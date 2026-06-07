@@ -79,7 +79,7 @@ local LITE_VERSION = "{ver}"
 -- >>> EDIT: your factory topology (replace `nil`), or set global FOREMAN_TOPOLOGY <<<
 local TOPOLOGY = FOREMAN_TOPOLOGY or nil
 
-{preload(["router", "planner", "app"])}
+{preload(["router", "planner", "namer", "app"])}
 
 if not TOPOLOGY then
   computer.log(4, "[Foreman] LITE v" .. LITE_VERSION ..
@@ -88,7 +88,7 @@ if not TOPOLOGY then
 end
 computer.log(1, "[Foreman] LITE v" .. LITE_VERSION .. " running")
 require("app").run(
-  {{ Router = require("router"), Planner = require("planner") }}, TOPOLOGY, {{ autoname = false }})
+  {{ Router = require("router"), Planner = require("planner"), Namer = require("namer") }}, TOPOLOGY, {{}})
 """
 
 

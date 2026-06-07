@@ -119,16 +119,22 @@ function Planner:chooseRecipe(item, need)
 end
 
 -- ---- fill one buffer -------------------------------------------------------
--- bufferItemOf("IRON_PLATE_BUFFER_1") -> "iron plate"
-function Planner.bufferItemOf(id)
-  local prefix = tostring(id):match("^(.-)_BUFFER_%d+$")
-  if not prefix then return nil end
-  return prefix:gsub("_", " "):lower()
+-- Resolve a container's destination item from an explicit c.buffer / c.output
+-- field (set by the namer's auto-assignment) or its name <Item>_(Buffer|Output)_<n>.
+function Planner.destItem(c)
+  if c.buffer then return tostring(c.buffer):lower() end
+  if c.output then return tostring(c.output):lower() end
+  local prefix, kw = tostring(c.id):match("^(.-)_(%a+)_%d+$")
+  if prefix and (kw:lower() == "buffer" or kw:lower() == "output") then
+    return prefix:gsub("_", " "):lower()
+  end
+  return nil
 end
+-- back-compat alias
+function Planner.bufferItemOf(id) return Planner.destItem({ id = id }) end
 
-function Planner:fillBuffer(bufferId, target)
-  local item = Planner.bufferItemOf(bufferId)
-  if not item then return false, "not a buffer name: " .. tostring(bufferId) end
+function Planner:fillBuffer(bufferId, item, target)
+  if not item then return false, "not a destination: " .. tostring(bufferId) end
   local current = count_in(self.getProxy(bufferId), item)
   local need = target - current
   if need <= 0 then return true, "already full" end
@@ -152,14 +158,16 @@ function Planner:fillBuffer(bufferId, target)
   return true, ("craft %d %s via '%s' (%d crafts)"):format(pick.produced, item, pick.opt.recipe.name, pick.crafts)
 end
 
---- Fill every buffer declared in the topology (containers named *_BUFFER_<n>
---- with a `target`), then run the router until orders complete.
+--- Fill every destination in the topology (a container resolving to an item via
+--- c.buffer/c.output or a *_(Buffer|Output)_<n> name) that has a `target`, then
+--- run the router until orders complete.
 function Planner:fillAll()
   self:scan()
   local plan = {}
   for _, c in ipairs(self.topo.containers or {}) do
-    if Planner.bufferItemOf(c.id) and c.target then
-      local ok, msg = self:fillBuffer(c.id, c.target)
+    local item = Planner.destItem(c)
+    if item and c.target then
+      local ok, msg = self:fillBuffer(c.id, item, c.target)
       plan[#plan + 1] = ("%s: %s"):format(c.id, msg)
     end
   end

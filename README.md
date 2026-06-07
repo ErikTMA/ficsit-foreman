@@ -16,6 +16,12 @@ self-managing logistics + production controller:
   and auto-orders ingredients → machine → buffer to keep `<Item>_<Keyword>_<N>` buffers full.
 - **Auto-naming** — name a container `input` / `output` / `buffer`; its first single
   item type renames it to `Iron_Plate_Buffer_1`, etc.
+- **Demand-driven auto-buffers** — name a container `auto_buffer` / `auto_output` and
+  the system picks what it should hold: the next item the machines can make that
+  isn't buffered yet (iron plate + wire covered → it becomes `Iron_Rod_Buffer_1`).
+  Once everything is covered, further auto-buffers reinforce the highest **transitive
+  demand** item — iron plate's demand counts everything that consumes reinforced iron
+  plate, which consumes iron plate, and so on up the recipe tree.
 
 It aims to grow into a full A→Z factory controller (power, trains, dashboards) — the
 core is a small kernel + pluggable modules.

@@ -25,6 +25,19 @@
 local Router = {}
 Router.__index = Router
 
+-- Resolve a container's destination item + ordinal, from an explicit
+-- c.buffer / c.output item field (set by auto-assignment) or its name
+-- <Item>_(Buffer|Output)_<n> (case-insensitive). Returns nil if not a destination.
+function Router.destItem(c)
+  if c.buffer then return tostring(c.buffer):lower(), c.n end
+  if c.output then return tostring(c.output):lower(), c.n end
+  local prefix, kw, n = tostring(c.id):match("^(.-)_(%a+)_(%d+)$")
+  if prefix and (kw:lower() == "buffer" or kw:lower() == "output") then
+    return prefix:gsub("_", " "):lower(), tonumber(n)
+  end
+  return nil
+end
+
 function Router.new(topology, getProxy)
   local self = setmetatable({}, Router)
   self.topo = topology
@@ -59,20 +72,21 @@ function Router.new(topology, getProxy)
   for _, c in ipairs(topology.containers or {}) do
     if tostring(c.id):match("^DEFAULT_OUT_%d+$") then table.insert(self.defaults, c.id) end
   end
-  -- buffers: name <ITEM>_BUFFER_<n> -> item + capacity; grouped + numerically ordered.
-  self.bufferItem = {}            -- bufferId -> item
+  -- buffer/output destinations: an explicit c.buffer / c.output item (e.g. set by
+  -- the namer's auto-assignment) OR a name <Item>_(Buffer|Output)_<n>. item +
+  -- capacity, grouped per item, numerically ordered.
+  self.bufferItem = {}            -- destId -> item
   self.capacity = {}              -- destId -> max units (defaults to its target)
-  self.buffersForItem = {}        -- item -> { bufferId... } ordered by <n>
+  self.buffersForItem = {}        -- item -> { destId... } ordered by <n>
   local order_n = {}
   for _, c in ipairs(topology.containers or {}) do
-    local prefix, n = tostring(c.id):match("^(.-)_BUFFER_(%d+)$")
-    if prefix then
-      local item = prefix:gsub("_", " "):lower()
+    local item, n = Router.destItem(c)
+    if item then
       self.bufferItem[c.id] = item
       self.capacity[c.id] = c.capacity or c.target
       self.buffersForItem[item] = self.buffersForItem[item] or {}
       table.insert(self.buffersForItem[item], c.id)
-      order_n[c.id] = tonumber(n)
+      order_n[c.id] = n or 1
     end
   end
   for _, list in pairs(self.buffersForItem) do
