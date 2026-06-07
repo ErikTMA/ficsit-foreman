@@ -17,11 +17,12 @@ jobs:
             echo "luac -p $f"; luac5.4 -p "$f"
           done
 
-      - name: Lint — must run in-game (no print / dofile / loadfile)
+      - name: Lint — no base calls FIN nils (dofile / loadfile / collectgarbage / os / unpack)
         run: |
-          # FIN nils print/dofile/loadfile; using them = a silent in-game break.
-          if grep -rnE '\b(print|dofile|loadfile|collectgarbage)\s*\(' lib examples; then
-            echo "::error::forbidden base call (FIN nils these) — use computer.log"; exit 1
+          # FIN nils these (LuaBaseModule.cpp) / never opens os; using them breaks in-game.
+          # NB: `print` IS kept by FIN (re-added in LuaMiscModules.cpp) — allowed.
+          if grep -rnE '\b(dofile|loadfile|collectgarbage)\s*\(|\bos\.|[^.:%w]unpack\s*\(' lib examples; then
+            echo "::error::base call FIN nils — use computer.log / table.unpack / computer.*"; exit 1
           fi
 
       - name: Leak guard — no emulator / private references
