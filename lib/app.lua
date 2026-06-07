@@ -69,9 +69,62 @@ function App.deriveProducts(topology, getProxy)
   return products, usage
 end
 
+-- ---- nick-convention parsing (auto-mode) ----------------------------------
+local function destOf(nick)   -- <Item>_<buffer|output>_<n>[_<target>] -> item, role, target
+  nick = tostring(nick)
+  local prefix, kw, _n, tgt = nick:match("^(.-)_(%a+)_(%d+)_(%d+)$")
+  if not (prefix and (kw:lower() == "buffer" or kw:lower() == "output")) then
+    prefix, kw = nick:match("^(.-)_(%a+)_(%d+)$"); tgt = nil
+  end
+  if prefix and (kw:lower() == "buffer" or kw:lower() == "output") then
+    return prefix:gsub("_", " "):lower(), kw:lower(), tgt and tonumber(tgt) or nil
+  end
+end
+local function sourceOf(nick)  -- <Item>_input_<n> -> item ; "input" -> "" (use content)
+  nick = tostring(nick)
+  local prefix = nick:match("^(.-)_input_%d+$")
+  if prefix then return prefix:gsub("_", " "):lower() end
+  if nick:lower() == "input" then return "" end
+end
+local function contentItem(p)  -- the single item type currently in a container, or nil
+  if not p.getInventories then return nil end
+  for _, inv in ipairs(p:getInventories()) do
+    for i = 0, (inv.size or 0) - 1 do local s = inv:getStack(i); if s and s.count > 0 then return s.item.type.name end end
+  end
+end
+local function capacityOf(p, item)  -- slots * stack max (fill-to-capacity)
+  local inv = p.getInventories and p:getInventories()[1]
+  local max = (findItem and findItem(item) and findItem(item).max) or 100
+  return (inv and inv.size or 24) * max
+end
+
+-- Build a topology purely from the live network: crawl belts (Discover) and read
+-- each container's role/item/target from its nick. No declared table needed.
+function App.discoverTopology(modules, getProxy)
+  local topo = modules.Discover.run({ getProxy = getProxy })
+  for _, c in ipairs(topo.containers) do
+    local p = getProxy(c.id); local nick = (p and p.nick) or ""
+    if tostring(nick):match("^DEFAULT_OUT_%d+$") then
+      c.isDefault = true
+    else
+      local src = sourceOf(nick)
+      if src ~= nil then
+        c.provides = (src ~= "" and src) or contentItem(p)
+      else
+        local item, role, tgt = destOf(nick)
+        if item then c[role] = item; c.target = tgt or capacityOf(p, item) end
+      end
+    end
+  end
+  return topo
+end
+
 function App.run(modules, topology, opts)
   opts = opts or {}
   local getProxy = opts.getProxy or function(id) return component.proxy(id) end
+  if (not topology or opts.discover) and modules.Discover then
+    topology = App.discoverTopology(modules, getProxy)   -- paste-and-go: no declared topology
+  end
   if modules.Namer then
     local products, usage = App.deriveProducts(topology, getProxy)
     -- optional explicit priority via topology.wishlist; else what the machines make

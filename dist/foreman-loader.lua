@@ -7,9 +7,10 @@
 -- ============================================================================
 
 -- >>> CHANGE THIS to upgrade/downgrade FULL (any released version tag, no 'v') <<<
-local VERSION = "0.1.4"
+local VERSION = "0.2.0"
 
--- >>> EDIT: your factory topology (replace `nil`), or set global FOREMAN_TOPOLOGY <<<
+-- Paste-and-go: leave TOPOLOGY nil and FULL auto-discovers the belt graph + reads
+-- container nicks. Only set it to declare the topology by hand (or FOREMAN_TOPOLOGY).
 local TOPOLOGY = FOREMAN_TOPOLOGY or nil
 
 local URL = "https://raw.githubusercontent.com/ErikTMA/ficsit-foreman/" .. "v" .. VERSION .. "/dist/foreman.lua"
@@ -44,11 +45,8 @@ local function fetchFull()
   return full
 end
 
-if not TOPOLOGY then
-  computer.log(4, "[Foreman] no TOPOLOGY declared — edit the TOPOLOGY table at the top, or set FOREMAN_TOPOLOGY.")
-  return
-end
 local full = fetchFull()
 if not full then return end
-computer.log(1, "[Foreman] FULL " .. tostring(full.version) .. " running")
+computer.log(1, "[Foreman] FULL " .. tostring(full.version) ..
+  (TOPOLOGY and " running (declared topology)" or " running (auto-discovering topology)"))
 full.run(TOPOLOGY, { autoname = true })

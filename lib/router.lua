@@ -1,19 +1,21 @@
 -- router.lua — topology-aware item routing framework for FicsIt-Networks.
 --
 -- This is PRODUCT code: it runs in-game on a Computer Case as well as under the
--- devbox emulator. It does NOT sense belt topology (FIN can't — a FactoryConnection
--- exposes no owner building), so you DECLARE the topology once as data; the router
--- then DISCOVERS routes through it with breadth-first search:
+-- devbox emulator. The topology can be auto-discovered (lib/discover.lua crawls the
+-- belt graph via getFactoryConnectors -> getConnected -> owner) or DECLARED as data;
+-- either way the router DISCOVERS routes through it with breadth-first search:
 --
 --     order("iron ingot", 100, "OUT_IRON")
 --
 -- finds the path from the container that provides the item to the target container
 -- and programs every CodeableSplitter along the way to send that item type out the
--- correct port. CodeableMergers just pass through. Works for any declared topology.
+-- correct port. CodeableMergers just pass through. Works for any topology.
 --
 -- Topology shape:
 --   {
---     containers = { {id=, provides=?, items=?}, ... },   -- provides: item type this source emits
+--     containers = { {id=, provides=?, buffer=?, output=?, target=?, isDefault=?}, ... },
+--                  -- provides: item this source emits; buffer/output: dest item;
+--                  -- target: fill cap; isDefault: a DEFAULT_OUT catch-all sink
 --     splitters  = { "S1", ... },                          -- CodeableSplitter ids/nicks
 --     mergers    = { "M1", ... },                          -- CodeableMerger ids/nicks
 --     belts      = { {from=, to=, fromOutput=?, toInput=?}, ... },  -- directed, port-aware
@@ -25,15 +27,19 @@
 local Router = {}
 Router.__index = Router
 
--- Resolve a container's destination item + ordinal, from an explicit
--- c.buffer / c.output item field (set by auto-assignment) or its name
--- <Item>_(Buffer|Output)_<n> (case-insensitive). Returns nil if not a destination.
+-- Resolve a container's destination item + ordinal + optional fill target, from an
+-- explicit c.buffer / c.output item field or its name <Item>_(Buffer|Output)_<n>[_<target>]
+-- (case-insensitive). Returns item, n, target — or nil if not a destination.
 function Router.destItem(c)
   if c.buffer then return tostring(c.buffer):lower(), c.n end
   if c.output then return tostring(c.output):lower(), c.n end
-  local prefix, kw, n = tostring(c.id):match("^(.-)_(%a+)_(%d+)$")
+  -- with explicit target suffix: <prefix>_<kw>_<index>_<target>
+  local prefix, kw, n, tgt = tostring(c.id):match("^(.-)_(%a+)_(%d+)_(%d+)$")
+  if not (prefix and (kw:lower() == "buffer" or kw:lower() == "output")) then
+    prefix, kw, n = tostring(c.id):match("^(.-)_(%a+)_(%d+)$"); tgt = nil
+  end
   if prefix and (kw:lower() == "buffer" or kw:lower() == "output") then
-    return prefix:gsub("_", " "):lower(), tonumber(n)
+    return prefix:gsub("_", " "):lower(), tonumber(n), tgt and tonumber(tgt) or nil
   end
   return nil
 end
@@ -70,7 +76,8 @@ function Router.new(topology, getProxy)
   -- containers named DEFAULT_OUT_<n> are the catch-all sinks for unroutable items.
   self.defaults = {}
   for _, c in ipairs(topology.containers or {}) do
-    if tostring(c.id):match("^DEFAULT_OUT_%d+$") then table.insert(self.defaults, c.id) end
+    -- by name in declared mode, or the c.isDefault flag in auto-discovered mode
+    if c.isDefault or tostring(c.id):match("^DEFAULT_OUT_%d+$") then table.insert(self.defaults, c.id) end
   end
   -- buffer/output destinations: an explicit c.buffer / c.output item (e.g. set by
   -- the namer's auto-assignment) OR a name <Item>_(Buffer|Output)_<n>. item +
@@ -80,10 +87,10 @@ function Router.new(topology, getProxy)
   self.buffersForItem = {}        -- item -> { destId... } ordered by <n>
   local order_n = {}
   for _, c in ipairs(topology.containers or {}) do
-    local item, n = Router.destItem(c)
+    local item, n, tgt = Router.destItem(c)
     if item then
       self.bufferItem[c.id] = item
-      self.capacity[c.id] = c.capacity or c.target
+      self.capacity[c.id] = c.capacity or c.target or tgt
       self.buffersForItem[item] = self.buffersForItem[item] or {}
       table.insert(self.buffersForItem[item], c.id)
       order_n[c.id] = n or 1

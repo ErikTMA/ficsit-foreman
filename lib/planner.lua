@@ -119,16 +119,28 @@ function Planner:chooseRecipe(item, need)
 end
 
 -- ---- fill one buffer -------------------------------------------------------
+-- Parse <Item>_(Buffer|Output)_<n>[_<target>] -> item, target (target may be nil).
+local function parseDest(id)
+  id = tostring(id)
+  local prefix, kw, _n, tgt = id:match("^(.-)_(%a+)_(%d+)_(%d+)$")
+  if not (prefix and (kw:lower() == "buffer" or kw:lower() == "output")) then
+    prefix, kw = id:match("^(.-)_(%a+)_(%d+)$"); tgt = nil
+  end
+  if prefix and (kw:lower() == "buffer" or kw:lower() == "output") then
+    return prefix:gsub("_", " "):lower(), tgt and tonumber(tgt) or nil
+  end
+end
 -- Resolve a container's destination item from an explicit c.buffer / c.output
--- field (set by the namer's auto-assignment) or its name <Item>_(Buffer|Output)_<n>.
+-- field (set by the namer's auto-assignment / auto-discovery) or its name
+-- <Item>_(Buffer|Output)_<n>[_<target>].
 function Planner.destItem(c)
   if c.buffer then return tostring(c.buffer):lower() end
   if c.output then return tostring(c.output):lower() end
-  local prefix, kw = tostring(c.id):match("^(.-)_(%a+)_%d+$")
-  if prefix and (kw:lower() == "buffer" or kw:lower() == "output") then
-    return prefix:gsub("_", " "):lower()
-  end
-  return nil
+  return (parseDest(c.id))
+end
+-- Optional fill target carried in the name suffix (iron_plate_buffer_1_500 -> 500).
+function Planner.destTarget(c)
+  local _, tgt = parseDest(c.id); return tgt
 end
 -- back-compat alias
 function Planner.bufferItemOf(id) return Planner.destItem({ id = id }) end
@@ -166,8 +178,9 @@ function Planner:fillAll()
   local plan = {}
   for _, c in ipairs(self.topo.containers or {}) do
     local item = Planner.destItem(c)
-    if item and c.target then
-      local ok, msg = self:fillBuffer(c.id, item, c.target)
+    local target = c.target or Planner.destTarget(c)
+    if item and target then
+      local ok, msg = self:fillBuffer(c.id, item, target)
       plan[#plan + 1] = ("%s: %s"):format(c.id, msg)
     end
   end

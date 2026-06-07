@@ -5,6 +5,10 @@ Lua **factory-control framework** for [Satisfactory](https://www.satisfactorygam
 It runs on a Computer Case EEPROM and turns your codeable splitters/mergers into a
 self-managing logistics + production controller:
 
+- **Paste-and-go auto-discovery** — leave the topology blank and Foreman crawls the
+  belt graph itself (`getFactoryConnectors → getConnected → owner`, a link-state crawl)
+  and reads every container's role/item/target straight from its nick. No topology
+  table to maintain; you *can* still declare one if you prefer.
 - **Topology-aware item routing** over a belt **loop** — BFS pathfinding, so any
   splitter can reach any destination.
 - **Gated container release** — networked containers output *only what is ordered*,
@@ -46,16 +50,19 @@ source of truth.
 1. Build a Computer Case + Lua CPU + RAM + EEPROM, and **Codeable Splitters / Mergers**
    (the controller drives those — the LITE hardware floor).
 2. Paste `dist/foreman-lite.lua` into the EEPROM.
-3. Declare your factory in the `TOPOLOGY` table at the top (see
-   [`examples/topology.example.lua`](examples/topology.example.lua)), OR leave it and let
-   `lib/discover.lua` crawl the belt graph automatically (`getFactoryConnectors` →
-   `getConnected` → `owner`).
-4. Hand-name your containers `<Item>_<Keyword>_<N>`.
+3. **Nick your containers** by convention and you're done — no topology table:
+   - source: `<Item>_input_<n>` (or a bare `input` — it adopts whatever item it holds)
+   - buffer/output: `<Item>_buffer_<n>` / `<Item>_output_<n>`, optional fill target
+     suffix `<Item>_buffer_<n>_<target>` (e.g. `iron_plate_buffer_1_500` keeps 500;
+     no suffix = fill to capacity)
+   - catch-all for unrouteable items: `DEFAULT_OUT_<n>` (a container or an A.W.E.S.O.M.E. Sink)
+   - demand-driven: `auto_buffer` / `auto_output` picks what to hold for you
+4. *(optional)* Declare the topology by hand instead — leave the nicks, fill the
+   `TOPOLOGY` table (see [`examples/topology.example.lua`](examples/topology.example.lua)).
 
-**FULL (after the Internet Card):** paste `dist/foreman-loader.lua` instead, set its
-`TOPOLOGY`. It fetches the pinned FULL bundle and runs it (and auto-names containers
-nicked `input` / `output` / `buffer`). Switching is a deliberate re-paste — LITE keeps
-running untouched until you do.
+**FULL (after the Internet Card):** paste `dist/foreman-loader.lua` instead. It fetches
+the pinned FULL bundle and runs it — same nick conventions, same paste-and-go discovery.
+Switching is a deliberate re-paste — LITE keeps running untouched until you do.
 
 ## Build from source
 
