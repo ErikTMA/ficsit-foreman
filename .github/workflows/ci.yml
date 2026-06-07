@@ -1,0 +1,40 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.4
+        run: sudo apt-get update && sudo apt-get install -y lua5.4
+
+      - name: Parse-check all Lua (luac -p)
+        run: |
+          set -e
+          find lib examples dist -name '*.lua' -print0 | while IFS= read -r -d '' f; do
+            echo "luac -p $f"; luac5.4 -p "$f"
+          done
+
+      - name: Lint — must run in-game (no print / dofile / loadfile)
+        run: |
+          # FIN nils print/dofile/loadfile; using them = a silent in-game break.
+          if grep -rnE '\b(print|dofile|loadfile|collectgarbage)\s*\(' lib examples; then
+            echo "::error::forbidden base call (FIN nils these) — use computer.log"; exit 1
+          fi
+
+      - name: Leak guard — no emulator / private references
+        run: |
+          # scan shipped code + docs (not this workflow, which names the tokens on purpose)
+          if grep -rnE 'emu/|loadmod|components_gen|gen_reflection|world\._idle|manifold_build|\.world\.lua' \
+               lib examples dist tools README.md; then
+            echo "::error::reference to the private emulator/test rig found in the public repo"; exit 1
+          fi
+
+      - name: dist/ is fresh (regenerate and diff)
+        run: |
+          python3 tools/bundle.py
+          if ! git diff --quiet -- dist/; then
+            echo "::error::dist/ is stale — run 'python3 tools/bundle.py' and commit"; git diff -- dist/; exit 1
+          fi
