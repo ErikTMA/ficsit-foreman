@@ -92,7 +92,11 @@ end
 local function contentItem(p)  -- the single item type currently in a container, or nil
   if not p.getInventories then return nil end
   for _, inv in ipairs(p:getInventories()) do
-    for i = 0, (inv.size or 0) - 1 do local s = inv:getStack(i); if s and s.count > 0 then return lc(s.item.type.name) end end
+    for i = 0, (inv.size or 0) - 1 do
+      local s = inv:getStack(i)
+      -- empty slots return a 0-count stack with nil item.type in-game — guard
+      if s and (s.count or 0) > 0 and s.item and s.item.type then return lc(s.item.type.name) end
+    end
   end
 end
 local function capacityOf(p, item)  -- slots * stack max (fill-to-capacity)

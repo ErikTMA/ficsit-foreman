@@ -70,9 +70,13 @@ local function count_in(proxy, item)
   local invs = proxy:getInventories()
   local total = 0
   for _, inv in ipairs(invs) do
-    for i = 0, inv.size - 1 do
+    for i = 0, (inv.size or 0) - 1 do
       local stack = inv:getStack(i)
-      if stack and lc(stack.item.type.name) == item then total = total + stack.count end
+      -- in-game an empty slot returns a 0-count stack whose item.type is nil — guard
+      if stack and (stack.count or 0) > 0 and stack.item and stack.item.type
+         and lc(stack.item.type.name) == item then
+        total = total + stack.count
+      end
     end
   end
   return total

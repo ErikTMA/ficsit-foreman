@@ -18,44 +18,56 @@ local Discover = {}
 
 local INPUT, OUTPUT = 0, 1
 
--- classify a component type NAME into a topology role (nil = ignore). Fallback only —
--- in-game getType() returns a class OBJECT whose stringification is not guaranteed to
--- contain a friendly name, so capability detection (Discover.classify) is primary.
+-- classify a component class-name string into a topology role (nil = ignore). Matches
+-- FIN reflection base-class internal names (`Manufacturer` = AFGBuildableManufacturer,
+-- the recipe-machine base; `CodeableSplitter`/`CodeableMerger`) AND the leaf names the
+-- emulator/game use (`Constructor`, `StorageContainer`, …). `tostring(class)` in-game is
+-- `Class<InternalName>`, so substring matching works.
 function Discover.roleOf(typ)
   typ = tostring(typ)
   if typ:find("Splitter") then return "splitter" end
   if typ:find("Merger") then return "merger" end
-  if typ:find("Constructor") or typ:find("Assembler") or typ:find("Manufacturer")
+  if typ:find("Manufacturer") or typ:find("Constructor") or typ:find("Assembler")
      or typ:find("Foundry") or typ:find("Refinery") or typ:find("Blender")
      or typ:find("Packager") or typ:find("Smelter") then return "machine" end
-  if typ:find("Storage") or typ:find("Container") or typ:find("ResourceSink") then return "container" end
+  if typ:find("Storage") or typ:find("Container") or typ:find("ResourceSink")
+     or typ:find("Depot") then return "container" end
   return nil
 end
 
--- type name, tolerant of FIN (getType() -> class object with .name) and the emulator
--- (getType() -> string).
-function Discover.typeName(p)
+-- Concatenated class-reference text of the component's type AND its ancestors, walking
+-- getType()/getParent(). This is WARNING-FREE: it uses only valid reflected calls
+-- (getType, getParent) and tostring — never probes for methods that may not exist
+-- (FIN logs "Nil return is deprecated" for a missing member, which mass method-probing
+-- triggers). The hierarchy guarantees a machine shows its `Manufacturer` base even if
+-- the leaf class name doesn't say so. Tolerant of the emulator (getType()->string).
+function Discover.typeChain(p)
   if not p.getType then return "" end
-  local ok, t = pcall(function() return p:getType() end)
-  if not ok or t == nil then return "" end
-  if type(t) == "table" then return tostring(t.name or t) end
-  return tostring(t)
+  local ok, cls = pcall(function() return p:getType() end)
+  if not ok then return "" end
+  local parts, guard = {}, 0
+  while cls and guard < 16 do
+    guard = guard + 1
+    parts[#parts + 1] = tostring(cls)
+    local okp, par = pcall(function() return cls.getParent and cls:getParent() end)
+    if not okp then break end
+    cls = par
+  end
+  return table.concat(parts, " ")
 end
 
--- classify a live component proxy by CAPABILITY (reflection exposes a function only on
--- components that have it), so it works regardless of how a class name stringifies:
---   getRecipes  -> a manufacturer (constructor/assembler/foundry/refinery/…)
---   getOutput   -> a CodeableSplitter (splitter-only; mergers have no GetOutput)
---   transferItem-> a CodeableMerger (has transferItem but no GetOutput)
---   getInventories -> a storage container
--- Falls back to the type-name heuristic for anything else (e.g. an A.W.E.S.O.M.E.
--- Sink used as DEFAULT_OUT, which may expose neither).
+-- classify a live component proxy. PRIMARY: by class hierarchy name (warning-free).
+-- FALLBACK (only when the name says nothing — e.g. a storage container whose registered
+-- ancestor is just `Buildable`): probe by capability. The fallback CAN emit FIN's
+-- deprecation warning for a missing member, so it runs last and only for the unmatched.
 function Discover.classify(p)
-  if p.getRecipes then return "machine" end
-  if p.getOutput then return "splitter" end
-  if p.transferItem then return "merger" end
-  if p.getInventories then return "container" end
-  return Discover.roleOf(Discover.typeName(p))
+  local role = Discover.roleOf(Discover.typeChain(p))
+  if role then return role end
+  if p.getRecipes then return "machine" end       -- manufacturer
+  if p.getOutput then return "splitter" end        -- CodeableSplitter (has GetOutput)
+  if p.transferItem then return "merger" end       -- CodeableMerger (no GetOutput)
+  if p.getInventories then return "container" end  -- storage / sink
+  return nil
 end
 
 -- ordinal of connector `conn` among `ownerProxy`'s connectors of `dir`

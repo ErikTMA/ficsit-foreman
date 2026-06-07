@@ -59,7 +59,8 @@ local function itemTypes(proxy)
   for _, inv in ipairs(proxy:getInventories()) do
     for i = 0, (inv.size or 0) - 1 do
       local s = inv:getStack(i)
-      local nm = s and s.count > 0 and tostring(s.item.type.name):lower()
+      -- empty slots return a 0-count stack with nil item.type in-game — guard before .name
+      local nm = s and (s.count or 0) > 0 and s.item and s.item.type and tostring(s.item.type.name):lower()
       if nm and not seen[nm] then
         seen[nm] = true; out[#out + 1] = nm
       end

@@ -184,9 +184,12 @@ function Router:_count(dst, item)
   local total = 0
   item = lc(item)
   for _, inv in ipairs(p:getInventories()) do
-    for i = 0, inv.size - 1 do
+    for i = 0, (inv.size or 0) - 1 do
       local s = inv:getStack(i)
-      if s and lc(s.item.type.name) == item then total = total + s.count end
+      -- empty slots return a 0-count stack with a nil item.type in-game — guard it
+      if s and (s.count or 0) > 0 and s.item and s.item.type and lc(s.item.type.name) == item then
+        total = total + s.count
+      end
     end
   end
   return total
