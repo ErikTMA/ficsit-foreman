@@ -48,15 +48,20 @@ local function parseGenerated(nick)
   end
 end
 
--- distinct item types currently in a container (count > 0)
+-- distinct item types currently in a container (count > 0), names normalized to
+-- lowercase — FIN reflection returns canonical (Title) case ("Concrete") while names
+-- parsed from nicks are lowercase ("concrete"); without this they never compare equal,
+-- so the namer re-typed an already-named container on every run (Concrete_Input_1 ->
+-- _2 -> ...). titleItem() restores display case for the new nick.
 local function itemTypes(proxy)
   if not proxy.getInventories then return {} end
   local seen, out = {}, {}
   for _, inv in ipairs(proxy:getInventories()) do
     for i = 0, (inv.size or 0) - 1 do
       local s = inv:getStack(i)
-      if s and s.count > 0 and not seen[s.item.type.name] then
-        seen[s.item.type.name] = true; out[#out + 1] = s.item.type.name
+      local nm = s and s.count > 0 and tostring(s.item.type.name):lower()
+      if nm and not seen[nm] then
+        seen[nm] = true; out[#out + 1] = nm
       end
     end
   end

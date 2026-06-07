@@ -18,7 +18,9 @@ local Discover = {}
 
 local INPUT, OUTPUT = 0, 1
 
--- classify a component type name into a topology role (nil = ignore)
+-- classify a component type NAME into a topology role (nil = ignore). Fallback only —
+-- in-game getType() returns a class OBJECT whose stringification is not guaranteed to
+-- contain a friendly name, so capability detection (Discover.classify) is primary.
 function Discover.roleOf(typ)
   typ = tostring(typ)
   if typ:find("Splitter") then return "splitter" end
@@ -28,6 +30,32 @@ function Discover.roleOf(typ)
      or typ:find("Packager") or typ:find("Smelter") then return "machine" end
   if typ:find("Storage") or typ:find("Container") or typ:find("ResourceSink") then return "container" end
   return nil
+end
+
+-- type name, tolerant of FIN (getType() -> class object with .name) and the emulator
+-- (getType() -> string).
+function Discover.typeName(p)
+  if not p.getType then return "" end
+  local ok, t = pcall(function() return p:getType() end)
+  if not ok or t == nil then return "" end
+  if type(t) == "table" then return tostring(t.name or t) end
+  return tostring(t)
+end
+
+-- classify a live component proxy by CAPABILITY (reflection exposes a function only on
+-- components that have it), so it works regardless of how a class name stringifies:
+--   getRecipes  -> a manufacturer (constructor/assembler/foundry/refinery/…)
+--   getOutput   -> a CodeableSplitter (splitter-only; mergers have no GetOutput)
+--   transferItem-> a CodeableMerger (has transferItem but no GetOutput)
+--   getInventories -> a storage container
+-- Falls back to the type-name heuristic for anything else (e.g. an A.W.E.S.O.M.E.
+-- Sink used as DEFAULT_OUT, which may expose neither).
+function Discover.classify(p)
+  if p.getRecipes then return "machine" end
+  if p.getOutput then return "splitter" end
+  if p.transferItem then return "merger" end
+  if p.getInventories then return "container" end
+  return Discover.roleOf(Discover.typeName(p))
 end
 
 -- ordinal of connector `conn` among `ownerProxy`'s connectors of `dir`
@@ -48,8 +76,8 @@ function Discover.run(opts)
   local proxies = {}
   for _, id in ipairs(find("")) do
     local p = getProxy(id)
-    if p and p.getType then
-      local role = Discover.roleOf(p:getType())
+    if p then
+      local role = Discover.classify(p)
       if role then
         proxies[id] = p
         if role == "splitter" then topo.splitters[#topo.splitters + 1] = id

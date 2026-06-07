@@ -9,6 +9,12 @@ self-managing logistics + production controller:
   belt graph itself (`getFactoryConnectors → getConnected → owner`, a link-state crawl)
   and reads every container's role/item/target straight from its nick. No topology
   table to maintain; you *can* still declare one if you prefer.
+- **Runs continuously** — it doesn't do one pass and stop. It blocks on signals and
+  routes items as they reach each splitter/merger, and on every idle tick it
+  **re-discovers** the network (build a container or machine while it runs and it gets
+  picked up) and **re-plans** to top buffers back up as they drain.
+- **Case-insensitive** — nick your containers in any case; item names match FIN's
+  canonical names regardless (`Iron Plate` ⇄ `iron_plate`).
 - **Topology-aware item routing** over a belt **loop** — BFS pathfinding, so any
   splitter can reach any destination.
 - **Gated container release** — networked containers output *only what is ordered*,
@@ -83,6 +89,15 @@ python3 tools/bundle.py     # regenerates dist/{foreman.lua, foreman-lite.lua, f
   `lib/discover.lua` crawls `getFactoryConnectors → getConnected → owner` to rebuild the
   belt graph (nodes + ports) automatically — a link-state crawl. You can still *declare*
   a topology if you prefer; roles/items come from container nicks + recipes either way.
+- **Item names are case-insensitive.** FIN reflection returns canonical names
+  (`getProducts().type.name` → `"Iron Plate"`; the `ItemRequest` signal carries an
+  `FInventoryItem` whose `.type` is an *ItemType object* with `.name`). Foreman
+  normalizes everything to lowercase, so nicks and recipe lookups match regardless of case.
+- **Control loop.** `App.run` registers one `ItemRequest` listener and blocks on
+  `event.pull` — items are routed as they arrive (event-driven, no busy-poll). On an
+  idle timeout it re-discovers + re-plans, so it keeps running and adapts to changes.
+  Machines must be on the FIN network (a network connector + cable) to be discovered;
+  classification is by capability (`getRecipes` → manufacturer), not class name.
 - Limits to respect (FIN): ~2500 Lua instructions/tick (then it yields), a 250-entry
   signal queue, NetworkCard messages ≤ 7 params.
 

@@ -14,6 +14,9 @@
 
 local App = {}
 
+-- Case-insensitive item names (reflection = canonical/Title case, nicks = lowercase).
+local function lc(s) return s and tostring(s):lower() or nil end
+
 -- Discover, from every manufacturer machine's recipes (constructors / assemblers /
 -- fabricators) via reflection:
 --   products — ordered, de-duped list of items the factory CAN make (candidate pool)
@@ -33,14 +36,14 @@ function App.deriveProducts(topology, getProxy)
         for _, r in ipairs(m:getRecipes()) do
           local prods, ings = {}, {}
           for _, p in ipairs(r:getProducts()) do
-            local nm = p.type and p.type.name
+            local nm = p.type and lc(p.type.name)
             if nm then
               prods[#prods + 1] = nm; items[nm] = true
               if not seen[nm] then seen[nm] = true; products[#products + 1] = nm end
             end
           end
           for _, ing in ipairs(r:getIngredients()) do
-            local nm = ing.type and ing.type.name
+            local nm = ing.type and lc(ing.type.name)
             if nm then ings[#ings + 1] = nm; items[nm] = true end
           end
           for _, ing in ipairs(ings) do
@@ -89,7 +92,7 @@ end
 local function contentItem(p)  -- the single item type currently in a container, or nil
   if not p.getInventories then return nil end
   for _, inv in ipairs(p:getInventories()) do
-    for i = 0, (inv.size or 0) - 1 do local s = inv:getStack(i); if s and s.count > 0 then return s.item.type.name end end
+    for i = 0, (inv.size or 0) - 1 do local s = inv:getStack(i); if s and s.count > 0 then return lc(s.item.type.name) end end
   end
 end
 local function capacityOf(p, item)  -- slots * stack max (fill-to-capacity)
@@ -119,25 +122,62 @@ function App.discoverTopology(modules, getProxy)
   return topo
 end
 
+-- (Re)build the whole control state from the live network: in auto mode re-crawl
+-- the belt graph (so containers/machines ADDED while running are picked up), re-derive
+-- products, (re)assign demand-driven containers, content-name sacred-keyword ones,
+-- then make a fresh router+planner and place fill orders. A declared topology is kept
+-- as-is (no re-crawl) but still re-planned. Renaming/auto-assign are idempotent —
+-- already-named nicks persist in-game, so repeated rebuilds are stable.
+function App.build(modules, declared, getProxy, opts)
+  local topo = declared
+  if (not topo or opts.discover) and modules.Discover then
+    topo = App.discoverTopology(modules, getProxy)
+  end
+  if modules.Namer then
+    local products, usage = App.deriveProducts(topo, getProxy)
+    local candidates = topo.wishlist or products          -- explicit priority else machine-makeable
+    modules.Namer.autoAssign(topo, { getProxy = getProxy, candidates = candidates, usage = usage })
+    modules.Namer.new(getProxy):scan()
+  end
+  local router  = modules.Router.new(topo, getProxy)
+  local planner = modules.Planner.new(topo, router, getProxy)
+  planner:fillAll()
+  router:pumpGated()        -- kick gated sources stuck from a previous cycle's overshoot
+  return router, planner, topo
+end
+
 function App.run(modules, topology, opts)
   opts = opts or {}
   local getProxy = opts.getProxy or function(id) return component.proxy(id) end
-  if (not topology or opts.discover) and modules.Discover then
-    topology = App.discoverTopology(modules, getProxy)   -- paste-and-go: no declared topology
+  local declared = topology                       -- nil => auto-discover (and re-discover)
+
+  -- One long-lived listener delegating to the CURRENT router; rebuilds swap the
+  -- router instance in `ctx` rather than re-registering (no duplicate listeners).
+  local ctx = {}
+  ctx.router, ctx.planner = App.build(modules, declared, getProxy, opts)
+  event.registerListener(event.filter{ event = "ItemRequest" },
+    function(_, sender, a, b) ctx.router:_dispatch(sender, a, b) end)
+
+  if opts.once then
+    -- batch mode (tests / one-shot): drain current routing work and return.
+    ctx.planner:run(opts.maxLoops)
+    return ctx.router, ctx.planner
   end
-  if modules.Namer then
-    local products, usage = App.deriveProducts(topology, getProxy)
-    -- optional explicit priority via topology.wishlist; else what the machines make
-    local candidates = topology.wishlist or products
-    modules.Namer.autoAssign(topology, { getProxy = getProxy, candidates = candidates, usage = usage })
-    modules.Namer.new(getProxy):scan()
+
+  -- IN-GAME DEFAULT: a persistent control loop. Items ride real belts over real time;
+  -- ItemRequest signals arrive asynchronously as they reach a splitter/merger.
+  -- event.pull() BLOCKS for the next signal (the listener routes it inside the pull) —
+  -- no busy-poll. On an idle timeout we REBUILD: re-discover the network (catching any
+  -- container/machine added since), re-plan, and top up drained buffers. This is what
+  -- makes Foreman keep running and keep discovering instead of doing one pass.
+  local replan = opts.replan or 2                 -- seconds to wait before a rebuild tick
+  while true do
+    local ev = event.pull(replan)                 -- blocks; listeners fire here
+    if ev == nil then                             -- idle timeout: refresh everything
+      ctx.router, ctx.planner = App.build(modules, declared, getProxy, opts)
+    end
   end
-  local router  = modules.Router.new(topology, getProxy)
-  local planner = modules.Planner.new(topology, router, getProxy)
-  planner:fillAll()
-  router:install()
-  planner:run(opts.maxLoops)
-  return router, planner
+  return ctx.router, ctx.planner                  -- unreachable; kept for symmetry
 end
 
 return App

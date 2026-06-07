@@ -19,6 +19,9 @@ local Planner = {}
 Planner.__index = Planner
 
 local function ceil(a, b) return math.floor((a + b - 1) / b) end
+-- Case-insensitive item names: reflection gives canonical (Title) case, nicks give
+-- lowercase. Key/compare everything lowercase so they match. (See router.lua.)
+local function lc(s) return s and tostring(s):lower() or nil end
 
 function Planner.new(topology, router, getProxy)
   local self = setmetatable({}, Planner)
@@ -29,7 +32,7 @@ function Planner.new(topology, router, getProxy)
   self.busy = {}                 -- ctorId -> true once assigned this planning pass
   self.sources = {}              -- itemName -> source container id (declared provides)
   for _, c in ipairs(topology.containers or {}) do
-    if c.provides then self.sources[c.provides] = c.id end
+    if c.provides then self.sources[lc(c.provides)] = c.id end
   end
   return self
 end
@@ -42,19 +45,20 @@ function Planner:scan()
       local ings = {}
       local totalIn = 0
       for _, ia in ipairs(recipe:getIngredients()) do
-        ings[#ings + 1] = { name = ia.type.name, amount = ia.amount }
+        ings[#ings + 1] = { name = lc(ia.type.name), amount = ia.amount }
         totalIn = totalIn + ia.amount
       end
       local duration = recipe.duration or 1
       for _, pa in ipairs(recipe:getProducts()) do
-        local list = self.recipesByProduct[pa.type.name] or {}
+        local key = lc(pa.type.name)
+        local list = self.recipesByProduct[key] or {}
         list[#list + 1] = {
           recipe = recipe, ctorId = cid, ctor = ctor,
           out = pa.amount, ingredients = ings, totalIn = totalIn,
           duration = duration,
           throughput = pa.amount / duration,   -- output per minute decides when stock is plentiful
         }
-        self.recipesByProduct[pa.type.name] = list
+        self.recipesByProduct[key] = list
       end
     end
   end
@@ -62,12 +66,13 @@ end
 
 -- ---- inventory reads (FIN-faithful: getInventories -> getStack) -------------
 local function count_in(proxy, item)
+  item = lc(item)
   local invs = proxy:getInventories()
   local total = 0
   for _, inv in ipairs(invs) do
     for i = 0, inv.size - 1 do
       local stack = inv:getStack(i)
-      if stack and stack.item.type.name == item then total = total + stack.count end
+      if stack and lc(stack.item.type.name) == item then total = total + stack.count end
     end
   end
   return total
@@ -75,9 +80,10 @@ end
 
 -- total available of an item across all declared source containers
 function Planner:available(item)
+  item = lc(item)
   local n = 0
   for _, c in ipairs(self.topo.containers or {}) do
-    if c.provides == item then n = n + count_in(self.getProxy(c.id), item) end
+    if lc(c.provides) == item then n = n + count_in(self.getProxy(c.id), item) end
   end
   return n
 end

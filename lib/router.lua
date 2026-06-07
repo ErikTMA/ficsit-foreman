@@ -27,6 +27,19 @@
 local Router = {}
 Router.__index = Router
 
+-- Case-insensitive item names: FIN reflection returns canonical (Title) case
+-- ("Iron Plate"), nicks give lowercase. Normalize everything to lowercase so keys
+-- and comparisons match regardless of source.
+local function lc(s) return s and tostring(s):lower() or nil end
+-- name of an item from a FIN signal payload (FInventoryItem: .type is an ItemType
+-- OBJECT with .name) — tolerant of the emulator/legacy {type=string} shape too.
+local function itemName(it)
+  if type(it) ~= "table" then return lc(it) end
+  local t = it.type
+  if type(t) == "table" then return lc(t.name) end
+  return lc(t)
+end
+
 -- Resolve a container's destination item + ordinal + optional fill target, from an
 -- explicit c.buffer / c.output item field or its name <Item>_(Buffer|Output)_<n>[_<target>]
 -- (case-insensitive). Returns item, n, target — or nil if not a destination.
@@ -64,7 +77,7 @@ function Router.new(topology, getProxy)
   -- releases items when an order calls for them. gated[mergerId][input] = item type.
   self.sourceItem = {}
   for _, c in ipairs(topology.containers or {}) do
-    if c.provides then self.sourceItem[c.id] = c.provides end
+    if c.provides then self.sourceItem[c.id] = lc(c.provides) end
   end
   self.gated = {}
   for _, b in ipairs(topology.belts or {}) do
@@ -106,8 +119,9 @@ end
 
 -- Find the container that emits `item` (declared via `provides`).
 function Router:sourceOf(item)
+  item = lc(item)
   for _, c in ipairs(self.topo.containers or {}) do
-    if c.provides == item then return c.id end
+    if lc(c.provides) == item then return c.id end
   end
 end
 
@@ -141,6 +155,7 @@ end
 --- constructor as the explicit src for the crafted product). Returns true, or
 --- false + reason if no path/source.
 function Router:order(item, count, dst, src)
+  item = lc(item)
   src = src or self:sourceOf(item)
   if not src then return false, "no source provides " .. item end
   if not self:findPath(src, dst) then return false, ("no path %s -> %s"):format(src, dst) end
@@ -167,10 +182,11 @@ function Router:_count(dst, item)
   local p = self.getProxy(dst)
   if not p or not p.getInventories then return 0 end
   local total = 0
+  item = lc(item)
   for _, inv in ipairs(p:getInventories()) do
     for i = 0, inv.size - 1 do
       local s = inv:getStack(i)
-      if s and s.item.type.name == item then total = total + s.count end
+      if s and lc(s.item.type.name) == item then total = total + s.count end
     end
   end
   return total
@@ -184,38 +200,72 @@ function Router:hasRoom(dst, item)
   return self:_count(dst, item) < cap
 end
 
+--- Handle one ItemRequest. Separated from install() so a long-lived listener can
+--- delegate to the CURRENT router after a live re-discovery (App swaps the router
+--- instance without re-registering — avoids stacking duplicate listeners).
+--- FIN signal payload is an FInventoryItem; the item name is item.type.name
+--- (item.type is the ItemType OBJECT, not a string). itemName() normalizes to
+--- lowercase so matching is case-insensitive vs reflection's canonical (Title) case.
+function Router:_dispatch(sender, a, b)
+  local id = sender.id
+  if self.isSplitter[id] then
+    self:_routeAtSplitter(sender, id, itemName(a))     -- splitter sig: (item)
+  elseif self.isMerger[id] then
+    local input, item = a, b                           -- merger sig: (input, item)
+    if self.gated[id] and self.gated[id][input] ~= nil then
+      -- Gated networked source: release ONLY what an order still wants, so the
+      -- container outputs exactly what's ordered and otherwise stays stopped.
+      local ord = self:_needRelease(itemName(item))
+      -- count a release ONLY when the pull actually succeeds (transferItem can fail
+      -- under back-pressure when the merger output is full) — else the counter
+      -- over-reports and the source stops short.
+      if ord and sender:transferItem(input) then
+        ord.released = ord.released + 1
+      end
+      -- else: do not pull -> the container holds its items (stopped)
+    else
+      sender:transferItem(input)                       -- in-transit: always forward
+    end
+  end
+end
+
 --- Register the signal handler that executes routing. Call once, then pump the
 --- event loop (e.g. Router:run() or your own event.pull loop).
 function Router:install()
   event.registerListener(event.filter{ event = "ItemRequest" },
-    function(_, sender, a, b)
-      local id = sender.id
-      if self.isSplitter[id] then
-        self:_routeAtSplitter(sender, id, a.type)       -- splitter sig: (item)
-      elseif self.isMerger[id] then
-        local input, item = a, b                        -- merger sig: (input, item)
-        if self.gated[id] and self.gated[id][input] ~= nil then
-          -- Gated networked source: release ONLY what an order still wants, so the
-          -- container outputs exactly what's ordered and otherwise stays stopped.
-          local ord = self:_needRelease(item.type)
-          -- count a release ONLY when the pull actually succeeds (transferItem can
-          -- fail under back-pressure when the merger output is full) — else the
-          -- counter over-reports and the source stops short.
-          if ord and sender:transferItem(input) then
-            ord.released = ord.released + 1
-          end
-          -- else: do not pull -> the container holds its items (stopped)
-        else
-          sender:transferItem(input)                    -- in-transit: always forward
-        end
-      end
-    end)
+    function(_, sender, a, b) self:_dispatch(sender, a, b) end)
 end
 
 -- An active order for this item type that still has items left to release.
 function Router:_needRelease(itemType)
   for _, o in ipairs(self.orders) do
     if o.item == itemType and o.released < o.count then return o end
+  end
+end
+
+--- Level-triggered kick for gated sources. ItemRequest is EDGE-triggered (fires once,
+--- when an item arrives at a merger input); an item that arrives while no order wants
+--- it just sits there, and is never re-offered when a LATER order does want it — so
+--- between orders the 2-slot merger input can stay stuck and block its source. After
+--- (re)planning, call this to poll every gated input and release whatever an active
+--- order now needs (until outputs back-pressure). Idempotent; safe to call each tick.
+function Router:pumpGated()
+  local progressed = true
+  while progressed do
+    progressed = false
+    for id, inputs in pairs(self.gated) do
+      local sender = self.getProxy(id)
+      if sender and sender.getInput then
+        for input in pairs(inputs) do
+          local it = sender:getInput(input)
+          local ord = it and self:_needRelease(itemName(it))
+          if ord and sender:transferItem(input) then
+            ord.released = ord.released + 1
+            progressed = true
+          end
+        end
+      end
+    end
   end
 end
 
