@@ -7,7 +7,7 @@
 -- ============================================================================
 
 -- >>> CHANGE THIS to upgrade/downgrade FULL (any released version tag, no 'v') <<<
-local VERSION = "0.1.3"
+local VERSION = "0.1.4"
 
 -- >>> EDIT: your factory topology (replace `nil`), or set global FOREMAN_TOPOLOGY <<<
 local TOPOLOGY = FOREMAN_TOPOLOGY or nil

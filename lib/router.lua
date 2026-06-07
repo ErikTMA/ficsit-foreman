@@ -191,9 +191,11 @@ function Router:install()
           -- Gated networked source: release ONLY what an order still wants, so the
           -- container outputs exactly what's ordered and otherwise stays stopped.
           local ord = self:_needRelease(item.type)
-          if ord then
+          -- count a release ONLY when the pull actually succeeds (transferItem can
+          -- fail under back-pressure when the merger output is full) — else the
+          -- counter over-reports and the source stops short.
+          if ord and sender:transferItem(input) then
             ord.released = ord.released + 1
-            sender:transferItem(input)
           end
           -- else: do not pull -> the container holds its items (stopped)
         else
@@ -235,10 +237,14 @@ function Router:_routeAtSplitter(sender, id, item)
   for _, D in ipairs(targets) do
     local belt = self:firstHopTo(id, D)
     if belt and (skipRoom or self:hasRoom(D, item)) then
-      sender:transferItem(belt.fromOutput or 0)
-      if belt.to == D and ord then                   -- delivered directly this hop
-        if D == ord.dst then ord.delivered = ord.delivered + 1
-        else ord.rerouted = ord.rerouted + 1 end
+      -- only act/count when the transfer succeeds; if the chosen output is full
+      -- (back-pressure) leave the item — the engine re-fires ItemRequest when the
+      -- output drains, giving a retry.
+      if sender:transferItem(belt.fromOutput or 0) then
+        if belt.to == D and ord then                 -- delivered directly this hop
+          if D == ord.dst then ord.delivered = ord.delivered + 1
+          else ord.rerouted = ord.rerouted + 1 end
+        end
       end
       return
     end
