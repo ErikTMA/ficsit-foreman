@@ -32,9 +32,23 @@ REPO = os.environ.get("FOREMAN_REPO", "ficsit-foreman")
 EOF_MARKER = "--[[FOREMAN_EOF]]"
 
 
+def strip_lua(src):
+    """Drop full-line comments and blank lines to keep the EEPROM lean. SAFE for our
+    libs: they use no long-bracket strings/comments ([[ ]]), so a line starting with
+    -- is always a comment, never string content. Trailing comments are left intact
+    (stripping those could touch a -- inside a string)."""
+    out = []
+    for line in src.split("\n"):
+        s = line.strip()
+        if s == "" or s.startswith("--"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def read(name):
     with open(os.path.join(LIB, name), encoding="utf-8") as fh:
-        return fh.read().rstrip("\n")
+        return strip_lua(fh.read().rstrip("\n"))
 
 
 def versions():

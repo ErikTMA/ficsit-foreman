@@ -163,12 +163,19 @@ function App.report(topo, planner, plan, opts)
     if c.provides then src = src + 1 end
     if c.buffer or c.output then buf = buf + 1 end
   end
+  local nc, ns, nm, nk, nb, no =
+    #(topo.containers or {}), #(topo.splitters or {}), #(topo.mergers or {}),
+    #(topo.constructors or {}), #(topo.belts or {}), #(planner.router.orders or {})
+  -- only log when the discovered SHAPE changes — the loop rebuilds every couple of
+  -- seconds and logging each tick floods the console.
+  local sig = table.concat({ nc, src, buf, ns, nm, nk, nb, no }, ",")
+  if sig == App._lastReport then return end
+  App._lastReport = sig
   computer.log(1, ("[Foreman] discovered: %d containers (%d src, %d buf), %d splitters, %d mergers, %d machines, %d belts; %d orders")
-    :format(#(topo.containers or {}), src, buf, #(topo.splitters or {}), #(topo.mergers or {}),
-            #(topo.constructors or {}), #(topo.belts or {}), #(planner.router.orders or {})))
+    :format(nc, src, buf, ns, nm, nk, nb, no))
   for _, line in ipairs(plan or {}) do computer.log(1, "[Foreman]   plan: " .. line) end
   if src == 0 then computer.log(2, "[Foreman] no SOURCE containers — nick an input '<Item>_input_1' (or bare 'input')") end
-  if #(topo.belts or {}) == 0 then computer.log(2, "[Foreman] no BELTS discovered — is the belt graph connected to networked buildings?") end
+  if nb == 0 then computer.log(2, "[Foreman] no BELTS discovered — connect buildings with real belts (codeable splitters/mergers need belted ports; beltless 'snap' mods like DirectToSplitter don't transfer)") end
 end
 
 function App.run(modules, topology, opts)

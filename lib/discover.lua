@@ -68,13 +68,58 @@ function Discover.classify(p)
   return nil
 end
 
+-- connector identity: the game returns a FRESH trace object each call, so `==` is
+-- unreliable — compare by getHash (every reflected object has it). Falls back to `==`
+-- for the emulator's stable connector objects.
+local function sameConn(a, b)
+  if a == b then return true end
+  if not (a and b) then return false end
+  local oka, ha = pcall(function() return a.getHash and a:getHash() end)
+  local okb, hb = pcall(function() return b.getHash and b:getHash() end)
+  return oka and okb and ha ~= nil and ha == hb
+end
+
 -- ordinal of connector `conn` among `ownerProxy`'s connectors of `dir`
 local function portIndex(ownerProxy, conn, dir)
   local idx = -1
   for _, c in ipairs(ownerProxy:getFactoryConnectors()) do
-    if c.direction == dir then idx = idx + 1; if c == conn then return idx end end
+    if c.direction == dir then idx = idx + 1; if sameConn(c, conn) then return idx end end
   end
   return 0
+end
+
+-- From an output connector, follow the connection chain THROUGH any intermediate
+-- conveyor/lift actors (a real belt is its own actor: building -> belt -> building)
+-- until reaching a connector whose owner is a KNOWN node. Returns destId + the node's
+-- arrival (input) connector, or nil. `nodeByHash` maps a node's getHash -> its id.
+-- (A direct connector-to-connector link, e.g. the emulator or a beltless snap, is the
+-- 0-hop case: the first owner is already a known node.)
+local function followToNode(startConn, nodeByHash)
+  local conn, hops = startConn, 0
+  while conn and hops < 64 do
+    hops = hops + 1
+    local okc, connected = pcall(function() return conn.isConnected end)
+    if not okc or not connected then return nil end
+    local okp, peer = pcall(function() return conn:getConnected() end)
+    if not okp or peer == nil then return nil end
+    local oko, owner = pcall(function() return peer.owner end)
+    if not oko or owner == nil then return nil end
+    local okh, h = pcall(function() return owner:getHash() end)
+    local destId = okh and h ~= nil and nodeByHash[tostring(h)] or nil
+    if destId then return destId, peer end          -- reached a known node
+    -- intermediate belt/lift: continue from its OUTPUT connector (not the arrival one)
+    local oco, conns = pcall(function() return owner:getFactoryConnectors() end)
+    if not oco or type(conns) ~= "table" then return nil end
+    local nextConn
+    for _, cc in ipairs(conns) do
+      if cc.direction == OUTPUT and not sameConn(cc, peer) then nextConn = cc; break end
+    end
+    if not nextConn then  -- fallback: any other connector
+      for _, cc in ipairs(conns) do if not sameConn(cc, peer) then nextConn = cc; break end end
+    end
+    conn = nextConn
+  end
+  return nil
 end
 
 -- a component's class never changes, and reflection (getFunctions over the hierarchy)
@@ -108,19 +153,27 @@ function Discover.run(opts)
     end
   end
 
+  -- node getHash -> id, so a connector's reached owner can be matched to a known node
+  local nodeByHash = {}
+  for nid, np in pairs(proxies) do
+    local okh, h = pcall(function() return np:getHash() end)
+    if okh and h ~= nil then nodeByHash[tostring(h)] = nid end
+  end
+
   for id, p in pairs(proxies) do
     if p.getFactoryConnectors then
       local outIdx = -1
-      for _, c in ipairs(p:getFactoryConnectors()) do
+      local okc, conns = pcall(function() return p:getFactoryConnectors() end)
+      for _, c in ipairs((okc and conns) or {}) do
         if c.direction == OUTPUT then
           outIdx = outIdx + 1
           if c.isConnected then
-            local peer = c:getConnected()
-            local owner = peer and peer.owner
-            if owner and owner.isNetworkComponent and proxies[owner.id] then
+            -- traverse through any belt/lift actors to the next real node
+            local destId, arrival = followToNode(c, nodeByHash)
+            if destId then
               topo.belts[#topo.belts + 1] = {
                 from = id, fromOutput = outIdx,
-                to = owner.id, toInput = portIndex(owner, peer, INPUT),
+                to = destId, toInput = portIndex(getProxy(destId), arrival, INPUT),
               }
             end
           end
