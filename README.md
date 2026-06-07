@@ -47,8 +47,9 @@ source of truth.
    (the controller drives those — the LITE hardware floor).
 2. Paste `dist/foreman-lite.lua` into the EEPROM.
 3. Declare your factory in the `TOPOLOGY` table at the top (see
-   [`examples/topology.example.lua`](examples/topology.example.lua)) — FIN can't sense
-   belt wiring, so you declare it once.
+   [`examples/topology.example.lua`](examples/topology.example.lua)), OR leave it and let
+   `lib/discover.lua` crawl the belt graph automatically (`getFactoryConnectors` →
+   `getConnected` → `owner`).
 4. Hand-name your containers `<Item>_<Keyword>_<N>`.
 
 **FULL (after the Internet Card):** paste `dist/foreman-loader.lua` instead, set its
@@ -69,10 +70,12 @@ python3 tools/bundle.py     # regenerates dist/{foreman.lua, foreman-lite.lua, f
 ## Architecture notes
 
 - **Pure FIN APIs only** (`component` / `event` / `computer` / `filesystem` / `future` /
-  `classes` / `structs`). No `print` (FIN nils it — use `computer.log`).
-- **Topology is declared data**, not sensed: `FactoryConnection` exposes no owner, so a
-  program can't walk the belt graph in-game. You declare nodes + port-aware belts; the
-  framework discovers *paths*.
+  `classes` / `structs`). `print` works (FIN re-adds it; logs with a space-join).
+- **Topology can be auto-discovered.** A `FactoryConnection` is an `ActorComponent`, so
+  it has `.owner` (the building); `connector:getConnected().owner` reaches the neighbour.
+  `lib/discover.lua` crawls `getFactoryConnectors → getConnected → owner` to rebuild the
+  belt graph (nodes + ports) automatically — a link-state crawl. You can still *declare*
+  a topology if you prefer; roles/items come from container nicks + recipes either way.
 - Limits to respect (FIN): ~2500 Lua instructions/tick (then it yields), a 250-entry
   signal queue, NetworkCard messages ≤ 7 params.
 
