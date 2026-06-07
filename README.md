@@ -20,38 +20,45 @@ self-managing logistics + production controller:
 It aims to grow into a full A→Z factory controller (power, trains, dashboards) — the
 core is a small kernel + pluggable modules.
 
-## Two distributions
+## Two distributions — separate, independently versioned, no auto-upgrade
 
-| | What | When |
-|---|---|---|
-| **LITE** | `dist/foreman-lite.lua` — a single self-contained EEPROM (no Internet Card, no hard drive). | From the moment you can run a Computer Case (HUB Tier 3 *Basics Networks*). By then you already have Smelter / Constructor / **Assembler**, so LITE drives those single-recipe chains with gated buffers. |
-| **FULL** | `dist/foreman.lua` — the complete framework, fetched over HTTP. | Once the **Internet Card** is unlocked (a late MAM node behind the SAM Fluctuator). The LITE EEPROM **auto-detects the card and fetches FULL**, adding multi-recipe selection, scaled auto-discovery, full reroute and auto-naming. |
+LITE and FULL are **distinct products**. LITE never upgrades itself; you choose FULL
+deliberately by pasting its loader once you have an Internet Card. Each has its own
+version (see the `VERSION` file: `lite=` / `full=`), and they can differ.
 
-Both are generated from the same `lib/` source by `tools/bundle.py` — one source of truth.
+| | Artifact(s) | What | When |
+|---|---|---|---|
+| **LITE** | `dist/foreman-lite.lua` | A single **self-contained** EEPROM — no Internet Card, no hard drive, **no fetch logic at all**. Drives single-recipe Smelter/Constructor/Assembler chains with gated buffers + room-aware delivery. | From the moment you can run a Computer Case (HUB Tier 3 *Basics Networks*). The Assembler is already unlocked by then. |
+| **FULL** | `dist/foreman-loader.lua` + `dist/foreman.lua` | Paste the small **loader** EEPROM; it requires an Internet Card and fetches the FULL bundle (`foreman.lua`) from the pinned release tag, then runs it: multi-recipe selection, scaled auto-discovery, full reroute, auto-naming. | Once the **Internet Card** is unlocked (a late MAM node behind the SAM Fluctuator). You install it on purpose — nothing happens automatically. |
 
-## Quick start (LITE)
+All artifacts are generated from the same `lib/` source by `tools/bundle.py` — one
+source of truth.
 
+## Quick start
+
+**LITE (early game):**
 1. Build a Computer Case + Lua CPU + RAM + EEPROM, and **Codeable Splitters / Mergers**
-   (the controller drives those; they're the LITE hardware floor).
+   (the controller drives those — the LITE hardware floor).
 2. Paste `dist/foreman-lite.lua` into the EEPROM.
 3. Declare your factory in the `TOPOLOGY` table at the top (see
    [`examples/topology.example.lua`](examples/topology.example.lua)) — FIN can't sense
    belt wiring, so you declare it once.
-4. Nick your containers `input` / `output` / `buffer` (FULL auto-renames them;
-   under LITE name them `<Item>_<Keyword>_<N>` by hand).
+4. Hand-name your containers `<Item>_<Keyword>_<N>`.
 
-When you later unlock the Internet Card, nothing to re-do — the EEPROM detects it and
-upgrades itself to FULL (pinned to this release tag).
+**FULL (after the Internet Card):** paste `dist/foreman-loader.lua` instead, set its
+`TOPOLOGY`. It fetches the pinned FULL bundle and runs it (and auto-names containers
+nicked `input` / `output` / `buffer`). Switching is a deliberate re-paste — LITE keeps
+running untouched until you do.
 
 ## Build from source
 
 ```sh
-python3 tools/bundle.py     # regenerates dist/foreman.lua + dist/foreman-lite.lua from lib/
+python3 tools/bundle.py     # regenerates dist/{foreman.lua, foreman-lite.lua, foreman-loader.lua}
 ```
 
-`dist/` is committed so the Internet Card can fetch `dist/foreman.lua` raw and you can
-paste `dist/foreman-lite.lua` directly. The bootstrap pins a **release tag** (never
-`main`) and verifies an end-of-file marker against truncated fetches.
+`dist/` is committed so the loader can fetch `dist/foreman.lua` raw and you can paste
+`dist/foreman-lite.lua` / `dist/foreman-loader.lua` directly. The loader pins a
+**release tag** (never `main`) and verifies an end-of-file marker against truncated fetches.
 
 ## Architecture notes
 
