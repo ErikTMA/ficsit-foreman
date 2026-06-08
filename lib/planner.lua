@@ -30,9 +30,13 @@ function Planner.new(topology, router, getProxy)
   self.getProxy = getProxy or function(id) return component.proxy(id) end
   self.recipesByProduct = {}     -- itemName -> list of recipe options
   self.busy = {}                 -- ctorId -> true once assigned this planning pass
-  self.sources = {}              -- itemName -> source container id (declared provides)
+  self.sources = {}              -- itemName -> { source container ids } (declared provides)
   for _, c in ipairs(topology.containers or {}) do
-    if c.provides then self.sources[lc(c.provides)] = c.id end
+    if c.provides then
+      local k = lc(c.provides)
+      self.sources[k] = self.sources[k] or {}
+      table.insert(self.sources[k], c.id)
+    end
   end
   return self
 end
@@ -90,6 +94,37 @@ function Planner:available(item)
     if lc(c.provides) == item then n = n + count_in(self.getProxy(c.id), item) end
   end
   return n
+end
+
+-- Order `qty` of a raw item to `dst`, SPLIT across every source container that provides it
+-- (each capped by what it physically holds), placing one router order per contributing
+-- source. A single order would pin the whole qty to ONE source — the router gates the
+-- others to 0 and their stock is stranded, so a buffer fed from two input containers can
+-- never fill. Returns true if at least one order was placed, and the qty left unplaced.
+function Planner:orderFrom(item, qty, dst, ratioNum, ratioDen)
+  item = lc(item)
+  local srcs = self.sources[item] or {}
+  if #srcs == 0 then return false, qty end
+  local function stamp()        -- record the stable recipe ratio for gateSources (out>1 fix)
+    if ratioDen then local o = self.router.orders[#self.router.orders]; o.ratioNum = ratioNum; o.ratioDen = ratioDen end
+  end
+  local remaining, placed = qty, false
+  for _, sid in ipairs(srcs) do
+    if remaining <= 0 then break end
+    local take = math.min(remaining, count_in(self.getProxy(sid), item))
+    if take > 0 then
+      self.router:order(item, take, dst, sid); stamp()
+      remaining = remaining - take; placed = true
+    end
+  end
+  -- whatever the current on-hand could not cover: still order it (from the first source) so
+  -- the gate AUTHORIZES that source to release as stock refills within the epoch. Without this
+  -- a source that is momentarily empty at plan time (a miner/belt still catching up) would be
+  -- gated shut for the whole ~2s replan interval even though demand exists.
+  if remaining > 0 then
+    self.router:order(item, remaining, dst, srcs[1]); stamp(); placed = true; remaining = 0
+  end
+  return placed, remaining
 end
 
 -- ---- producibility (recursive) ---------------------------------------------
@@ -160,19 +195,32 @@ end
 -- that makes it), or nil if it can't be produced (no recipe, or no free constructor for
 -- a stage). Each stage uses a DISTINCT free constructor (freeOnly) — a machine runs one
 -- recipe.
-function Planner:produce(item, need, depth)
-  item = lc(item); depth = depth or 0
-  if self.sources[item] then return self.sources[item] end
+-- cumNum/cumDen carry the CUMULATIVE recipe ratio: units of `item` (this stage's product)
+-- per unit of the TERMINAL product. The top call (terminal product itself) is 1/1; each
+-- recursion multiplies by the stage's ingredient.amount / product.out. Ingredient orders are
+-- stamped with their ratio-to-terminal so gateSources caps the raw source by a stable ratio.
+function Planner:produce(item, need, depth, cumNum, cumDen)
+  item = lc(item); depth = depth or 0; cumNum = cumNum or 1; cumDen = cumDen or 1
+  if self.sources[item] then return self.sources[item][1] end   -- raw: first source (back-compat)
   if depth > 8 then return nil end
   local pick = self:chooseRecipe(item, need, depth, true)
   if not pick then return nil end
   self.busy[pick.opt.ctorId] = true              -- claim before recursing (no reuse)
   pick.opt.ctor:setRecipe(pick.opt.recipe)
+  local out = pick.opt.out or 1
   for _, ing in ipairs(pick.opt.ingredients) do
     local qty = pick.crafts * ing.amount
-    local src = self:produce(ing.name, qty, depth + 1)
-    if not src then return nil end
-    self.router:order(ing.name, qty, pick.opt.ctorId, src)
+    local rNum, rDen = cumNum * ing.amount, cumDen * out   -- this ingredient per terminal product
+    if self.sources[ing.name] then
+      -- raw ingredient: split the order across ALL providing source containers, ratio-stamped.
+      if not self:orderFrom(ing.name, qty, pick.opt.ctorId, rNum, rDen) then return nil end
+    else
+      -- crafted ingredient: make it on its own constructor, then order from there.
+      local src = self:produce(ing.name, qty, depth + 1, rNum, rDen)
+      if not src then return nil end
+      self.router:order(ing.name, qty, pick.opt.ctorId, src)
+      local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
+    end
   end
   return pick.opt.ctorId
 end
@@ -210,19 +258,25 @@ function Planner:fillBuffer(bufferId, item, target)
   local need = target - current
   if need <= 0 then return true, "already full" end
 
-  -- direct source available? route it straight.
+  -- direct source available? route it straight, SPLIT across every providing source.
   if self.sources[item] then
     local qty = math.min(need, self:available(item))
-    if qty > 0 then self.router:order(item, qty, bufferId) end
+    if qty > 0 then self:orderFrom(item, qty, bufferId) end
     return true, ("direct %d %s"):format(qty, item)
   end
 
   -- otherwise craft it — possibly through multiple stages (copper -> wire -> cable).
   -- produce() plans the whole sub-tree and returns where `item` ends up available.
   if self:producible(item) <= 0 then return false, "no recipe / no ingredients for " .. item end
+  local startN = #self.router.orders          -- ingredient orders produce() places land after here
   local producer = self:produce(item, need, 0)
   if not producer then return false, "no free constructor to craft " .. item end
-  self.router:order(item, need, bufferId, producer)   -- product producer -> buffer
+  self.router:order(item, need, bufferId, producer)   -- TERMINAL product order: producer -> buffer
+  -- point every ingredient order in this craft sub-tree at the terminal product order, so
+  -- gateSources gates each raw source against the BUFFER's delivery (× recipe ratio), not
+  -- against the ingredient's arrival at a constructor (which would over-release unboundedly).
+  local terminal = self.router.orders[#self.router.orders]
+  for i = startN + 1, #self.router.orders - 1 do self.router.orders[i].term = terminal end
   return true, ("craft %d %s"):format(need, item)
 end
 
@@ -240,8 +294,10 @@ function Planner:fillAll()
       plan[#plan + 1] = ("%s: %s"):format(c.id, msg)
     end
   end
-  -- now that all orders exist, gate each source at its own output connector so it
-  -- releases EXACTLY the demanded total (and an un-demanded source releases nothing).
+  -- now that all orders exist: (1) compute per-edge quota from their stored paths so
+  -- routing is balanced and node-agnostic, then (2) gate each source at its own output
+  -- connector so it releases EXACTLY the demanded total (un-demanded sources release nothing).
+  if self.router and self.router.buildQuota then self.router:buildQuota() end
   if self.router and self.router.gateSources then self.router:gateSources() end
   return plan
 end

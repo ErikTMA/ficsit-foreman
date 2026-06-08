@@ -193,6 +193,12 @@ function App.run(modules, topology, opts)
   local getProxy = opts.getProxy or function(id) return component.proxy(id) end
   local declared = topology                       -- nil => auto-discover (and re-discover)
 
+  -- New session: clear the source-gating ledgers. Router._auth (cumulative authorized) and
+  -- Router._deliv (cumulative delivered) are module-global so they PERSIST across the
+  -- rebuilds inside this loop (that is what stops a rebuild re-releasing in-flight stock);
+  -- but a fresh App.run is a fresh session and must start them empty.
+  if modules.Router then modules.Router._auth = {}; modules.Router._deliv = {} end
+
   -- One long-lived listener delegating to the CURRENT router; rebuilds swap the
   -- router instance in `ctx` rather than re-registering (no duplicate listeners).
   local ctx = {}
