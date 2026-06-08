@@ -138,13 +138,13 @@ function Discover.run(opts)
   local getProxy = opts.getProxy or function(id) return component.proxy(id) end
 
   local topo = { containers = {}, splitters = {}, mergers = {}, constructors = {}, belts = {} }
-  local proxies = {}
+  local proxies, roleById = {}, {}
   for _, id in ipairs(find("")) do
     local p = getProxy(id)
     if p then
       local role = Discover.roleCached(id, p)
       if role then
-        proxies[id] = p
+        proxies[id] = p; roleById[id] = role
         if role == "splitter" then topo.splitters[#topo.splitters + 1] = id
         elseif role == "merger" then topo.mergers[#topo.mergers + 1] = id
         elseif role == "machine" then topo.constructors[#topo.constructors + 1] = id
@@ -171,10 +171,12 @@ function Discover.run(opts)
   end
 
   for id, p in pairs(proxies) do
-    if p.getConnectorByIndex then
+    if roleById[id] == "splitter" then
       -- SPLITTER: outputs are FIN logic-indexed (transferItem(out) maps 0->Output2,
       -- 1->Output1, 2->Output3). fromOutput MUST be that logic index, not a connector
       -- ordinal, or routing transfers to the wrong output -> items pile up / stall.
+      -- Use the ROLE (not `p.getConnectorByIndex`, which would deprecation-warn on every
+      -- non-splitter); a splitter always HAS getConnectorByIndex so calling it is clean.
       local i = 0
       while i < 16 do
         local okc, c = pcall(function() return p:getConnectorByIndex(i) end)

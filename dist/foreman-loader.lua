@@ -7,7 +7,7 @@
 -- ============================================================================
 
 -- >>> CHANGE THIS to upgrade/downgrade FULL (any released version tag, no 'v') <<<
-local VERSION = "0.4.1"
+local VERSION = "0.4.2"
 
 -- Paste-and-go: leave TOPOLOGY nil and FULL auto-discovers the belt graph + reads
 -- container nicks. Only set it to declare the topology by hand (or FOREMAN_TOPOLOGY).
