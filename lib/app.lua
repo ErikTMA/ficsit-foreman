@@ -134,7 +134,9 @@ end
 -- (App.build) only needs to run occasionally to catch newly-built machines/containers.
 function App.plan(modules, topo, getProxy, opts)
   local router  = modules.Router.new(topo, getProxy)
-  local planner = modules.Planner.new(topo, router, getProxy)
+  -- epochSeconds (the re-plan cadence) sizes per-machine capacity for demand-proportional
+  -- pool allocation; default 2s matches the persistent loop's replan interval.
+  local planner = modules.Planner.new(topo, router, getProxy, opts and opts.replan)
   router:listenAll()        -- listen to all splitters/mergers (once per session; faster reactions)
   local plan = planner:fillAll()   -- places orders AND gates each source connector
   router:pump()             -- level-triggered: drain any items already held in codeables
@@ -221,6 +223,9 @@ function App.run(modules, topology, opts)
   -- rebuilds inside this loop (that is what stops a rebuild re-releasing in-flight stock);
   -- but a fresh App.run is a fresh session and must start them empty.
   if modules.Router then modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {} end
+  -- The constructor-pool scheduler keeps a DURABLE per-machine state (recipe assignment +
+  -- drain progress) module-side so it survives the ~2s rebuilds; a fresh session starts clean.
+  if modules.Planner then modules.Planner._ctorState = {} end
 
   -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by
   -- default for clean output. Enable by passing opts.debug=true OR nicking the Computer Case

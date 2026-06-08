@@ -32,19 +32,43 @@ REPO = os.environ.get("FOREMAN_REPO", "ficsit-foreman")
 EOF_MARKER = "--[[FOREMAN_EOF]]"
 
 
+def _strip_trailing_comment(line):
+    """Cut a line at its first `--` that starts a comment (i.e. is NOT inside a string), via a
+    tiny per-line lexer that tracks single/double quotes and backslash escapes. Our libs use no
+    long-bracket strings/comments ([[ ]]), so a `--` outside a quoted string always begins a
+    line comment. Safe even if a future string contains `--` (it stays inside the quote state).
+    Returns the code portion with the trailing comment + surrounding space removed."""
+    in_str, i, n = None, 0, len(line)
+    while i < n:
+        c = line[i]
+        if in_str:
+            if c == "\\":
+                i += 2; continue
+            if c == in_str:
+                in_str = None
+        elif c == '"' or c == "'":
+            in_str = c
+        elif c == "-" and i + 1 < n and line[i + 1] == "-":
+            return line[:i].rstrip()
+        i += 1
+    return line
+
+
 def strip_lua(src):
-    """Drop full-line comments + blank lines AND leading indentation to keep the EEPROM lean.
+    """Drop comments (full-line AND trailing) + blank lines AND leading indentation to keep the
+    EEPROM lean — comments document the SOURCE, they need not ship as EEPROM bytes.
     SAFE for our libs: they use no long-bracket strings/comments ([[ ]]) and no multi-line
-    strings, so (a) a line starting with -- is always a comment, never string content, and
-    (b) Lua is free-form — leading whitespace is purely cosmetic, so stripping each line's
-    indent never changes parsing (newlines still separate statements). Trailing comments are
-    left intact (stripping those could touch a -- inside a string)."""
+    strings, so (a) a line starting with -- is always a comment, (b) Lua is free-form — leading
+    whitespace is purely cosmetic, so stripping each line's indent never changes parsing, and
+    (c) the trailing-comment cut is string/escape-aware (see _strip_trailing_comment)."""
     out = []
     for line in src.split("\n"):
         s = line.strip()
         if s == "" or s.startswith("--"):
             continue
-        out.append(s)
+        s = _strip_trailing_comment(s)
+        if s != "":
+            out.append(s)
     return "\n".join(out)
 
 

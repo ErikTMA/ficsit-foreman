@@ -267,21 +267,46 @@ end
 --- reach this computer. CRITICAL: in FIN, event.registerListener only sets a callback
 --- filter — you must ALSO event.listen(component) for each signal source, or NOTHING
 --- arrives (the "items stuck at the first merger" symptom).
---- Listen each component at most ONCE per session: in-game event.listen(component) calls
---- HookSubsystem::AttachHooks which does ClearHooks + NewObject<UFIRHook> EVERY call, so
---- re-listening all components on every ~2s rebuild churns hook UObjects and piles up GC
---- pressure (the "lags more and more the longer it runs" symptom). The set is reset per
---- App.run session; the FIN side de-dupes the listener itself (AddUnique).
+---
+--- LISTEN-ONCE, RE-SYNC ON CHANGE. Two in-game costs make naive listening leak FPS:
+---  (1) event.listen(component) -> HookSubsystem::AttachHooks = ClearHooks + NewObject<UFIRHook>
+---      EVERY call, so re-listening all components on every ~2s rebuild churns hook UObjects
+---      (the original "lags more over time" v0.7.1 symptom) — so we must NOT re-listen a stable set.
+---  (2) WORSE, and the real progressive-FPS leak: FIN's AFINSignalSubsystem keeps a per-SENDER
+---      entry FOREVER for the session (only removed by event.ignore / save). When a player
+---      repairs/re-snaps/rebuilds a belt/splitter/merger/container it gets a NEW FGuid, so the
+---      ~4s re-discovery listens the new id and ORPHANS the old id's sender+hooks permanently.
+---      The orphan set grows with distinct-ids-seen; the game thread then pays on every UE GC
+---      pass (walks every sender's traces) and every item grab (IsSender over the growing map)
+---      => steady decline that vanishes the instant the computer halts (Reset -> IgnoreAll).
+--- Fix: only TOUCH the listeners when the live codeable id-set actually CHANGES; then prune
+--- EVERYTHING (event.ignoreAll drops the orphans we can no longer reference) and re-listen the
+--- current set. A stable factory still listens exactly once (no churn); a rebuild costs one
+--- bounded re-sync instead of an immortal orphan. Reset per App.run session.
 Router._listened = Router._listened or {}
 function Router:listenAll()
   if not (event and event.listen) then return end
-  local function listen(id)
-    if Router._listened[id] then return end
-    local p = self.getProxy(id)
-    if p then pcall(function() event.listen(p) end); Router._listened[id] = true end
+  local want = {}
+  for _, id in ipairs(self.topo.splitters or {}) do want[id] = true end
+  for _, id in ipairs(self.topo.mergers or {}) do want[id] = true end
+  -- changed iff some wanted id is not yet listened, or some listened id is gone from the topology
+  local changed = false
+  for id in pairs(want) do if not Router._listened[id] then changed = true; break end end
+  if not changed then
+    for id in pairs(Router._listened) do if not want[id] then changed = true; break end end
   end
-  for _, id in ipairs(self.topo.splitters or {}) do listen(id) end
-  for _, id in ipairs(self.topo.mergers or {}) do listen(id) end
+  if not changed then return end                 -- stable set: nothing to do (no re-listen churn)
+  local prev = 0; for _ in pairs(Router._listened) do prev = prev + 1 end
+  if event.ignoreAll then pcall(function() event.ignoreAll() end) end   -- drop ALL incl orphaned senders
+  Router._listened = {}
+  local n = 0
+  for id in pairs(want) do
+    local p = self.getProxy(id)
+    if p then pcall(function() event.listen(p) end); Router._listened[id] = true; n = n + 1 end
+  end
+  if Router.DEBUG and computer and computer.log then
+    computer.log(1, ("[Foreman] listeners re-synced %d -> %d (pruned orphaned senders)"):format(prev, n))
+  end
 end
 
 --- Register the signal handler that executes routing AND listen to all codeable nodes.
