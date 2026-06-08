@@ -593,18 +593,23 @@ function Router:pump()
     for _, id in ipairs(self.topo.mergers or {}) do
       local m = self.getProxy(id)
       if m and m.getInput then
-        -- ALTERNATE inputs fairly. A merger's output holds only 2 items, so always trying
-        -- inputs 0,1,2 in fixed order lets input 0 keep grabbing the freed slot first and
-        -- STARVE inputs 1/2 (their upstream sources back up — the "merger doesn't alternate"
-        -- symptom). Rotate the starting input each pump via a per-merger round-robin cursor.
+        -- ALTERNATE inputs fairly. A merger's output holds only 2 items, so always draining
+        -- inputs 0,1,2 in fixed order lets the early inputs grab the freed slots and STARVE
+        -- the rest (uneven, drifting ratios). Forward exactly ONE item per pass, from the next
+        -- non-empty input at/after the cursor, then advance the cursor PAST it — so consecutive
+        -- forwards rotate evenly across the active inputs (1:1:1). The while-loop re-runs to
+        -- forward the rest in that rotated order.
         local start = self._mrr[id] or 0
         for k = 0, 2 do
           local i = (start + k) % 3
           local ok, it = pcall(function() return m:getInput(i) end)
           local nm = ok and itemName(it)
-          if nm and self:_mergerPush(m, id, i, nm) then total = total + 1; progressed = true end
+          if nm and self:_mergerPush(m, id, i, nm) then
+            total = total + 1; progressed = true
+            self._mrr[id] = (i + 1) % 3            -- next forward serves the input after this one
+            break
+          end
         end
-        self._mrr[id] = (start + 1) % 3
       end
     end
   end
