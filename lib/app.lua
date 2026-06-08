@@ -166,7 +166,7 @@ end
 -- transferItem output port at each splitter hop). Short 6-char ids match the netdump labels,
 -- so a path that ends somewhere other than its dst (or routes through DEFAULT_OUT) is visible.
 function App.dumpPaths(router)
-  if App._pathsLogged or not (computer and computer.log) then return end
+  if not App._debug or App._pathsLogged or not (computer and computer.log) then return end
   App._pathsLogged = true
   local function s(x) return tostring(x):sub(1, 6) end
   for _, o in ipairs(router.orders or {}) do
@@ -221,6 +221,14 @@ function App.run(modules, topology, opts)
   -- rebuilds inside this loop (that is what stops a rebuild re-releasing in-flight stock);
   -- but a fresh App.run is a fresh session and must start them empty.
   if modules.Router then modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {} end
+
+  -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by
+  -- default for clean output. Enable by passing opts.debug=true OR nicking the Computer Case
+  -- "debug". Surfaces App.dumpPaths + Router._dlog.
+  local dbg = opts.debug
+  if dbg == nil then pcall(function() local ci = computer.getInstance and computer.getInstance(); dbg = (ci and ci.nick == "debug") or false end) end
+  App._debug = dbg and true or false
+  if modules.Router then modules.Router.DEBUG = App._debug end
 
   -- One long-lived listener delegating to the CURRENT router; rebuilds swap the
   -- router instance in `ctx` rather than re-registering (no duplicate listeners).

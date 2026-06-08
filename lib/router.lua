@@ -31,7 +31,9 @@ Router.__index = Router
 -- sink) so a busy factory's routing is visible without flooding the console. Short 6-char
 -- ids match the netdump labels. Disable by leaving _dn at the cap.
 Router._dn = 0
+Router.DEBUG = false          -- App.run sets this from opts.debug / a computer nicked "debug"
 function Router._dlog(msg)
+  if not Router.DEBUG then return end
   if Router._dn < 60 and computer and computer.log then
     Router._dn = Router._dn + 1
     computer.log(1, "[Foreman] " .. msg)
@@ -130,6 +132,7 @@ function Router.new(topology, getProxy)
   self.ordersByItem = {}          -- item -> order (latest placed; back-compat)
   self.ordersForItem = {}         -- item -> { all orders } (multi-destination routing)
   self._fh = {}                   -- firstHop cache: [from][dst] = belt | false
+  self._mrr = {}                  -- per-merger round-robin input cursor (fair input draining)
   return self
 end
 
@@ -548,6 +551,17 @@ function Router:gateSources()
     -- player hand-fills or deletes) therefore leaves a small, bounded leftover budget that can
     -- leak to the sink — a rare manual-intervention edge, accepted over breaking normal fills.
   end
+  -- BLOCK every NON-source container's output (buffers, the DEFAULT_OUT sink, any storage).
+  -- They are DESTINATIONS: items flow IN and must STAY. If their output stays open they re-emit
+  -- their contents back into the manifold, which re-circulates around the belt loop and drips
+  -- to the sink (the "it fills the buffer but also takes from it" symptom). Fully blocked = 0
+  -- unblockedTransfers (never authorized), so nothing leaves. Inputs are unaffected.
+  for _, c in ipairs(self.topo.containers or {}) do
+    if not self.sourceItem[c.id] then
+      local conn = self:_outputConnector(self.getProxy(c.id))
+      if conn then pcall(function() conn.blocked = true end) end
+    end
+  end
 end
 
 --- LEVEL-TRIGGERED routing sweep. ItemRequest is edge-triggered (fires once on arrival)
@@ -572,11 +586,18 @@ function Router:pump()
     for _, id in ipairs(self.topo.mergers or {}) do
       local m = self.getProxy(id)
       if m and m.getInput then
-        for i = 0, 2 do
+        -- ALTERNATE inputs fairly. A merger's output holds only 2 items, so always trying
+        -- inputs 0,1,2 in fixed order lets input 0 keep grabbing the freed slot first and
+        -- STARVE inputs 1/2 (their upstream sources back up — the "merger doesn't alternate"
+        -- symptom). Rotate the starting input each pump via a per-merger round-robin cursor.
+        local start = self._mrr[id] or 0
+        for k = 0, 2 do
+          local i = (start + k) % 3
           local ok, it = pcall(function() return m:getInput(i) end)
           local nm = ok and itemName(it)
           if nm and self:_mergerPush(m, id, i, nm) then total = total + 1; progressed = true end
         end
+        self._mrr[id] = (start + 1) % 3
       end
     end
   end
