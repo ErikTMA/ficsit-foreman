@@ -671,13 +671,15 @@ function Planner:fillAll()
       self:tallyDraws(item, target - count_in(self.getProxy(c.id), item), 0, {})
     end
   end
-  -- PASS 1.5: size per-item unmet demand across the whole craft DAG, then hand the shared
-  -- constructor pool out demand-proportionally (multi-constructor per recipe; graceful
-  -- drain-then-switch reallocation lives in produceOn's FSM). hubDraw is ready, so
-  -- reachesNeedingBuffer sees the true (hold + draw) need.
-  self:computeDemand()
-  self:allocate()
-  -- PASS 2: fill every buffer (pooled split where allocated, else single-machine produce()).
+  -- PASS 2: fill every buffer with the single-machine produce() recursion (one machine per
+  -- recipe, claimed in topology order). The demand-proportional constructor-POOL scheduler
+  -- (computeDemand/allocate/produceOn/_fsmFeed) is DISABLED on the live base: in a real factory
+  -- it thrashed (re-allocated every ~2s), starved sibling chains (all machines piled onto the
+  -- highest-demand chain, leaving "no free constructor to craft wire" so released copper dumped
+  -- to the sink), and the per-epoch demand+reachability scan (hundreds of getInventories/findPath
+  -- = game-thread syncs) throttled routing. Those functions remain for a future redesign behind
+  -- stability hysteresis + flow control; fillBuffer falls straight through to produce() while
+  -- self.assign stays empty. (FPS-leak fix + dead-hub guard are unaffected.)
   local plan = {}
   for _, c in ipairs(self.topo.containers or {}) do
     local item = Planner.destItem(c)
