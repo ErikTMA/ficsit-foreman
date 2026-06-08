@@ -177,10 +177,21 @@ function Discover.run(opts)
       -- ordinal, or routing transfers to the wrong output -> items pile up / stall.
       -- Use the ROLE (not `p.getConnectorByIndex`, which would deprecation-warn on every
       -- non-splitter); a splitter always HAS getConnectorByIndex so calling it is clean.
-      local i = 0
+      -- CRITICAL: in-game getConnectorByIndex does `abs(i) % 3` — it WRAPS and never returns
+      -- nil, so a naive loop keeps going past output 2, recording phantom DUPLICATE belts at
+      -- fromOutput 3,4,5,... Those are poison: transferItem(3) clamps output>2 to 2 (=Output3),
+      -- so a belt recorded as fromOutput=3 claims to reach Output2's neighbour but physically
+      -- ships to Output3's — the item silently lands at the wrong building (the "goes to sink,
+      -- no SINK log" symptom). Stop as soon as a connector REPEATS (the wrap), so only the 3
+      -- real outputs are recorded. (The emulator returns nil past the real outputs; both break.)
+      local i, seen = 0, {}
       while i < 16 do
         local okc, c = pcall(function() return p:getConnectorByIndex(i) end)
         if not okc or c == nil then break end
+        local okh, h = pcall(function() return c.getHash and c:getHash() end)
+        local key = (okh and h ~= nil) and tostring(h) or tostring(c)
+        if seen[key] then break end                    -- wrapped past the real outputs
+        seen[key] = true
         local cok, connd = pcall(function() return c.isConnected end)
         if cok and connd then recordBelt(id, i, c) end
         i = i + 1
