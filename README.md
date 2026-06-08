@@ -24,6 +24,10 @@ self-managing logistics + production controller:
 - **Production planning** — auto-detects constructors/assemblers and their recipes via
   reflection, picks a recipe by throughput when stock is plentiful (else max yield),
   and auto-orders ingredients → machine → buffer to keep `<Item>_<Keyword>_<N>` buffers full.
+- **Multi-stage (transitive) crafting** — a buffer for a deep item resolves the whole
+  chain from raw sources: a `cable` buffer with only a copper source auto-plans
+  `copper → wire → cable` across two constructors. Each craft stage claims its own
+  free machine.
 - **Auto-naming** — name a container `input` / `output` / `buffer`; its first single
   item type renames it to `Iron_Plate_Buffer_1`, etc.
 - **Demand-driven auto-buffers** — name a container `auto_buffer` / `auto_output` and

@@ -92,23 +92,49 @@ function Planner:available(item)
   return n
 end
 
+-- ---- producibility (recursive) ---------------------------------------------
+-- Max units of `item` that can be made from raw SOURCES, crafting through as many
+-- recipe stages as needed (copper -> wire -> cable). A direct source returns its
+-- available stock; a craftable item returns the best a recipe can yield given its
+-- ingredients' own producibility. Cycle/depth guarded. This is what lets the planner
+-- treat an intermediate (wire) as "available" even though it's only in a buffer/recipe.
+function Planner:producible(item, depth, seen)
+  item = lc(item); depth = depth or 0; seen = seen or {}
+  if self.sources[item] then return self:available(item) end
+  if depth > 8 or seen[item] then return 0 end
+  local cands = self.recipesByProduct[item]
+  if not cands then return 0 end
+  seen[item] = true
+  local best = 0
+  for _, opt in ipairs(cands) do
+    local crafts = math.huge
+    for _, ing in ipairs(opt.ingredients) do
+      crafts = math.min(crafts, math.floor(self:producible(ing.name, depth + 1, seen) / ing.amount))
+    end
+    if crafts ~= math.huge and crafts > 0 then best = math.max(best, crafts * opt.out) end
+  end
+  seen[item] = nil
+  return best
+end
+
 -- ---- recipe selection ------------------------------------------------------
 -- Returns { opt, crafts, produced } or nil if nothing can be made.
---   * if a recipe can fully satisfy the need from available stock, pick the one
---     with the highest THROUGHPUT (output per minute = out/duration).
---   * otherwise pick the one that yields the MOST from what's available.
--- Constructors already assigned this pass (self.busy) are skipped unless none else
--- is available, so multiple constructors naturally take on different products.
-function Planner:chooseRecipe(item, need)
+--   * if a recipe can fully satisfy the need, pick the highest THROUGHPUT (out/min).
+--   * otherwise pick the one that yields the MOST from what's producible.
+-- Ingredient availability is RECURSIVE (producible): an ingredient that is itself
+-- craftable counts, enabling multi-stage chains. Busy constructors are skipped;
+-- freeOnly=true never reuses one (each craft stage needs its own machine).
+function Planner:chooseRecipe(item, need, depth, freeOnly)
   local cands = self.recipesByProduct[item]
   if not cands then return nil end
+  depth = depth or 0
   local function evaluate(allowBusy)
     local full, scarce
     for _, opt in ipairs(cands) do
       if allowBusy or not self.busy[opt.ctorId] then
         local craftsPossible = math.huge
         for _, ing in ipairs(opt.ingredients) do
-          craftsPossible = math.min(craftsPossible, math.floor(self:available(ing.name) / ing.amount))
+          craftsPossible = math.min(craftsPossible, math.floor(self:producible(ing.name, depth + 1) / ing.amount))
         end
         if craftsPossible > 0 then
           local producedPossible = craftsPossible * opt.out
@@ -125,7 +151,30 @@ function Planner:chooseRecipe(item, need)
     end
     return full or scarce
   end
-  return evaluate(false) or evaluate(true)   -- prefer a free constructor
+  return evaluate(false) or (not freeOnly and evaluate(true)) or nil   -- prefer a free constructor
+end
+
+-- Recursively MAKE `need` of `item`: claim a free constructor per craft stage, set its
+-- recipe, and (recursively) order each ingredient from its own producer. Returns the
+-- producer id where `item` becomes available (a source container, or the constructor
+-- that makes it), or nil if it can't be produced (no recipe, or no free constructor for
+-- a stage). Each stage uses a DISTINCT free constructor (freeOnly) — a machine runs one
+-- recipe.
+function Planner:produce(item, need, depth)
+  item = lc(item); depth = depth or 0
+  if self.sources[item] then return self.sources[item] end
+  if depth > 8 then return nil end
+  local pick = self:chooseRecipe(item, need, depth, true)
+  if not pick then return nil end
+  self.busy[pick.opt.ctorId] = true              -- claim before recursing (no reuse)
+  pick.opt.ctor:setRecipe(pick.opt.recipe)
+  for _, ing in ipairs(pick.opt.ingredients) do
+    local qty = pick.crafts * ing.amount
+    local src = self:produce(ing.name, qty, depth + 1)
+    if not src then return nil end
+    self.router:order(ing.name, qty, pick.opt.ctorId, src)
+  end
+  return pick.opt.ctorId
 end
 
 -- ---- fill one buffer -------------------------------------------------------
@@ -168,16 +217,13 @@ function Planner:fillBuffer(bufferId, item, target)
     return true, ("direct %d %s"):format(qty, item)
   end
 
-  -- otherwise craft it.
-  local pick = self:chooseRecipe(item, need)
-  if not pick then return false, "no recipe / no ingredients for " .. item end
-  self.busy[pick.opt.ctorId] = true   -- this constructor is now committed this pass
-  pick.opt.ctor:setRecipe(pick.opt.recipe)
-  for _, ing in ipairs(pick.opt.ingredients) do
-    self.router:order(ing.name, pick.crafts * ing.amount, pick.opt.ctorId, self.sources[ing.name])
-  end
-  self.router:order(item, pick.produced, bufferId, pick.opt.ctorId)  -- product src = constructor
-  return true, ("craft %d %s via '%s' (%d crafts)"):format(pick.produced, item, pick.opt.recipe.name, pick.crafts)
+  -- otherwise craft it — possibly through multiple stages (copper -> wire -> cable).
+  -- produce() plans the whole sub-tree and returns where `item` ends up available.
+  if self:producible(item) <= 0 then return false, "no recipe / no ingredients for " .. item end
+  local producer = self:produce(item, need, 0)
+  if not producer then return false, "no free constructor to craft " .. item end
+  self.router:order(item, need, bufferId, producer)   -- product producer -> buffer
+  return true, ("craft %d %s"):format(need, item)
 end
 
 --- Fill every destination in the topology (a container resolving to an item via
