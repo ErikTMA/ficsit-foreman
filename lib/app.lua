@@ -225,9 +225,9 @@ function App.run(modules, topology, opts)
   if modules.Router then modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {} end
   -- ingredient flow-control window (max in-flight feedstock per order, anti belt-flood); tunable.
   if modules.Router and opts.flowWindow then modules.Router.flowWindow = opts.flowWindow end
-  -- The constructor-pool scheduler keeps a DURABLE per-machine state (recipe assignment +
-  -- drain progress) module-side so it survives the ~2s rebuilds; a fresh session starts clean.
-  if modules.Planner then modules.Planner._ctorState = {} end
+  -- The control model keeps a DURABLE machine->recipe assignment (+ epoch clock for hysteresis)
+  -- module-side so it survives the ~2s rebuilds; a fresh session starts clean.
+  if modules.Planner then modules.Planner._assign = {}; modules.Planner._epoch = 0 end
 
   -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by
   -- default for clean output. Enable by passing opts.debug=true OR nicking the Computer Case

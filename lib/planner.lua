@@ -216,11 +216,12 @@ end
 -- IS being fed); the free-constructor check covers a hub not yet reached in this fill pass.
 function Planner:_hubViable(item, hub)
   item = lc(item)
-  if count_in(self.getProxy(hub), item) > 0 then return true end
+  if count_in(self.getProxy(hub), item) > 0 then return true end             -- has stock
+  if self.served and self.served[item] and #self.served[item] > 0 then return true end  -- a machine is ASSIGNED to fill it this epoch (order-independent of execution sequence)
   for _, o in ipairs(self.router.orders) do
-    if o.dst == hub and o.item == item then return true end
+    if o.dst == hub and o.item == item then return true end                  -- already being filled
   end
-  return self:chooseRecipe(item, 1, 0, true) ~= nil
+  return self:chooseRecipe(item, 1, 0, true) ~= nil                          -- a free machine can fill it
 end
 
 -- Recursively MAKE `need` of `item`: claim a free constructor per craft stage, set its
@@ -239,67 +240,66 @@ end
 -- claimed — so a recipe that can only be PARTIALLY supplied (e.g. screws available but iron
 -- plate uncraftable for reinforced plate) places NO orders at all, instead of releasing the
 -- one available ingredient to clog the belts with stock nothing will consume.
+-- Order every ingredient of recipe `opt` (for `crafts` batches) INTO machine `cid`. Shared by
+-- produce() (recursive un-hubbed sub-production) and produceFor() (the assigned-machine path).
+--   raw source       -> orderFrom (split across providers, ratio-stamped)
+--   hub-buffered      -> DRAW from the item's hub buffer (filled by its own machine), if viable
+--   un-hubbed crafted -> recursively produce() it on a free machine, order from there
+-- cumNum/cumDen carry the cumulative ratio of this ingredient per TERMINAL product (for gating).
+-- Returns ok, subClaimed (constructors the recursion claimed) — or false on any failure (caller
+-- rolls back). Places NO product order; the caller does that.
+function Planner:_orderIngredients(opt, crafts, cid, cumNum, cumDen, depth)
+  local sub, out = {}, opt.out or 1
+  -- ATOMIC: if any ingredient fails partway, un-claim the constructors EARLIER ingredients' recursive
+  -- produce() already claimed (else they leak busy + a setRecipe, re-churning every epoch). The
+  -- caller truncates the orders; this releases the machines.
+  local function fail() for _, c in ipairs(sub) do self.busy[c] = nil end; return false end
+  for _, ing in ipairs(opt.ingredients) do
+    local qty = crafts * ing.amount
+    local rNum, rDen = cumNum * ing.amount, cumDen * out   -- this ingredient per terminal product
+    if self.sources[ing.name] then
+      if not self:orderFrom(ing.name, qty, cid, rNum, rDen) then return fail() end
+    elseif self.bufferOf[ing.name] then
+      local hub = self.bufferOf[ing.name]
+      if not self:_hubViable(ing.name, hub) then return fail() end   -- never draw from a DEAD hub
+      if not self.router:order(ing.name, qty, cid, hub) then return fail() end
+      local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
+      self.router.sourceItem[hub] = lc(ing.name)
+    else
+      local src, sc = self:produce(ing.name, qty, (depth or 0) + 1, rNum, rDen)
+      if not src then return fail() end
+      for _, c in ipairs(sc or {}) do sub[#sub + 1] = c end   -- record claims BEFORE the order so fail() releases them
+      if not self.router:order(ing.name, qty, cid, src) then return fail() end
+      local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
+    end
+  end
+  return true, sub
+end
+
+-- Recursively MAKE `need` of an UN-HUBBED crafted `item` on a FREE machine (claimed via
+-- chooseRecipe), set its recipe (only on change — FIN setRecipe empties the input), order its
+-- ingredients (via _orderIngredients), and return the producer id + claimed constructors — or nil
+-- on any failure (atomic rollback: drops its orders AND un-claims its machines, so a partially-
+-- suppliable recipe places nothing). This is the deep-craft-tree path (e.g. deeptree's iron rod ->
+-- screw, which have no buffer); buffered items go through the assignment layer instead.
 function Planner:produce(item, need, depth, cumNum, cumDen)
   item = lc(item); depth = depth or 0; cumNum = cumNum or 1; cumDen = cumDen or 1
   if self.sources[item] then return self.sources[item][1], {} end   -- raw: first source (back-compat)
   if depth > 8 then return nil end
-  -- STABILITY: if a machine is already reserved for this item (it's running this recipe and the
-  -- item still needs filling — see fillAll's reservation pre-pass), USE that machine. Otherwise the
-  -- ~2s re-plan would re-hand machines out greedily and, when recipes outnumber machines, keep
-  -- yanking a machine off a still-needed recipe onto another (setRecipe churn = dumped input).
-  local pick
-  local rcid = self.reserved[item]
-  if rcid then
-    for _, opt in ipairs(self.recipesByProduct[item] or {}) do
-      if opt.ctorId == rcid then
-        pick = { opt = opt, crafts = ceil(need, opt.out), produced = ceil(need, opt.out) * opt.out }
-        break
-      end
-    end
-  end
-  if not pick then pick = self:chooseRecipe(item, need, depth, true) end
+  local pick = self:chooseRecipe(item, need, depth, true)
   if not pick then return nil end
   local startN = #self.router.orders
   local claimed = { pick.opt.ctorId }
-  self.busy[pick.opt.ctorId] = true              -- claim before recursing (no reuse)
-  -- setRecipe EMPTIES the constructor's input inventory EVERY call (FIN moves input->output,
-  -- even when set to the SAME recipe). The persistent loop re-plans every ~2s, so calling it
-  -- unconditionally would dump partial inputs each rebuild — a constructor holding 1 of 2 wire
-  -- loses it, items vanish, and it burns several copper per crafted wire. ONLY set it when the
-  -- recipe actually CHANGES (compare by recipe name).
+  self.busy[pick.opt.ctorId] = true
   local okc, cur = pcall(function() return pick.opt.ctor:getRecipe() end)
-  local curName = okc and cur and cur.name
-  if curName ~= pick.opt.recipe.name then pick.opt.ctor:setRecipe(pick.opt.recipe) end
-  local function rollback()
-    self.router:_truncateOrders(startN)          -- drop the partial ingredient orders
-    for _, c in ipairs(claimed) do self.busy[c] = nil end   -- release the constructors
+  if (okc and cur and cur.name) ~= pick.opt.recipe.name then pick.opt.ctor:setRecipe(pick.opt.recipe) end
+  local ok, sub = self:_orderIngredients(pick.opt, pick.crafts, pick.opt.ctorId, cumNum, cumDen, depth)
+  if not ok then
+    self.router:_truncateOrders(startN)
+    for _, c in ipairs(claimed) do self.busy[c] = nil end
     return nil
   end
-  local out = pick.opt.out or 1
-  for _, ing in ipairs(pick.opt.ingredients) do
-    local qty = pick.crafts * ing.amount
-    local rNum, rDen = cumNum * ing.amount, cumDen * out   -- this ingredient per terminal product
-    if self.sources[ing.name] then
-      -- raw ingredient: split the order across ALL providing source containers, ratio-stamped.
-      if not self:orderFrom(ing.name, qty, pick.opt.ctorId, rNum, rDen) then return rollback() end
-    elseif self.bufferOf[ing.name] then
-      -- ingredient stored in a BUFFER HUB (e.g. cable's wire in the wire buffer): DRAW from it
-      -- (the hub is filled by its own enlarged fill order) rather than crafting a parallel
-      -- stream; register it as a source so gateSources gates its output to this demand.
-      local hub = self.bufferOf[ing.name]
-      if not self:_hubViable(ing.name, hub) then return rollback() end   -- never draw from a DEAD hub
-      if not self.router:order(ing.name, qty, pick.opt.ctorId, hub) then return rollback() end
-      local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
-      self.router.sourceItem[hub] = lc(ing.name)
-    else
-      -- otherwise CRAFT it on its own constructor, then order from there.
-      local src, sub = self:produce(ing.name, qty, depth + 1, rNum, rDen)
-      if not src then return rollback() end
-      if not self.router:order(ing.name, qty, pick.opt.ctorId, src) then return rollback() end
-      local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
-      for _, c in ipairs(sub or {}) do claimed[#claimed + 1] = c end   -- inherit sub-tree claims
-    end
-  end
+  for _, c in ipairs(sub or {}) do claimed[#claimed + 1] = c end
   return pick.opt.ctorId, claimed
 end
 
@@ -331,125 +331,270 @@ end
 -- back-compat alias
 function Planner.bufferItemOf(id) return Planner.destItem({ id = id }) end
 
--- DRY-RUN the craft tree of `item` to tally how much of each HUB item it will DRAW, WITHOUT
--- placing orders or claiming constructors. fillAll runs this for every craftable buffer
--- BEFORE filling, so a hub's own fill order is enlarged by the total drawn THROUGH it (else
--- the hub is permanently under-fed by the draw amount, and the raw source feeding it is
--- never authorized for the throughput it must pass on).
-function Planner:tallyDraws(item, need, depth, seen)
-  item = lc(item); depth = depth or 0
-  if self.sources[item] or depth > 8 or (seen and seen[item]) then return end
-  local pick = self:chooseRecipe(item, need, depth, false)
-  if not pick then return end
-  seen = seen or {}; seen[item] = true
-  for _, ing in ipairs(pick.opt.ingredients) do
-    local qty = pick.crafts * ing.amount
-    if self.sources[ing.name] then                                   -- raw: no hub draw
-    elseif self.bufferOf[ing.name] then
-      self.hubDraw[ing.name] = (self.hubDraw[ing.name] or 0) + qty    -- DRAWN from this hub
-    else
-      self:tallyDraws(ing.name, qty, depth + 1, seen)                 -- crafted: recurse
+
+-- ============================================================================
+-- CONTROL MODEL — spec docs/superpowers/specs/2026-06-09-foreman-control-model-design.md.
+-- DEMAND (computeNeed) -> ASSIGNMENT (assign; durable + hysteresis) -> EXECUTION (produceFor;
+-- lossless). One coherent model replacing the reactive v0.9.x patches.
+-- ============================================================================
+
+-- DEMAND: per-item NEED (units) used to RANK what gets a machine — buffer shortfalls propagated
+-- through the craft DAG, PRODUCIBLE-CAPPED so a blocked item (no available feedstock) never ranks.
+function Planner:computeNeed()
+  self.need, self.hubDraw = {}, {}     -- hubDraw is tallied during propagation (each hub-buffered
+  for _, c in ipairs(self.topo.containers or {}) do          -- ingredient is a DRAW from its hub)
+    local item = Planner.destItem(c)
+    local target = c.target or Planner.destTarget(c)
+    if item and target and not self.sources[item] then
+      self:_addNeed(item, target - count_in(self.getProxy(c.id), item), 0, {})
     end
+  end
+end
+function Planner:_addNeed(item, units, depth, seen)
+  item = lc(item)
+  if units <= 0 or depth > 8 or seen[item] then return end
+  if self:producible(item) <= 0 then return end              -- producible cap (subsumes dead-hub)
+  self.need[item] = (self.need[item] or 0) + units
+  if self.sources[item] then return end                      -- raw leaf
+  local pick = self:chooseRecipe(item, units, depth, false)  -- representative recipe (sizing only)
+  if not pick then return end
+  seen[item] = true
+  local crafts = ceil(units, pick.opt.out)
+  for _, ing in ipairs(pick.opt.ingredients) do
+    local q = crafts * ing.amount
+    if self.bufferOf[ing.name] and not self.sources[ing.name] then
+      self.hubDraw[ing.name] = (self.hubDraw[ing.name] or 0) + q   -- drawn FROM ing's hub (sizes its fill)
+    end
+    self:_addNeed(ing.name, q, depth + 1, seen)
   end
   seen[item] = nil
 end
 
-function Planner:fillBuffer(bufferId, item, target)
-  if not item then return false, "not a destination: " .. tostring(bufferId) end
-  local current = count_in(self.getProxy(bufferId), item)
-  local need = target - current
-  -- if THIS buffer is the hub others DRAW from, produce extra so it holds its target AND
-  -- supplies the consumers (the draw total was tallied in fillAll's pre-pass).
-  if self.bufferOf[item] == bufferId and self.hubDraw and self.hubDraw[item] then
-    need = need + self.hubDraw[item]
-  end
-  if need <= 0 then return true, "already full" end
-
-  -- direct source available? route it straight, SPLIT across every providing source.
-  if self.sources[item] then
-    local qty = math.min(need, self:available(item))
-    if qty > 0 then self:orderFrom(item, qty, bufferId) end
-    return true, ("direct %d %s"):format(qty, item)
-  end
-
-  -- otherwise craft it — possibly through multiple stages (copper -> wire -> cable).
-  -- produce() claims one free constructor per stage and orders each ingredient from its producer.
-  if self:producible(item) <= 0 then return false, "no recipe / no ingredients for " .. item end
-  local startN = #self.router.orders          -- ingredient orders produce() places land after here
-  local producer = self:produce(item, need, 0)
-  if not producer then return false, "no free constructor to craft " .. item end
-  self.router:order(item, need, bufferId, producer)   -- TERMINAL product order: producer -> buffer
-  -- point every ingredient order in this craft sub-tree at the terminal product order, so
-  -- gateSources gates each raw source against the BUFFER's delivery (× recipe ratio), not
-  -- against the ingredient's arrival at a constructor (which would over-release unboundedly).
-  local terminal = self.router.orders[#self.router.orders]
-  for i = startN + 1, #self.router.orders - 1 do self.router.orders[i].term = terminal end
-  return true, ("craft %d %s"):format(need, item)
+-- per-epoch machine capacity (units) — sizes fan-out. Coarse fallback to one output batch.
+function Planner:_machineCap(opt)
+  local tp = opt.throughput or 0
+  if tp <= 0 then return opt.out or 1 end
+  return math.max(1, math.floor(tp * (self.epochSeconds or 2)))
 end
 
--- Does `item` still need filling anywhere — a buffer below target (incl. hub draw)? Drives the
--- stability reservation: a machine keeps its current recipe only while its product is still wanted.
-function Planner:_itemNeeded(item)
-  item = lc(item)
+-- a consumer (a buffer/hub or an assigned recipe's ingredient) that would accept item `it` — so
+-- dumping a leftover on setRecipe routes to it rather than sinking. Reads self.consumedSet, which
+-- assign() computes ONCE per epoch from the assignment — NOT the partially-built router.orders,
+-- which would make the verdict depend on pairs(self.served) execution order.
+function Planner:_hasConsumer(it)
+  it = lc(it)
+  if self.bufferOf[it] then return true end
+  return (self.consumedSet and self.consumedSet[it]) or false
+end
+
+-- LOSSLESS SWITCH gate. FIN setRecipe empties the input to the OUTPUT (router then routes it). Safe
+-- to switch `cid` to `wantOpt` iff EVERY leftover input item is routable — a new-recipe ingredient,
+-- or something with a consumer (_hasConsumer). If any leftover would SINK (no consumer, e.g. copper
+-- once wire is deallocated), keep draining instead so it's crafted into the current product, not
+-- dumped. (We do NOT special-case "can't finish a craft" — a partial of one ingredient can sit
+-- alongside a full stack of another, so that is NOT a bounded remnant.) Unknown input -> false.
+function Planner:canSwitch(cid, wantOpt)
+  local p = self.getProxy(cid)
+  local oki, inv = pcall(function() return p:getInputInv() end)
+  if not (oki and inv and inv.getStack) then return false end
+  local have = {}
+  for i = 0, (inv.size or 0) - 1 do
+    local s = inv:getStack(i)
+    if s and (s.count or 0) > 0 and s.item and s.item.type then
+      have[lc(s.item.type.name)] = (have[lc(s.item.type.name)] or 0) + s.count
+    end
+  end
+  if not next(have) then return true end                     -- empty: safe
+  local wantIng = {}
+  for _, ing in ipairs(wantOpt.ingredients) do wantIng[ing.name] = true end
+  for it in pairs(have) do
+    if not wantIng[it] and not self:_hasConsumer(it) then return false end   -- would sink: keep draining
+  end
+  return true
+end
+
+-- ASSIGNMENT (durable, anti-thrash). Keep each machine on its recipe while its product is still
+-- wanted; reassign only when satisfied, or out-ranked by need >= MARGIN after >= MIN_DWELL epochs.
+-- Cover distinct top-need recipes first (breadth), then spare machines fan out onto the highest-
+-- need item exceeding its served capacity. Only BUFFERED items are pooled; un-hubbed intermediates
+-- are produced on demand by produce() inside _orderIngredients.
+local MARGIN, MIN_DWELL = 1.6, 3
+Planner._assign = Planner._assign or {}    -- ctorId -> { recipe=<name>, item=<item>, since=<epoch> }
+Planner._epoch  = Planner._epoch or 0
+function Planner:assign()
+  Planner._epoch = (Planner._epoch or 0) + 1
+  -- PRUNE stale assignments for constructors no longer in the topology (a repaired/re-snapped
+  -- machine gets a NEW id; the old one would leave a phantom cid in self.served whose fill-share is
+  -- silently lost). Mirrors Router.listenAll's orphan prune.
+  local liveCid = {}
+  for _, cid in ipairs(self.topo.constructors or {}) do liveCid[cid] = true end
+  for cid in pairs(Planner._assign) do if not liveCid[cid] then Planner._assign[cid] = nil end end
+  local pool = {}
+  for it, n in pairs(self.need) do
+    if n > 0 and self.bufferOf[it] and self.recipesByProduct[it] and not self.sources[it] then pool[it] = n end
+  end
+  local cap = {}                              -- ctorId -> { item -> opt }; FIRST opt per (cid,item) wins (deterministic)
+  for it in pairs(pool) do
+    for _, opt in ipairs(self.recipesByProduct[it]) do
+      cap[opt.ctorId] = cap[opt.ctorId] or {}; cap[opt.ctorId][it] = cap[opt.ctorId][it] or opt
+    end
+  end
+  -- SEED from machines' LIVE recipes (untracked ones) so a running recipe is respected — but stamp
+  -- `since` back by MIN_DWELL so a seeded machine is IMMEDIATELY re-rankable: a tiny-need live recipe
+  -- must not monopolize a machine for MIN_DWELL epochs while the top-need item starves.
+  for _, cid in ipairs(self.topo.constructors or {}) do
+    if not Planner._assign[cid] then
+      local okc, rec = pcall(function() return self.getProxy(cid):getRecipe() end)
+      local it = okc and rec and rec.name and self.itemOfRecipe[tostring(rec.name)]
+      if it and pool[it] and cap[cid] and cap[cid][it] then
+        Planner._assign[cid] = { recipe = cap[cid][it].recipe.name, item = it, opt = cap[cid][it], since = Planner._epoch - MIN_DWELL }
+      end
+    end
+  end
+  local function servedN(it) local n = 0; for _, a in pairs(Planner._assign) do if a.item == it then n = n + 1 end end; return n end
+  for cid, a in pairs(Planner._assign) do if not pool[a.item] then Planner._assign[cid] = nil end end   -- drop satisfied
+  -- de-serve out-ranked machines (margin + dwell), spreading freed machines across DISTINCT unserved
+  -- items (pendingServe) so one top item doesn't free EVERY out-ranked machine (avoidable thrash).
+  local pendingServe = {}
+  local function topUnserved() local b, bn for it, n in pairs(pool) do if servedN(it) == 0 and not pendingServe[it] and (not bn or n > bn) then b, bn = it, n end end return b, bn end
+  for cid, a in pairs(Planner._assign) do
+    local tu, tn = topUnserved()
+    if tu and tn >= MARGIN * (pool[a.item] or 1) and (Planner._epoch - (a.since or 0)) >= MIN_DWELL and cap[cid] and cap[cid][tu] then
+      Planner._assign[cid] = nil; pendingServe[tu] = true
+    end
+  end
+  local free = {}
+  for _, cid in ipairs(self.topo.constructors or {}) do if not Planner._assign[cid] then free[cid] = true end end
+  local ranked = {}
+  for it in pairs(pool) do ranked[#ranked + 1] = it end
+  table.sort(ranked, function(a, b) if pool[a] ~= pool[b] then return pool[a] > pool[b] end return tostring(a) < tostring(b) end)
+  local function capCount(cid) local n = 0; for _ in pairs(cap[cid] or {}) do n = n + 1 end; return n end
+  local function grab(it)                     -- the MOST SPECIALIZED free machine (don't burn a versatile machine on a coverable specialized item); deterministic over topo order
+    local best
+    for _, cid in ipairs(self.topo.constructors or {}) do
+      if free[cid] and cap[cid] and cap[cid][it] and (not best or capCount(cid) < capCount(best)) then best = cid end
+    end
+    if best then Planner._assign[best] = { recipe = cap[best][it].recipe.name, item = it, opt = cap[best][it], since = Planner._epoch }; free[best] = nil; return true end
+  end
+  for _, it in ipairs(ranked) do if servedN(it) == 0 then grab(it) end end   -- BREADTH
+  local more = true                                                          -- FAN-OUT
+  while more do
+    more = false
+    for _, it in ipairs(ranked) do
+      local sc = 0
+      for cid, a in pairs(Planner._assign) do if a.item == it and cap[cid] and cap[cid][it] then sc = sc + self:_machineCap(cap[cid][it]) end end
+      if pool[it] > sc and grab(it) then more = true; break end
+    end
+  end
+  self.served, self.consumedSet = {}, {}      -- publish served + the per-epoch consumed-item set (canSwitch)
+  for cid, a in pairs(Planner._assign) do
+    self.served[a.item] = self.served[a.item] or {}
+    self.served[a.item][#self.served[a.item] + 1] = cid
+    self.busy[cid] = true
+    if a.opt then for _, ing in ipairs(a.opt.ingredients) do self.consumedSet[ing.name] = true end end
+  end
+end
+
+-- total hub-fill amount for an item (Σ its needing buffers' need, incl. hub draw).
+function Planner:_fillAmount(item)
+  local amt = 0; for _, b in ipairs(self:_needingBuffers(item)) do amt = amt + b.need end; return amt
+end
+
+-- the buffer(s) of `item` that still need filling: { {id=, need=} ... }. The hub (bufferOf) carries
+-- the draw on top of its own shortfall; other buffers just their shortfall.
+function Planner:_needingBuffers(item)
+  item = lc(item); local out = {}
   for _, c in ipairs(self.topo.containers or {}) do
     if Planner.destItem(c) == item then
       local target = c.target or Planner.destTarget(c)
       if target then
         local need = target - count_in(self.getProxy(c.id), item)
-        if self.bufferOf[item] == c.id and self.hubDraw and self.hubDraw[item] then
-          need = need + self.hubDraw[item]
-        end
-        if need > 0 then return true end
+        if self.bufferOf[item] == c.id and self.hubDraw and self.hubDraw[item] then need = need + self.hubDraw[item] end
+        if need > 0 then out[#out + 1] = { id = c.id, need = need } end
       end
     end
   end
-  return false
+  return out
 end
 
---- Fill every destination in the topology (a container resolving to an item via
---- c.buffer/c.output or a *_(Buffer|Output)_<n> name) that has a `target`, then
---- run the router until orders complete.
+-- EXECUTION: machine `cid` makes its `share` of `item`'s hub fill, delivered to the item's buffer.
+-- Lossless: if the live recipe ≠ assigned, switch only when canSwitch, else DRAIN (route the
+-- current recipe's finishing output, no new feed). Atomic rollback on any ingredient failure.
+function Planner:produceFor(cid, item, share, dst)
+  -- use the EXACT recipe assign() chose (stored on _assign) — not a re-pick by first-opt, which can
+  -- disagree with the demand/hub-draw layers and set an infeasible alternate when one machine knows
+  -- several recipes for the same product.
+  local a = Planner._assign[cid]
+  local opt = a and a.opt
+  dst = dst or self.bufferOf[item]   -- which buffer of `item` to deliver to (multi-buffer items)
+  if not opt or not dst then return false end
+  local startN = #self.router.orders
+  local claimed = { cid }
+  local function rollback() self.router:_truncateOrders(startN); for _, c in ipairs(claimed) do self.busy[c] = nil end; return false end
+  local okc, cur = pcall(function() return opt.ctor:getRecipe() end)
+  local live = okc and cur and cur.name or nil
+  if live ~= opt.recipe.name then
+    if self:canSwitch(cid, opt) then
+      pcall(function() opt.ctor:setRecipe(opt.recipe) end)
+    else
+      local curItem = live and self.itemOfRecipe[tostring(live)]   -- DRAIN: route finishing output
+      if curItem and self.bufferOf[curItem] then
+        self.router:order(curItem, math.max(1, self:_fillAmount(curItem)), self.bufferOf[curItem], cid)
+      end
+      return true
+    end
+  end
+  local crafts = ceil(share, opt.out)
+  local ok, sub = self:_orderIngredients(opt, crafts, cid, 1, 1, 0)
+  if not ok then return rollback() end
+  for _, c in ipairs(sub or {}) do claimed[#claimed + 1] = c end
+  if self.router:order(item, share, dst, cid) then
+    local terminal = self.router.orders[#self.router.orders]
+    for i = startN + 1, #self.router.orders - 1 do self.router.orders[i].term = terminal end
+  end
+  return true
+end
+
+--- Fill every destination: DEMAND -> ASSIGNMENT -> EXECUTION, then edge-quota + source gating.
 function Planner:fillAll()
   self:scan()
-  -- PASS 1 (dry run): tally how much of each hub item is DRAWN through it by all the craftable
-  -- buffers, so PASS 2 can enlarge each hub's own fill to cover its draws.
-  self.hubDraw = {}
-  for _, c in ipairs(self.topo.containers or {}) do
-    local item = Planner.destItem(c)
-    local target = c.target or Planner.destTarget(c)
-    if item and target and not self.sources[item] and self:producible(item) > 0 then
-      self:tallyDraws(item, target - count_in(self.getProxy(c.id), item), 0, {})
-    end
-  end
-  -- PASS 1.5 (STABILITY RESERVATION): when recipes outnumber machines, claiming greedily in
-  -- buffer order each ~2s re-plan keeps yanking a machine off a still-needed recipe onto another
-  -- (setRecipe churn -> dumped input). So FIRST reserve each machine for the recipe it's ALREADY
-  -- running, as long as that recipe's product still needs filling. produce() then prefers the
-  -- reserved machine, so a machine keeps its recipe across epochs; it's only freed for a new
-  -- recipe once its current one is satisfied (the legit, occasional reallocation).
-  self.reserved = {}
-  for _, cid in ipairs(self.topo.constructors or {}) do
-    local okc, rec = pcall(function() return self.getProxy(cid):getRecipe() end)
-    local item = okc and rec and rec.name and self.itemOfRecipe[tostring(rec.name)]
-    if item and not self.reserved[item] and not self.busy[cid] and self:_itemNeeded(item) then
-      self.reserved[item] = cid
-      self.busy[cid] = true                  -- not available to be stolen for another recipe
-    end
-  end
-  -- PASS 2: fill every buffer with the single-machine produce() recursion (one machine per recipe,
-  -- preferring each machine's reserved recipe for stability; fillBuffer -> produce()).
+  self:computeNeed()     -- need[] for ranking + hubDraw[] for hub-fill sizing (folded into one pass)
+  self:assign()
   local plan = {}
+  -- direct raw-source buffers route straight (no machine)
   for _, c in ipairs(self.topo.containers or {}) do
-    local item = Planner.destItem(c)
-    local target = c.target or Planner.destTarget(c)
-    if item and target then
-      local ok, msg = self:fillBuffer(c.id, item, target)
-      plan[#plan + 1] = ("%s: %s"):format(c.id, msg)
+    local item = Planner.destItem(c); local target = c.target or Planner.destTarget(c)
+    if item and target and self.sources[item] then
+      local qty = math.min(target - count_in(self.getProxy(c.id), item), self:available(item))
+      if qty > 0 then self:orderFrom(item, qty, c.id) end
+      plan[#plan + 1] = ("%s: direct %s"):format(tostring(c.id):sub(1, 6), item)
     end
   end
-  -- now that all orders exist: (1) compute per-edge quota from their stored paths so
-  -- routing is balanced and node-agnostic, then (2) gate each source at its own output
-  -- connector so it releases EXACTLY the demanded total (un-demanded sources release nothing).
+  -- assigned machines fill their item's buffer(s). Common case = ONE buffer per item: fan all its
+  -- machines into it, splitting the (hold + draw) need. RARE case = several buffers for one item on
+  -- dedicated lines: route each machine to a needing buffer it can REACH (per-buffer findPath only
+  -- here, so the common path stays cheap).
+  for item, cids in pairs(self.served or {}) do
+    local buffers = self:_needingBuffers(item)
+    if #buffers == 1 then
+      local amt, k = buffers[1].need, #cids
+      local base, extra, placed = math.floor(amt / k), amt % k, 0
+      for i, cid in ipairs(cids) do
+        local sh = base + (i <= extra and 1 or 0)
+        if sh > 0 and self:produceFor(cid, item, sh, buffers[1].id) then placed = placed + 1 end
+      end
+      plan[#plan + 1] = ("%s: %d across %d/%d ctor"):format(item, amt, placed, k)
+    elseif #buffers > 1 then
+      for _, cid in ipairs(cids) do                 -- each machine -> a reachable needing buffer (max remaining)
+        local best
+        for _, b in ipairs(buffers) do
+          if b.need > 0 and self.router:findPath(cid, b.id) and (not best or b.need > best.need) then best = b end
+        end
+        if best and self:produceFor(cid, item, best.need, best.id) then best.need = 0 end
+      end
+      plan[#plan + 1] = ("%s: across %d buffers"):format(item, #buffers)
+    end
+  end
   if self.router and self.router.buildQuota then self.router:buildQuota() end
   if self.router and self.router.gateSources then self.router:gateSources() end
   return plan
