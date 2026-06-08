@@ -245,30 +245,35 @@ function App.run(modules, topology, opts)
   end
 
   -- IN-GAME DEFAULT: a persistent control loop, LEVEL-TRIGGERED. Each iteration pumps
-  -- (actively drains every splitter/merger input — robust against missed ItemRequest
-  -- edges, the cause of "items stuck at the merger"). If the pump moved nothing, block on
-  -- event.pull (woken by a new ItemRequest, or a timeout). On timeout, cheaply RE-PLAN
-  -- against the cached topology (top up drained buffers); only every `rediscover`-th idle
-  -- tick do a full re-discovery (crawl the belt graph to pick up newly-built machines/
-  -- containers). Re-crawling 200 belts + re-deriving recipes EVERY 2s is what made a big
-  -- factory lag progressively — most ticks nothing structural changed, so skip it.
-  local replan = opts.replan or 2
-  local rediscover = opts.rediscover or 5         -- full re-discover every Nth idle tick
-  local idle = 0
+  -- (actively drains every splitter/merger input — robust against missed ItemRequest edges).
+  -- REFRESH (re-plan, and every `rediscover`-th time a full belt re-crawl to pick up newly
+  -- built machines / repaired belts) is driven by a WALL-CLOCK timer, NOT by going idle: a
+  -- busy factory's belts keep pump() > 0 forever, so the old idle-only refresh never fired
+  -- while running — new assemblers and fixed belts were invisible until a restart. The idle
+  -- branch is kept too (it drives the offline emulator and reacts faster when truly quiet).
+  local replan = opts.replan or 2                 -- seconds: idle wait + refresh cadence
+  local replanMs = opts.replanMs or (replan * 1000)
+  local rediscover = opts.rediscover or 2         -- full re-discover every Nth refresh
+  local nref = 0
+  local function now() return (computer.millis and computer.millis()) or 0 end
+  local lastMs = now()
+  local function refresh()
+    nref = nref + 1
+    if (not declared) and (nref % rediscover == 0) then
+      ctx.router, ctx.planner, ctx.topo = App.build(modules, declared, getProxy, opts)  -- full re-crawl
+    else
+      ctx.router, ctx.planner = App.plan(modules, ctx.topo, getProxy, opts)              -- cheap re-plan
+    end
+    lastMs = now()
+  end
   while true do
     local moved = ctx.router:pump()
-    if moved == 0 then
-      local ev = event.pull(replan)               -- nothing to do: wait for a signal/timeout
-      if ev == nil then                           -- idle timeout: refresh
-        idle = idle + 1
-        if declared then
-          ctx.router, ctx.planner = App.plan(modules, ctx.topo, getProxy, opts)
-        elseif idle % rediscover == 0 then
-          ctx.router, ctx.planner, ctx.topo = App.build(modules, declared, getProxy, opts)
-        else
-          ctx.router, ctx.planner = App.plan(modules, ctx.topo, getProxy, opts)
-        end
-      end
+    if now() - lastMs >= replanMs then
+      refresh()                                   -- wall-clock: refresh even while busy
+    elseif moved == 0 then
+      if event.pull(replan) == nil then refresh() end  -- idle: wait for a signal/timeout, then refresh
+    else
+      event.pull(0)                               -- busy: drain a queued signal / advance the conveyor
     end
   end
   return ctx.router, ctx.planner                  -- unreachable; kept for symmetry

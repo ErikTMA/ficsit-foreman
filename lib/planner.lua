@@ -38,6 +38,14 @@ function Planner.new(topology, router, getProxy)
       table.insert(self.sources[k], c.id)
     end
   end
+  -- itemName -> a BUFFER container that stores it = that item's HUB. An ingredient with a
+  -- hub is DRAWN from the hub (e.g. cable takes wire from the wire buffer) instead of
+  -- crafting a second parallel stream; the hub is kept full by its own fill order.
+  self.bufferOf = {}
+  for _, c in ipairs(topology.containers or {}) do
+    local di = Planner.destItem(c)
+    if di and not self.bufferOf[di] then self.bufferOf[di] = c.id end
+  end
   return self
 end
 
@@ -112,17 +120,19 @@ function Planner:orderFrom(item, qty, dst, ratioNum, ratioDen)
   for _, sid in ipairs(srcs) do
     if remaining <= 0 then break end
     local take = math.min(remaining, count_in(self.getProxy(sid), item))
-    if take > 0 then
-      self.router:order(item, take, dst, sid); stamp()
-      remaining = remaining - take; placed = true
+    -- only stamp/credit a placement that ACTUALLY happened: order() returns false (and
+    -- appends nothing) when there's no belt path src->dst, so stamping orders[#orders]
+    -- blindly would corrupt a previous order's ratio (or index nil).
+    if take > 0 and self.router:order(item, take, dst, sid) then
+      stamp(); remaining = remaining - take; placed = true
     end
   end
   -- whatever the current on-hand could not cover: still order it (from the first source) so
   -- the gate AUTHORIZES that source to release as stock refills within the epoch. Without this
   -- a source that is momentarily empty at plan time (a miner/belt still catching up) would be
   -- gated shut for the whole ~2s replan interval even though demand exists.
-  if remaining > 0 then
-    self.router:order(item, remaining, dst, srcs[1]); stamp(); placed = true; remaining = 0
+  if remaining > 0 and self.router:order(item, remaining, dst, srcs[1]) then
+    stamp(); placed = true; remaining = 0
   end
   return placed, remaining
 end
@@ -136,11 +146,15 @@ end
 function Planner:producible(item, depth, seen)
   item = lc(item); depth = depth or 0; seen = seen or {}
   if self.sources[item] then return self:available(item) end
-  if depth > 8 or seen[item] then return 0 end
+  -- an item already sitting in a HUB buffer is available up to its on-hand (e.g. mined/
+  -- imported straight into the buffer, or wire whose only supply is the hub) — so a consumer
+  -- isn't judged un-producible just because its feedstock lives in a buffer rather than raw.
+  local hubStock = (self.bufferOf and self.bufferOf[item]) and count_in(self.getProxy(self.bufferOf[item]), item) or 0
+  if depth > 8 or seen[item] then return hubStock end
   local cands = self.recipesByProduct[item]
-  if not cands then return 0 end
+  if not cands then return hubStock end
   seen[item] = true
-  local best = 0
+  local best = hubStock
   for _, opt in ipairs(cands) do
     local crafts = math.huge
     for _, ing in ipairs(opt.ingredients) do
@@ -214,8 +228,19 @@ function Planner:produce(item, need, depth, cumNum, cumDen)
     if self.sources[ing.name] then
       -- raw ingredient: split the order across ALL providing source containers, ratio-stamped.
       if not self:orderFrom(ing.name, qty, pick.opt.ctorId, rNum, rDen) then return nil end
+    elseif self.bufferOf[ing.name] then
+      -- the ingredient is stored in a BUFFER HUB (e.g. cable's wire lives in the wire buffer):
+      -- DRAW from the hub rather than crafting a parallel stream. The hub is filled by its own
+      -- fill order (enlarged by this draw — see fillAll's tallyDraws); register it as a source
+      -- so gateSources gates its output to exactly this demand (and does not block it).
+      local hub = self.bufferOf[ing.name]
+      -- order() returns false (appends nothing) if the hub can't reach the consumer; guard
+      -- before stamping/registering so a mis-wired hub doesn't crash or corrupt a prior order.
+      if not self.router:order(ing.name, qty, pick.opt.ctorId, hub) then return nil end
+      local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
+      self.router.sourceItem[hub] = lc(ing.name)
     else
-      -- crafted ingredient: make it on its own constructor, then order from there.
+      -- otherwise CRAFT it on its own constructor, then order from there.
       local src = self:produce(ing.name, qty, depth + 1, rNum, rDen)
       if not src then return nil end
       self.router:order(ing.name, qty, pick.opt.ctorId, src)
@@ -252,10 +277,38 @@ end
 -- back-compat alias
 function Planner.bufferItemOf(id) return Planner.destItem({ id = id }) end
 
+-- DRY-RUN the craft tree of `item` to tally how much of each HUB item it will DRAW, WITHOUT
+-- placing orders or claiming constructors. fillAll runs this for every craftable buffer
+-- BEFORE filling, so a hub's own fill order is enlarged by the total drawn THROUGH it (else
+-- the hub is permanently under-fed by the draw amount, and the raw source feeding it is
+-- never authorized for the throughput it must pass on).
+function Planner:tallyDraws(item, need, depth, seen)
+  item = lc(item); depth = depth or 0
+  if self.sources[item] or depth > 8 or (seen and seen[item]) then return end
+  local pick = self:chooseRecipe(item, need, depth, false)
+  if not pick then return end
+  seen = seen or {}; seen[item] = true
+  for _, ing in ipairs(pick.opt.ingredients) do
+    local qty = pick.crafts * ing.amount
+    if self.sources[ing.name] then                                   -- raw: no hub draw
+    elseif self.bufferOf[ing.name] then
+      self.hubDraw[ing.name] = (self.hubDraw[ing.name] or 0) + qty    -- DRAWN from this hub
+    else
+      self:tallyDraws(ing.name, qty, depth + 1, seen)                 -- crafted: recurse
+    end
+  end
+  seen[item] = nil
+end
+
 function Planner:fillBuffer(bufferId, item, target)
   if not item then return false, "not a destination: " .. tostring(bufferId) end
   local current = count_in(self.getProxy(bufferId), item)
   local need = target - current
+  -- if THIS buffer is the hub others DRAW from, produce extra so it holds its target AND
+  -- supplies the consumers (the draw total was tallied in fillAll's pre-pass).
+  if self.bufferOf[item] == bufferId and self.hubDraw and self.hubDraw[item] then
+    need = need + self.hubDraw[item]
+  end
   if need <= 0 then return true, "already full" end
 
   -- direct source available? route it straight, SPLIT across every providing source.
@@ -285,6 +338,17 @@ end
 --- run the router until orders complete.
 function Planner:fillAll()
   self:scan()
+  -- PASS 1 (dry run): tally how much of each hub item is DRAWN through it by all the craftable
+  -- buffers, so PASS 2 can enlarge each hub's own fill to cover its draws.
+  self.hubDraw = {}
+  for _, c in ipairs(self.topo.containers or {}) do
+    local item = Planner.destItem(c)
+    local target = c.target or Planner.destTarget(c)
+    if item and target and not self.sources[item] and self:producible(item) > 0 then
+      self:tallyDraws(item, target - count_in(self.getProxy(c.id), item), 0, {})
+    end
+  end
+  -- PASS 2: fill every buffer (hub fills are now sized for hold + draw).
   local plan = {}
   for _, c in ipairs(self.topo.containers or {}) do
     local item = Planner.destItem(c)
