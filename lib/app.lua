@@ -147,9 +147,9 @@ function App.build(modules, declared, getProxy, opts)
   end
   local router  = modules.Router.new(topo, getProxy)
   local planner = modules.Planner.new(topo, router, getProxy)
-  router:listenAll()        -- listen to all splitters/mergers (else NO signals arrive)
+  router:listenAll()        -- listen to all splitters/mergers (faster reactions)
   local plan = planner:fillAll()
-  router:pumpGated()        -- kick gated sources stuck from a previous cycle's overshoot
+  router:pump()             -- level-triggered: drain any items already held in codeables
   App.report(topo, planner, plan, opts)
   return router, planner, topo
 end
@@ -197,17 +197,19 @@ function App.run(modules, topology, opts)
     return ctx.router, ctx.planner
   end
 
-  -- IN-GAME DEFAULT: a persistent control loop. Items ride real belts over real time;
-  -- ItemRequest signals arrive asynchronously as they reach a splitter/merger.
-  -- event.pull() BLOCKS for the next signal (the listener routes it inside the pull) —
-  -- no busy-poll. On an idle timeout we REBUILD: re-discover the network (catching any
-  -- container/machine added since), re-plan, and top up drained buffers. This is what
-  -- makes Foreman keep running and keep discovering instead of doing one pass.
-  local replan = opts.replan or 2                 -- seconds to wait before a rebuild tick
+  -- IN-GAME DEFAULT: a persistent control loop, LEVEL-TRIGGERED. Each iteration pumps
+  -- (actively drains every splitter/merger input — robust against missed ItemRequest
+  -- edges, the cause of "items stuck at the merger"). If the pump moved nothing, block
+  -- on event.pull (woken by a new ItemRequest, or a timeout) and on timeout REBUILD:
+  -- re-discover (catch added components), re-plan, top up drained buffers.
+  local replan = opts.replan or 2
   while true do
-    local ev = event.pull(replan)                 -- blocks; listeners fire here
-    if ev == nil then                             -- idle timeout: refresh everything
-      ctx.router, ctx.planner = App.build(modules, declared, getProxy, opts)
+    local moved = ctx.router:pump()
+    if moved == 0 then
+      local ev = event.pull(replan)               -- nothing to do: wait for a signal/timeout
+      if ev == nil then                           -- idle timeout: refresh everything
+        ctx.router, ctx.planner = App.build(modules, declared, getProxy, opts)
+      end
     end
   end
   return ctx.router, ctx.planner                  -- unreachable; kept for symmetry

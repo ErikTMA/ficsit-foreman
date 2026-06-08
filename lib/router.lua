@@ -116,7 +116,9 @@ function Router.new(topology, getProxy)
   for _, list in pairs(self.buffersForItem) do
     table.sort(list, function(x, y) return order_n[x] < order_n[y] end)
   end
-  self.ordersByItem = {}          -- item -> order (latest placed)
+  self.ordersByItem = {}          -- item -> order (latest placed; back-compat)
+  self.ordersForItem = {}         -- item -> { all orders } (multi-destination routing)
+  self.rr = {}                    -- item -> round-robin cursor for balancing destinations
   self._fh = {}                   -- firstHop cache: [from][dst] = belt | false
   return self
 end
@@ -165,7 +167,9 @@ function Router:order(item, count, dst, src)
   if not self:findPath(src, dst) then return false, ("no path %s -> %s"):format(src, dst) end
   local order = { item = item, count = count, dst = dst, src = src, delivered = 0, rerouted = 0, released = 0 }
   table.insert(self.orders, order)
-  self.ordersByItem[item] = order
+  self.ordersByItem[item] = order                 -- latest (back-compat)
+  self.ordersForItem[item] = self.ordersForItem[item] or {}
+  table.insert(self.ordersForItem[item], order)   -- ALL orders for this item (multi-destination)
   return true
 end
 
@@ -216,23 +220,11 @@ end
 function Router:_dispatch(sender, a, b)
   local id = sender.id
   if self.isSplitter[id] then
-    self:_routeAtSplitter(sender, id, itemName(a))     -- splitter sig: (item)
+    local nm = itemName(a)                             -- splitter sig: (item)
+    if nm then self:_routeAtSplitter(sender, id, nm) end
   elseif self.isMerger[id] then
-    local input, item = a, b                           -- merger sig: (input, item)
-    local nm = itemName(item)
-    local gset = self.gatedItems[id]
-    if gset and gset[nm] then
-      -- Gated networked source item: release ONLY what an order still wants, so the
-      -- container outputs exactly what's ordered and otherwise stays stopped. Count a
-      -- release only when the pull SUCCEEDS (transferItem fails on a full output).
-      local ord = self:_needRelease(nm)
-      if ord and sender:transferItem(input) then
-        ord.released = ord.released + 1
-      end
-      -- else: do not pull -> the container holds its items (stopped)
-    else
-      sender:transferItem(input)                       -- in-transit (incl. unknown): forward
-    end
+    local nm = itemName(b)                             -- merger sig: (input, item)
+    if nm then self:_mergerPush(sender, id, a, nm) end
   end
 end
 
@@ -268,28 +260,8 @@ end
 --- between orders the 2-slot merger input can stay stuck and block its source. After
 --- (re)planning, call this to poll every gated input and release whatever an active
 --- order now needs (until outputs back-pressure). Idempotent; safe to call each tick.
-function Router:pumpGated()
-  local progressed = true
-  while progressed do
-    progressed = false
-    for id, gset in pairs(self.gatedItems) do
-      local sender = self.getProxy(id)
-      if sender and sender.getInput then
-        for input = 0, 2 do                       -- merger logic input ids (FIN getInput remap)
-          local ok, it = pcall(function() return sender:getInput(input) end)
-          local nm = ok and it and itemName(it)
-          if nm and gset[nm] then
-            local ord = self:_needRelease(nm)
-            if ord and sender:transferItem(input) then
-              ord.released = ord.released + 1
-              progressed = true
-            end
-          end
-        end
-      end
-    end
-  end
-end
+-- back-compat alias — pump() now drains gated merger inputs AND everything else.
+function Router:pumpGated() return self:pump() end
 
 -- Decide where an item at a splitter goes, checking destination ROOM and
 -- rerouting on the loop when a buffer is full:
@@ -301,42 +273,112 @@ end
 -- Because the belts form a loop, every buffer is reachable from every splitter, so
 -- an item whose nearest buffer is full is forwarded on toward an alternate.
 function Router:_routeAtSplitter(sender, id, item)
-  local ord = self.ordersByItem[item]
-  local targets, skipRoom = {}, false
-  if ord and not self.bufferItem[ord.dst] then
-    targets, skipRoom = { ord.dst }, true            -- non-buffer dst (constructor): always accepts
-  else
-    local prim = ord and ord.dst
-    if prim and self.bufferItem[prim] then targets[#targets + 1] = prim end
-    for _, b in ipairs(self.buffersForItem[item] or {}) do
-      if b ~= prim then targets[#targets + 1] = b end
-    end
+  -- Authoritative: route the item ACTUALLY at the input right now. An ItemRequest is
+  -- edge-triggered and can arrive stale — after the level-triggered pump() already moved
+  -- that item — so trusting the signal's item would route (or PANIC) on a phantom.
+  if sender.getInput then
+    local cur = itemName(sender:getInput())
+    if not cur then return false end                 -- input empty: stale signal, no-op
+    item = cur
   end
+  -- ALL active orders for this item (still need items), so the SAME item type feeding
+  -- multiple destinations (e.g. copper -> two wire constructors) is balanced round-robin
+  -- across them, not all dumped on one. Then any buffer for the item (reroute/overflow).
+  local active = {}
+  for _, o in ipairs(self.ordersForItem[item] or {}) do
+    if o.delivered < o.count then active[#active + 1] = o end
+  end
+  local targets, seen = {}, {}
+  local function add(D) if D and not seen[D] then seen[D] = true; targets[#targets + 1] = D end end
+  local n = #active
+  if n > 0 then
+    local cur = self.rr[item] or 0
+    for k = 0, n - 1 do add(active[((cur + k) % n) + 1].dst) end   -- round-robin start
+    self.rr[item] = cur + 1
+  end
+  for _, b in ipairs(self.buffersForItem[item] or {}) do add(b) end
 
   for _, D in ipairs(targets) do
     local belt = self:firstHopTo(id, D)
-    if belt and (skipRoom or self:hasRoom(D, item)) then
+    local terminal = not self.bufferItem[D]          -- constructor/sink: always accepts
+    if belt and (terminal or self:hasRoom(D, item)) then
       -- only act/count when the transfer succeeds; if the chosen output is full
-      -- (back-pressure) leave the item — the engine re-fires ItemRequest when the
-      -- output drains, giving a retry.
+      -- (back-pressure) leave the item — a later pump/ItemRequest retries.
       if sender:transferItem(belt.fromOutput or 0) then
-        if belt.to == D and ord then                 -- delivered directly this hop
-          if D == ord.dst then ord.delivered = ord.delivered + 1
-          else ord.rerouted = ord.rerouted + 1 end
+        -- count delivery ONLY when this hop actually REACHES the destination (belt.to == D),
+        -- not at every splitter en route — else the order over-counts and goes inactive,
+        -- sending the rest to the sink.
+        if belt.to == D then
+          local credited = false
+          for _, o in ipairs(active) do if o.dst == D then o.delivered = o.delivered + 1; credited = true; break end end
+          if not credited and active[1] then active[1].rerouted = active[1].rerouted + 1 end
         end
+        return true
       end
-      return
+      return false                                   -- chosen output full; retry later
     end
   end
 
-  -- last resort: the catch-all sink
+  -- last resort: the catch-all sink (any item with no real destination drifts here —
+  -- e.g. a path was removed, or an unknown item entered the system).
   local sink = self.defaults[1]
   if sink then
     local belt = self:firstHopTo(id, sink)
-    if belt then sender:transferItem(belt.fromOutput or 0); return end
+    if belt then return sender:transferItem(belt.fromOutput or 0) and true or false end
   end
+  -- no sink. If this item HAS a buffer that's merely FULL right now, just hold it
+  -- (back-pressure) — don't jam. Only an item with NO destination anywhere (unknown,
+  -- no buffer) jams the controller and asks for a DEFAULT_OUT.
+  if next(self.buffersForItem[item] or {}) then return false end
   computer.panic(("unroutable item '%s' at splitter %s: add a container named DEFAULT_OUT_%d and wire it into the network")
     :format(tostring(item), id, #self.defaults + 1))
+end
+
+-- Move one held item out of a merger input: a gated source item releases only what an
+-- order still wants; everything else (in-transit, incl. unknown) is forwarded. The
+-- `input` is the merger's own logic id (from the signal or a getInput poll), which is
+-- exactly what transferItem expects. Returns true if an item moved.
+function Router:_mergerPush(sender, id, input, nm)
+  local gset = self.gatedItems[id]
+  if gset and gset[nm] then
+    local ord = self:_needRelease(nm)
+    if ord and sender:transferItem(input) then ord.released = ord.released + 1; return true end
+    return false                                     -- nothing ordered -> hold (gate)
+  end
+  return sender:transferItem(input) and true or false
+end
+
+--- LEVEL-TRIGGERED routing sweep. ItemRequest is edge-triggered (fires once on arrival)
+--- and an item that arrives unseen never re-fires — so a purely event-driven router
+--- leaves items stuck in splitter/merger inputs forever (the in-game symptom). pump()
+--- actively polls every codeable input each call and drains whatever is held, looping
+--- until no further progress. This is the real driver; the ItemRequest listener just
+--- makes it react faster. Returns the number of items moved.
+function Router:pump()
+  local total = 0
+  local progressed, guard = true, 0
+  while progressed and guard < 10000 do
+    progressed = false; guard = guard + 1
+    for _, id in ipairs(self.topo.splitters or {}) do
+      local s = self.getProxy(id)
+      if s and s.getInput then
+        local ok, it = pcall(function() return s:getInput() end)
+        local nm = ok and itemName(it)               -- nil for an empty input (FIN empty struct)
+        if nm and self:_routeAtSplitter(s, id, nm) then total = total + 1; progressed = true end
+      end
+    end
+    for _, id in ipairs(self.topo.mergers or {}) do
+      local m = self.getProxy(id)
+      if m and m.getInput then
+        for i = 0, 2 do
+          local ok, it = pcall(function() return m:getInput(i) end)
+          local nm = ok and itemName(it)
+          if nm and self:_mergerPush(m, id, i, nm) then total = total + 1; progressed = true end
+        end
+      end
+    end
+  end
+  return total
 end
 
 --- Are all placed orders fulfilled (delivered to their primary dst)?
@@ -347,11 +389,13 @@ function Router:allDone()
   return true
 end
 
---- Drive the event loop until the system is quiescent (every item settled into a
---- buffer or the sink, every gated source stopped). Returns true when quiescent.
+--- Drive routing until quiescent (batch/test). Each iteration: level-triggered pump()
+--- (drain all codeable inputs) + one event.pull(0) (which, under the emulator, advances
+--- the conveyor sim and dispatches any signals). Quiescent when neither moves anything.
 function Router:run(maxLoops)
   for _ = 1, maxLoops or 5000000 do
-    if event.pull(0) == nil then return true end   -- nil => queue empty and nothing left to flow
+    local moved = self:pump()
+    if event.pull(0) == nil and moved == 0 then return true end
   end
   return false
 end
