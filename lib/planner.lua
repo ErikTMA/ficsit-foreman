@@ -31,6 +31,8 @@ function Planner.new(topology, router, getProxy, epochSeconds)
   self.getProxy = getProxy or function(id) return component.proxy(id) end
   self.recipesByProduct = {}     -- itemName -> list of recipe options
   self.busy = {}                 -- ctorId -> true once assigned this planning pass
+  self.itemOfRecipe = {}         -- recipe display name -> product item (for stable reservation)
+  self.reserved = {}             -- item -> ctorId already making it this session (anti recipe-churn)
   self.sources = {}              -- itemName -> { source container ids } (declared provides)
   for _, c in ipairs(topology.containers or {}) do
     if c.provides then
@@ -64,6 +66,7 @@ function Planner:scan()
       local duration = recipe.duration or 1
       for _, pa in ipairs(recipe:getProducts()) do
         local key = lc(pa.type.name)
+        self.itemOfRecipe[tostring(recipe.name)] = key   -- live getRecipe().name -> what it makes
         local list = self.recipesByProduct[key] or {}
         list[#list + 1] = {
           recipe = recipe, ctorId = cid, ctor = ctor,
@@ -240,7 +243,21 @@ function Planner:produce(item, need, depth, cumNum, cumDen)
   item = lc(item); depth = depth or 0; cumNum = cumNum or 1; cumDen = cumDen or 1
   if self.sources[item] then return self.sources[item][1], {} end   -- raw: first source (back-compat)
   if depth > 8 then return nil end
-  local pick = self:chooseRecipe(item, need, depth, true)
+  -- STABILITY: if a machine is already reserved for this item (it's running this recipe and the
+  -- item still needs filling — see fillAll's reservation pre-pass), USE that machine. Otherwise the
+  -- ~2s re-plan would re-hand machines out greedily and, when recipes outnumber machines, keep
+  -- yanking a machine off a still-needed recipe onto another (setRecipe churn = dumped input).
+  local pick
+  local rcid = self.reserved[item]
+  if rcid then
+    for _, opt in ipairs(self.recipesByProduct[item] or {}) do
+      if opt.ctorId == rcid then
+        pick = { opt = opt, crafts = ceil(need, opt.out), produced = ceil(need, opt.out) * opt.out }
+        break
+      end
+    end
+  end
+  if not pick then pick = self:chooseRecipe(item, need, depth, true) end
   if not pick then return nil end
   local startN = #self.router.orders
   local claimed = { pick.opt.ctorId }
@@ -370,6 +387,25 @@ function Planner:fillBuffer(bufferId, item, target)
   return true, ("craft %d %s"):format(need, item)
 end
 
+-- Does `item` still need filling anywhere — a buffer below target (incl. hub draw)? Drives the
+-- stability reservation: a machine keeps its current recipe only while its product is still wanted.
+function Planner:_itemNeeded(item)
+  item = lc(item)
+  for _, c in ipairs(self.topo.containers or {}) do
+    if Planner.destItem(c) == item then
+      local target = c.target or Planner.destTarget(c)
+      if target then
+        local need = target - count_in(self.getProxy(c.id), item)
+        if self.bufferOf[item] == c.id and self.hubDraw and self.hubDraw[item] then
+          need = need + self.hubDraw[item]
+        end
+        if need > 0 then return true end
+      end
+    end
+  end
+  return false
+end
+
 --- Fill every destination in the topology (a container resolving to an item via
 --- c.buffer/c.output or a *_(Buffer|Output)_<n> name) that has a `target`, then
 --- run the router until orders complete.
@@ -385,15 +421,23 @@ function Planner:fillAll()
       self:tallyDraws(item, target - count_in(self.getProxy(c.id), item), 0, {})
     end
   end
-  -- PASS 2: fill every buffer with the single-machine produce() recursion (one machine per
-  -- recipe, claimed in topology order). The demand-proportional constructor-POOL scheduler
-  -- (computeDemand/allocate/produceOn/_fsmFeed) is DISABLED on the live base: in a real factory
-  -- it thrashed (re-allocated every ~2s), starved sibling chains (all machines piled onto the
-  -- highest-demand chain, leaving "no free constructor to craft wire" so released copper dumped
-  -- to the sink), and the per-epoch demand+reachability scan (hundreds of getInventories/findPath
-  -- = game-thread syncs) throttled routing. Those functions remain for a future redesign behind
-  -- stability hysteresis + flow control; fillBuffer falls straight through to produce() while
-  -- self.assign stays empty. (FPS-leak fix + dead-hub guard are unaffected.)
+  -- PASS 1.5 (STABILITY RESERVATION): when recipes outnumber machines, claiming greedily in
+  -- buffer order each ~2s re-plan keeps yanking a machine off a still-needed recipe onto another
+  -- (setRecipe churn -> dumped input). So FIRST reserve each machine for the recipe it's ALREADY
+  -- running, as long as that recipe's product still needs filling. produce() then prefers the
+  -- reserved machine, so a machine keeps its recipe across epochs; it's only freed for a new
+  -- recipe once its current one is satisfied (the legit, occasional reallocation).
+  self.reserved = {}
+  for _, cid in ipairs(self.topo.constructors or {}) do
+    local okc, rec = pcall(function() return self.getProxy(cid):getRecipe() end)
+    local item = okc and rec and rec.name and self.itemOfRecipe[tostring(rec.name)]
+    if item and not self.reserved[item] and not self.busy[cid] and self:_itemNeeded(item) then
+      self.reserved[item] = cid
+      self.busy[cid] = true                  -- not available to be stolen for another recipe
+    end
+  end
+  -- PASS 2: fill every buffer with the single-machine produce() recursion (one machine per recipe,
+  -- preferring each machine's reserved recipe for stability; fillBuffer -> produce()).
   local plan = {}
   for _, c in ipairs(self.topo.containers or {}) do
     local item = Planner.destItem(c)
