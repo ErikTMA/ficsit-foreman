@@ -128,12 +128,25 @@ function App.discoverTopology(modules, getProxy)
   return topo
 end
 
--- (Re)build the whole control state from the live network: in auto mode re-crawl
--- the belt graph (so containers/machines ADDED while running are picked up), re-derive
--- products, (re)assign demand-driven containers, content-name sacred-keyword ones,
--- then make a fresh router+planner and place fill orders. A declared topology is kept
--- as-is (no re-crawl) but still re-planned. Renaming/auto-assign are idempotent —
--- already-named nicks persist in-game, so repeated rebuilds are stable.
+-- CHEAP re-plan against a KNOWN topology: fresh router+planner, listen (new components
+-- only), place fill orders + gate sources, drain. No belt crawl, no recipe re-derivation,
+-- no renaming. This is what the persistent loop runs most ticks — the expensive discovery
+-- (App.build) only needs to run occasionally to catch newly-built machines/containers.
+function App.plan(modules, topo, getProxy, opts)
+  local router  = modules.Router.new(topo, getProxy)
+  local planner = modules.Planner.new(topo, router, getProxy)
+  router:listenAll()        -- listen to all splitters/mergers (once per session; faster reactions)
+  local plan = planner:fillAll()   -- places orders AND gates each source connector
+  router:pump()             -- level-triggered: drain any items already held in codeables
+  App.report(topo, planner, plan, opts)
+  return router, planner
+end
+
+-- (Re)build the whole control state from the live network: in auto mode re-crawl the belt
+-- graph (so containers/machines ADDED while running are picked up), re-derive products,
+-- (re)assign demand-driven containers, content-name sacred-keyword ones, then plan. A
+-- declared topology is kept as-is (no re-crawl) but still re-planned. Renaming/auto-assign
+-- are idempotent — already-named nicks persist in-game, so repeated rebuilds are stable.
 function App.build(modules, declared, getProxy, opts)
   local topo = declared
   if (not topo or opts.discover) and modules.Discover then
@@ -145,12 +158,7 @@ function App.build(modules, declared, getProxy, opts)
     modules.Namer.autoAssign(topo, { getProxy = getProxy, candidates = candidates, usage = usage })
     modules.Namer.new(getProxy):scan()
   end
-  local router  = modules.Router.new(topo, getProxy)
-  local planner = modules.Planner.new(topo, router, getProxy)
-  router:listenAll()        -- listen to all splitters/mergers (faster reactions)
-  local plan = planner:fillAll()   -- places orders AND gates each source connector
-  router:pump()             -- level-triggered: drain any items already held in codeables
-  App.report(topo, planner, plan, opts)
+  local router, planner = App.plan(modules, topo, getProxy, opts)
   return router, planner, topo
 end
 
@@ -197,12 +205,12 @@ function App.run(modules, topology, opts)
   -- Router._deliv (cumulative delivered) are module-global so they PERSIST across the
   -- rebuilds inside this loop (that is what stops a rebuild re-releasing in-flight stock);
   -- but a fresh App.run is a fresh session and must start them empty.
-  if modules.Router then modules.Router._auth = {}; modules.Router._deliv = {} end
+  if modules.Router then modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {} end
 
   -- One long-lived listener delegating to the CURRENT router; rebuilds swap the
   -- router instance in `ctx` rather than re-registering (no duplicate listeners).
   local ctx = {}
-  ctx.router, ctx.planner = App.build(modules, declared, getProxy, opts)
+  ctx.router, ctx.planner, ctx.topo = App.build(modules, declared, getProxy, opts)
   event.registerListener(event.filter{ event = "ItemRequest" },
     function(_, sender, a, b) ctx.router:_dispatch(sender, a, b) end)
 
@@ -214,16 +222,28 @@ function App.run(modules, topology, opts)
 
   -- IN-GAME DEFAULT: a persistent control loop, LEVEL-TRIGGERED. Each iteration pumps
   -- (actively drains every splitter/merger input — robust against missed ItemRequest
-  -- edges, the cause of "items stuck at the merger"). If the pump moved nothing, block
-  -- on event.pull (woken by a new ItemRequest, or a timeout) and on timeout REBUILD:
-  -- re-discover (catch added components), re-plan, top up drained buffers.
+  -- edges, the cause of "items stuck at the merger"). If the pump moved nothing, block on
+  -- event.pull (woken by a new ItemRequest, or a timeout). On timeout, cheaply RE-PLAN
+  -- against the cached topology (top up drained buffers); only every `rediscover`-th idle
+  -- tick do a full re-discovery (crawl the belt graph to pick up newly-built machines/
+  -- containers). Re-crawling 200 belts + re-deriving recipes EVERY 2s is what made a big
+  -- factory lag progressively — most ticks nothing structural changed, so skip it.
   local replan = opts.replan or 2
+  local rediscover = opts.rediscover or 5         -- full re-discover every Nth idle tick
+  local idle = 0
   while true do
     local moved = ctx.router:pump()
     if moved == 0 then
       local ev = event.pull(replan)               -- nothing to do: wait for a signal/timeout
-      if ev == nil then                           -- idle timeout: refresh everything
-        ctx.router, ctx.planner = App.build(modules, declared, getProxy, opts)
+      if ev == nil then                           -- idle timeout: refresh
+        idle = idle + 1
+        if declared then
+          ctx.router, ctx.planner = App.plan(modules, ctx.topo, getProxy, opts)
+        elseif idle % rediscover == 0 then
+          ctx.router, ctx.planner, ctx.topo = App.build(modules, declared, getProxy, opts)
+        else
+          ctx.router, ctx.planner = App.plan(modules, ctx.topo, getProxy, opts)
+        end
       end
     end
   end

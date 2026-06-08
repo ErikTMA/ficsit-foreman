@@ -229,10 +229,20 @@ end
 --- Start listening to every splitter/merger so their ItemRequest signals actually
 --- reach this computer. CRITICAL: in FIN, event.registerListener only sets a callback
 --- filter — you must ALSO event.listen(component) for each signal source, or NOTHING
---- arrives (the "items stuck at the first merger" symptom). Idempotent; safe per rebuild.
+--- arrives (the "items stuck at the first merger" symptom).
+--- Listen each component at most ONCE per session: in-game event.listen(component) calls
+--- HookSubsystem::AttachHooks which does ClearHooks + NewObject<UFIRHook> EVERY call, so
+--- re-listening all components on every ~2s rebuild churns hook UObjects and piles up GC
+--- pressure (the "lags more and more the longer it runs" symptom). The set is reset per
+--- App.run session; the FIN side de-dupes the listener itself (AddUnique).
+Router._listened = Router._listened or {}
 function Router:listenAll()
   if not (event and event.listen) then return end
-  local function listen(id) local p = self.getProxy(id); if p then pcall(function() event.listen(p) end) end end
+  local function listen(id)
+    if Router._listened[id] then return end
+    local p = self.getProxy(id)
+    if p then pcall(function() event.listen(p) end); Router._listened[id] = true end
+  end
   for _, id in ipairs(self.topo.splitters or {}) do listen(id) end
   for _, id in ipairs(self.topo.mergers or {}) do listen(id) end
 end
@@ -312,6 +322,26 @@ function Router:_overflow(sender, id, item)
   for _, o in ipairs(self.ordersForItem[item] or {}) do
     if o.delivered < o.count then active[#active + 1] = o end
   end
+  -- RECOVER an item that fell off its pre-built quota path. In a dense shared manifold an
+  -- item routed greedily (or merged onto a belt that isn't on its BFS route) can reach a
+  -- node carrying no quota for it; rather than dump it, RE-PATHFIND from HERE toward an
+  -- active order's destination — most-behind first, so balance is preserved — whether that
+  -- destination is a constructor or a buffer. This is the "recalculate a new way to the
+  -- destination" path; only if NO order's dst is reachable do we fall through to the sink.
+  table.sort(active, function(a, b) return (a.count - a.delivered) > (b.count - b.delivered) end)
+  for _, o in ipairs(active) do
+    local terminal = not self.bufferItem[o.dst]
+    if terminal or self:hasRoom(o.dst, item) then
+      local belt = self:firstHopTo(id, o.dst)
+      if belt then
+        if sender:transferItem(belt.fromOutput or 0) then
+          if belt.to == o.dst then self:_credit(belt, item) end
+          return true
+        end
+        return false                                 -- chosen output full; retry later
+      end
+    end
+  end
   -- reroute/overflow: an alternate buffer for the same item (e.g. primary full).
   for _, D in ipairs(self.buffersForItem[item] or {}) do
     if self:hasRoom(D, item) then
@@ -328,7 +358,10 @@ function Router:_overflow(sender, id, item)
         Router._sinkLog = (Router._sinkLog or 0)
         if Router._sinkLog < 16 then
           Router._sinkLog = Router._sinkLog + 1
-          computer.log(2, ("[Foreman] SINK: '%s' at %s -> %s has no quota leg here (buffers full / path changed)")
+          -- recovery already tried to re-pathfind to every active dst, so reaching here means
+          -- NO belt path exists from this node to the destination — the discovered graph is
+          -- disconnected here (a mis-mapped port, a one-way snap, or a genuinely missing belt).
+          computer.log(2, ("[Foreman] SINK: '%s' stuck at %s — NO belt path to %s (graph disconnected here)")
             :format(item, tostring(id), tostring(active[1].dst)))
         end
       end
