@@ -195,6 +195,19 @@ function Router:order(item, count, dst, src)
   return true
 end
 
+--- Remove orders placed after index `n` (the planner's atomic rollback: if a craft plan
+--- turns out infeasible, drop the partial ingredient orders it already placed so their
+--- sources aren't gated to release an ingredient nothing will consume). Orders are appended
+--- in placement order, so the last per-item is at the tail of ordersForItem — pop in reverse.
+function Router:_truncateOrders(n)
+  while #self.orders > n do
+    local o = table.remove(self.orders)
+    local list = self.ordersForItem[o.item]
+    if list and list[#list] == o then table.remove(list) end
+    self.ordersByItem[o.item] = (list and list[#list]) or nil
+  end
+end
+
 -- Cached first belt of a shortest path from -> dst (nil if unreachable). Works on
 -- the belt LOOP because findPath's BFS handles cycles.
 function Router:firstHopTo(from, dst)

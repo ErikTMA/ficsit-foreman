@@ -213,41 +213,52 @@ end
 -- per unit of the TERMINAL product. The top call (terminal product itself) is 1/1; each
 -- recursion multiplies by the stage's ingredient.amount / product.out. Ingredient orders are
 -- stamped with their ratio-to-terminal so gateSources caps the raw source by a stable ratio.
+-- Returns producerId, claimedCtors (the constructors this whole sub-tree claimed) on success,
+-- or nil on failure. ATOMIC: if ANY ingredient can't be produced (no free constructor, no
+-- feedstock, no path), it rolls back every order it placed AND un-claims every constructor it
+-- claimed — so a recipe that can only be PARTIALLY supplied (e.g. screws available but iron
+-- plate uncraftable for reinforced plate) places NO orders at all, instead of releasing the
+-- one available ingredient to clog the belts with stock nothing will consume.
 function Planner:produce(item, need, depth, cumNum, cumDen)
   item = lc(item); depth = depth or 0; cumNum = cumNum or 1; cumDen = cumDen or 1
-  if self.sources[item] then return self.sources[item][1] end   -- raw: first source (back-compat)
+  if self.sources[item] then return self.sources[item][1], {} end   -- raw: first source (back-compat)
   if depth > 8 then return nil end
   local pick = self:chooseRecipe(item, need, depth, true)
   if not pick then return nil end
+  local startN = #self.router.orders
+  local claimed = { pick.opt.ctorId }
   self.busy[pick.opt.ctorId] = true              -- claim before recursing (no reuse)
   pick.opt.ctor:setRecipe(pick.opt.recipe)
+  local function rollback()
+    self.router:_truncateOrders(startN)          -- drop the partial ingredient orders
+    for _, c in ipairs(claimed) do self.busy[c] = nil end   -- release the constructors
+    return nil
+  end
   local out = pick.opt.out or 1
   for _, ing in ipairs(pick.opt.ingredients) do
     local qty = pick.crafts * ing.amount
     local rNum, rDen = cumNum * ing.amount, cumDen * out   -- this ingredient per terminal product
     if self.sources[ing.name] then
       -- raw ingredient: split the order across ALL providing source containers, ratio-stamped.
-      if not self:orderFrom(ing.name, qty, pick.opt.ctorId, rNum, rDen) then return nil end
+      if not self:orderFrom(ing.name, qty, pick.opt.ctorId, rNum, rDen) then return rollback() end
     elseif self.bufferOf[ing.name] then
-      -- the ingredient is stored in a BUFFER HUB (e.g. cable's wire lives in the wire buffer):
-      -- DRAW from the hub rather than crafting a parallel stream. The hub is filled by its own
-      -- fill order (enlarged by this draw — see fillAll's tallyDraws); register it as a source
-      -- so gateSources gates its output to exactly this demand (and does not block it).
+      -- ingredient stored in a BUFFER HUB (e.g. cable's wire in the wire buffer): DRAW from it
+      -- (the hub is filled by its own enlarged fill order) rather than crafting a parallel
+      -- stream; register it as a source so gateSources gates its output to this demand.
       local hub = self.bufferOf[ing.name]
-      -- order() returns false (appends nothing) if the hub can't reach the consumer; guard
-      -- before stamping/registering so a mis-wired hub doesn't crash or corrupt a prior order.
-      if not self.router:order(ing.name, qty, pick.opt.ctorId, hub) then return nil end
+      if not self.router:order(ing.name, qty, pick.opt.ctorId, hub) then return rollback() end
       local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
       self.router.sourceItem[hub] = lc(ing.name)
     else
       -- otherwise CRAFT it on its own constructor, then order from there.
-      local src = self:produce(ing.name, qty, depth + 1, rNum, rDen)
-      if not src then return nil end
-      self.router:order(ing.name, qty, pick.opt.ctorId, src)
+      local src, sub = self:produce(ing.name, qty, depth + 1, rNum, rDen)
+      if not src then return rollback() end
+      if not self.router:order(ing.name, qty, pick.opt.ctorId, src) then return rollback() end
       local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
+      for _, c in ipairs(sub or {}) do claimed[#claimed + 1] = c end   -- inherit sub-tree claims
     end
   end
-  return pick.opt.ctorId
+  return pick.opt.ctorId, claimed
 end
 
 -- ---- fill one buffer -------------------------------------------------------
