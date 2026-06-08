@@ -22,7 +22,6 @@ No code is stripped; each module ends in `return <table>`, so wrapping its sourc
 in `function() ... end` yields that table.
 """
 import os
-import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIB = os.path.join(ROOT, "lib")
@@ -219,8 +218,8 @@ def main():
     for name, body in arts.items():
         with open(os.path.join(DIST, name), "w", encoding="utf-8") as fh:
             fh.write(body)
-        if name.endswith("-lite.lua") and len(body) > 50000:
-            print(f"WARNING: {name} exceeds 50KB EEPROM ceiling ({len(body)}B)", file=sys.stderr)
+        # No hard size cap: FIN's EEPROM Code is an unbounded FString (verified against
+        # ficsit-networks C++ source). The final line reports bytes for reference only.
     print(f"bundled LITE v{v['lite']} ({len(arts['foreman-lite.lua'])}B), "
           f"FULL v{v['full']} ({len(arts['foreman.lua'])}B), "
           f"loader ({len(arts['foreman-loader.lua'])}B)")
