@@ -515,18 +515,37 @@ end
 -- the delta over what we have already authorized (Router._auth, durable); a drained buffer
 -- grows terminalAllTime so refills still happen.
 Router._auth = Router._auth or {}     -- "item:<item>" -> cumulative units authorized this session
+-- SLIDING-WINDOW FLOW CONTROL: an INGREDIENT feeding a constructor is released only up to
+-- "already consumed + flowWindow", not the whole terminal demand at once. Without it, a big
+-- buffer (12000 wire) authorizes 12000 copper up front; the constructor crafts slowly, so the
+-- copper floods the (shared) belt and saturates the input — and if the machine is then
+-- reassigned, that in-flight feedstock is stranded/dumped. With it, in-flight (belt + input)
+-- stays ≈ flowWindow; as the constructor crafts (terminal product delivered -> _deliv), the
+-- window slides forward, so total release still converges to the full demand. Only INGREDIENT
+-- orders are windowed (a DIRECT buffer fill is absorbed by its destination buffer's capacity,
+-- so it doesn't flood). The terminal demand remains the hard upper bound (no over-release).
+Router.flowWindow = Router.flowWindow or 50   -- max in-flight ingredient units per order (tunable)
 function Router:_contribution(o)
   local t = o.term or o
   local td = Router._deliv[tostring(t.src) .. "|" .. t.item] or 0
   local termAll = td + math.max(0, t.count - t.delivered)            -- terminal buffer all-time demand
-  if t == o then return termAll end                                  -- direct / self-terminal
+  if t == o then return termAll end                                  -- direct / self-terminal: not windowed
   -- ingredient: scale the terminal demand by the STABLE recipe ratio (units of this raw item
   -- per unit of terminal product, set by the planner). Scaling by the shrinking per-epoch need
   -- (o.count/t.count) instead inflates as the buffer nears full, over-releasing out>1 recipes
   -- (e.g. 1 copper -> 2 wire) to the sink.
-  if o.ratioDen and o.ratioDen > 0 then return math.ceil(termAll * o.ratioNum / o.ratioDen) end
-  if (t.count or 0) > 0 then return math.ceil(o.count * termAll / t.count) end  -- fallback (unstamped)
-  return o.count
+  local window = Router.flowWindow or 50
+  local full, consumed
+  if o.ratioDen and o.ratioDen > 0 then
+    full     = math.ceil(termAll * o.ratioNum / o.ratioDen)          -- total ingredient for ALL product
+    consumed = math.ceil(td * o.ratioNum / o.ratioDen)               -- ingredient already turned into product
+  elseif (t.count or 0) > 0 then
+    full     = math.ceil(o.count * termAll / t.count)                -- fallback (unstamped ratio)
+    consumed = math.ceil(o.count * td / t.count)
+  else
+    return o.count
+  end
+  return math.min(full, consumed + window)   -- release only consumed + a window's worth of lookahead
 end
 function Router:gateSources()
   -- Group source containers by the item they provide and gate PER ITEM, not per container.

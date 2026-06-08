@@ -223,6 +223,8 @@ function App.run(modules, topology, opts)
   -- rebuilds inside this loop (that is what stops a rebuild re-releasing in-flight stock);
   -- but a fresh App.run is a fresh session and must start them empty.
   if modules.Router then modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {} end
+  -- ingredient flow-control window (max in-flight feedstock per order, anti belt-flood); tunable.
+  if modules.Router and opts.flowWindow then modules.Router.flowWindow = opts.flowWindow end
   -- The constructor-pool scheduler keeps a DURABLE per-machine state (recipe assignment +
   -- drain progress) module-side so it survives the ~2s rebuilds; a fresh session starts clean.
   if modules.Planner then modules.Planner._ctorState = {} end
