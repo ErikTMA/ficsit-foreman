@@ -175,6 +175,15 @@ function App.report(topo, planner, plan, opts)
   computer.log(1, ("[Foreman] discovered: %d containers (%d src, %d buf), %d splitters, %d mergers, %d machines, %d belts; %d orders")
     :format(nc, src, buf, ns, nm, nk, nb, no))
   for _, line in ipairs(plan or {}) do computer.log(1, "[Foreman]   plan: " .. line) end
+  -- per-order reachability: if there's no belt path from a source/producer to a
+  -- destination, the item will fall through to the sink. Surfaces a fragmented graph
+  -- (e.g. a buffer reachable only via a beltless DirectToSplitter snap — those record
+  -- as connections but don't carry items, so the path "exists" yet nothing crosses).
+  for _, o in ipairs(planner.router.orders or {}) do
+    if not planner.router:findPath(o.src, o.dst) then
+      computer.log(2, ("[Foreman]   NO PATH: %s  %s -> %s (item will go to DEFAULT_OUT)"):format(o.item, tostring(o.src), tostring(o.dst)))
+    end
+  end
   if src == 0 then computer.log(2, "[Foreman] no SOURCE containers — nick an input '<Item>_input_1' (or bare 'input')") end
   if nb == 0 then computer.log(2, "[Foreman] no BELTS discovered — connect buildings with real belts (codeable splitters/mergers need belted ports; beltless 'snap' mods like DirectToSplitter don't transfer)") end
 end

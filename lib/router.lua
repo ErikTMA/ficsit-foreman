@@ -80,8 +80,9 @@ function Router.new(topology, getProxy)
   -- in and pass the SIGNAL's own input straight to transferItem (always the right FIN
   -- index). gatedItems[mergerId][itemType] = true.
   self.sourceItem = {}
+  self.sourceItems = {}                            -- set of every item type a source emits
   for _, c in ipairs(topology.containers or {}) do
-    if c.provides then self.sourceItem[c.id] = lc(c.provides) end
+    if c.provides then self.sourceItem[c.id] = lc(c.provides); self.sourceItems[lc(c.provides)] = true end
   end
   self.gatedItems = {}
   for _, b in ipairs(topology.belts or {}) do
@@ -319,8 +320,14 @@ function Router:_routeAtSplitter(sender, id, item)
     end
   end
 
-  -- last resort: the catch-all sink (any item with no real destination drifts here —
-  -- e.g. a path was removed, or an unknown item entered the system).
+  -- A SOURCE-provided item with NO active order is just an idle source over-feeding —
+  -- HOLD it (back-pressure the source), never sink it. DEFAULT_OUT is only for unmanaged
+  -- items (per spec), not a source's own item. (An item WITH an active order whose
+  -- buffers are full falls through to the sink below as genuine overflow — reroute.)
+  if #active == 0 and self.sourceItems[item] then return false end
+
+  -- last resort: the catch-all sink (an item with an order but full buffers, or an
+  -- unknown/unmanaged item, drifts here — e.g. a path was removed).
   local sink = self.defaults[1]
   if sink then
     local belt = self:firstHopTo(id, sink)
