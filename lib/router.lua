@@ -551,13 +551,20 @@ function Router:gateSources()
     -- player hand-fills or deletes) therefore leaves a small, bounded leftover budget that can
     -- leak to the sink — a rare manual-intervention edge, accepted over breaking normal fills.
   end
-  -- BLOCK every NON-source container's output (buffers, the DEFAULT_OUT sink, any storage).
-  -- They are DESTINATIONS: items flow IN and must STAY. If their output stays open they re-emit
-  -- their contents back into the manifold, which re-circulates around the belt loop and drips
-  -- to the sink (the "it fills the buffer but also takes from it" symptom). Fully blocked = 0
-  -- unblockedTransfers (never authorized), so nothing leaves. Inputs are unaffected.
+  -- BLOCK the output of PURE-DESTINATION containers only. A terminal buffer (concrete: nothing
+  -- consumes it) or the sink must not re-emit its contents back into the belt loop (the
+  -- "fills the buffer but also takes from it" re-circulation). BUT a PASS-THROUGH container —
+  -- one that some order's path legitimately routes OUT of (a source, or a wire buffer wired
+  -- into the cable constructor that draws from it) — must stay OPEN so that flow continues.
+  -- A container is pass-through iff it appears as `belt.from` on some order's path; everything
+  -- else with no outbound flow is a dead-end store and gets blocked. (Sources are pass-through
+  -- by construction and are gated above.)
+  local flowsOut = {}
+  for _, o in ipairs(self.orders) do
+    for _, b in ipairs(o.path or {}) do flowsOut[b.from] = true end
+  end
   for _, c in ipairs(self.topo.containers or {}) do
-    if not self.sourceItem[c.id] then
+    if not self.sourceItem[c.id] and not flowsOut[c.id] then
       local conn = self:_outputConnector(self.getProxy(c.id))
       if conn then pcall(function() conn.blocked = true end) end
     end
