@@ -42,14 +42,24 @@ end
 -- ("Iron Plate"), nicks give lowercase. Normalize everything to lowercase so keys
 -- and comparisons match regardless of source.
 local function lc(s) return s and tostring(s):lower() or nil end
--- name of an item from a FIN signal payload (FInventoryItem: .type is an ItemType
--- OBJECT with .name) — tolerant of the emulator/legacy {type=string} shape too.
+-- Name of an item from a FIN ItemRequest payload / getInput() result. The item is an
+-- FInventoryItem whose `.type` is an ItemType OBJECT with `.name`.
+-- CRITICAL: in-game a FIN struct is NOT a Lua table — type(it) is a FIN struct type, NOT
+-- "table". The old `type(it)~="table"` gate therefore made EVERY real item fall through to
+-- tostring = "struct<item>", which matched no order, so every item sank (the in-game bug).
+-- FIN structs DO support member access (exactly how the planner reads recipe items), so read
+-- `.type` / `.type.name` directly, nil-guarded so an EMPTY input struct (no .type) -> nil.
 local function itemName(it)
-  if type(it) ~= "table" then return lc(it) end
-  local t = it.type
-  if type(t) == "table" then return lc(t.name) end
-  return lc(t)
+  if it == nil then return nil end
+  if type(it) == "string" then return lc(it) end       -- plain name (legacy)
+  local okt, t = pcall(function() return it.type end)
+  if not okt or t == nil then return nil end            -- empty input struct / not an item
+  local okn, nm = pcall(function() return t.name end)   -- ItemType.name (struct member access)
+  if okn and nm ~= nil then return lc(nm) end
+  if type(t) == "string" then return lc(t) end          -- legacy/emulator {type="<name>"} shape
+  return nil
 end
+Router._itemName = itemName    -- exposed for unit tests
 
 -- Resolve a container's destination item + ordinal + optional fill target, from an
 -- explicit c.buffer / c.output item field or its name <Item>_(Buffer|Output)_<n>[_<target>]
