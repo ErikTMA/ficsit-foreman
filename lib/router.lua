@@ -27,6 +27,17 @@
 local Router = {}
 Router.__index = Router
 
+-- Capped diagnostic logger: the FIRST N routing decisions (splitter choices, overflow,
+-- sink) so a busy factory's routing is visible without flooding the console. Short 6-char
+-- ids match the netdump labels. Disable by leaving _dn at the cap.
+Router._dn = 0
+function Router._dlog(msg)
+  if Router._dn < 60 and computer and computer.log then
+    Router._dn = Router._dn + 1
+    computer.log(1, "[Foreman] " .. msg)
+  end
+end
+
 -- Case-insensitive item names: FIN reflection returns canonical (Title) case
 -- ("Iron Plate"), nicks give lowercase. Normalize everything to lowercase so keys
 -- and comparisons match regardless of source.
@@ -336,6 +347,7 @@ function Router:_overflow(sender, id, item)
       if belt then
         if sender:transferItem(belt.fromOutput or 0) then
           if belt.to == o.dst then self:_credit(belt, item) end
+          Router._dlog(("RECOVER %s '%s' >out[%d] %s ->%s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(belt.to):sub(1,6), tostring(o.dst):sub(1,6)))
           return true
         end
         return false                                 -- chosen output full; retry later
@@ -365,6 +377,7 @@ function Router:_overflow(sender, id, item)
             :format(item, tostring(id), tostring(active[1].dst)))
         end
       end
+      Router._dlog(("SINK %s '%s' (no path to any dst)"):format(tostring(id):sub(1,6), item))
       return sender:transferItem(belt.fromOutput or 0) and true or false
     end
   end
@@ -392,6 +405,7 @@ function Router:_routeAtSplitter(sender, id, item)
     if sender:transferItem(best.fromOutput or 0) then
       best._q[item] = (best._q[item] or 1) - 1       -- reserve-on-dispatch: this leg got one
       self:_credit(best, item)
+      Router._dlog(("SPL %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, best.fromOutput or 0, tostring(best.to):sub(1,6)))
       return true
     end
     return false                                     -- chosen output full; retry later

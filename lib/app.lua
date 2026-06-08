@@ -162,6 +162,21 @@ function App.build(modules, declared, getProxy, opts)
   return router, planner, topo
 end
 
+-- Diagnostic: log each order's COMPUTED PATH once (the belt sequence src -> dst with the
+-- transferItem output port at each splitter hop). Short 6-char ids match the netdump labels,
+-- so a path that ends somewhere other than its dst (or routes through DEFAULT_OUT) is visible.
+function App.dumpPaths(router)
+  if App._pathsLogged or not (computer and computer.log) then return end
+  App._pathsLogged = true
+  local function s(x) return tostring(x):sub(1, 6) end
+  for _, o in ipairs(router.orders or {}) do
+    local segs = {}
+    for _, b in ipairs(o.path or {}) do segs[#segs + 1] = ("[%d]>%s"):format(b.fromOutput or 0, s(b.to)) end
+    computer.log(1, ("[Foreman] PATH '%s' x%d  %s ->%s  : %s")
+      :format(o.item, o.count, s(o.src), s(o.dst), (#segs > 0 and table.concat(segs, " ")) or "(empty!)"))
+  end
+end
+
 -- One concise observability line per build + the plan, so "nothing happening" is never
 -- silent: you can see exactly what was discovered (sources/buffers/belts) and whether
 -- any orders were placed. Set opts.quiet=true to suppress once it's working.
@@ -211,6 +226,7 @@ function App.run(modules, topology, opts)
   -- router instance in `ctx` rather than re-registering (no duplicate listeners).
   local ctx = {}
   ctx.router, ctx.planner, ctx.topo = App.build(modules, declared, getProxy, opts)
+  App.dumpPaths(ctx.router)                        -- one-time diagnostic: each order's belt path
   event.registerListener(event.filter{ event = "ItemRequest" },
     function(_, sender, a, b) ctx.router:_dispatch(sender, a, b) end)
 
