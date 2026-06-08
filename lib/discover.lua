@@ -160,23 +160,37 @@ function Discover.run(opts)
     if okh and h ~= nil then nodeByHash[tostring(h)] = nid end
   end
 
+  local function recordBelt(id, fromOutput, conn)
+    local destId, arrival = followToNode(conn, nodeByHash)   -- through any belt/lift actors
+    if destId then
+      topo.belts[#topo.belts + 1] = {
+        from = id, fromOutput = fromOutput,
+        to = destId, toInput = portIndex(getProxy(destId), arrival, INPUT),
+      }
+    end
+  end
+
   for id, p in pairs(proxies) do
-    if p.getFactoryConnectors then
-      local outIdx = -1
-      local okc, conns = pcall(function() return p:getFactoryConnectors() end)
+    if p.getConnectorByIndex then
+      -- SPLITTER: outputs are FIN logic-indexed (transferItem(out) maps 0->Output2,
+      -- 1->Output1, 2->Output3). fromOutput MUST be that logic index, not a connector
+      -- ordinal, or routing transfers to the wrong output -> items pile up / stall.
+      local i = 0
+      while i < 16 do
+        local okc, c = pcall(function() return p:getConnectorByIndex(i) end)
+        if not okc or c == nil then break end
+        local cok, connd = pcall(function() return c.isConnected end)
+        if cok and connd then recordBelt(id, i, c) end
+        i = i + 1
+      end
+    elseif p.getFactoryConnectors then
+      -- non-splitter (container/merger/machine): the router never transferItem's these
+      -- by output port, so a connector ordinal is fine for fromOutput.
+      local outIdx, okc, conns = -1, pcall(function() return p:getFactoryConnectors() end)
       for _, c in ipairs((okc and conns) or {}) do
         if c.direction == OUTPUT then
           outIdx = outIdx + 1
-          if c.isConnected then
-            -- traverse through any belt/lift actors to the next real node
-            local destId, arrival = followToNode(c, nodeByHash)
-            if destId then
-              topo.belts[#topo.belts + 1] = {
-                from = id, fromOutput = outIdx,
-                to = destId, toInput = portIndex(getProxy(destId), arrival, INPUT),
-              }
-            end
-          end
+          if c.isConnected then recordBelt(id, outIdx, c) end
         end
       end
     end

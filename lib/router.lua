@@ -73,17 +73,21 @@ function Router.new(topology, getProxy)
   -- route[splitterId][itemType] = { output=portIndex, order=orderRef, terminal=bool }
   self.route = {}
   self.orders = {}
-  -- gated source release: a networked source container feeding a merger input only
-  -- releases items when an order calls for them. gated[mergerId][input] = item type.
+  -- Gated source release: a networked source container feeding a merger releases items
+  -- only when an order calls for them. Keyed by ITEM TYPE (not input index): the merger
+  -- ItemRequest signal's input id is FIN-remapped (Input1->1, Input2->0, Input3->2) and
+  -- need not match a discovered connector ordinal, so we gate on the item a source feeds
+  -- in and pass the SIGNAL's own input straight to transferItem (always the right FIN
+  -- index). gatedItems[mergerId][itemType] = true.
   self.sourceItem = {}
   for _, c in ipairs(topology.containers or {}) do
     if c.provides then self.sourceItem[c.id] = lc(c.provides) end
   end
-  self.gated = {}
+  self.gatedItems = {}
   for _, b in ipairs(topology.belts or {}) do
     if self.sourceItem[b.from] and self.isMerger[b.to] then
-      self.gated[b.to] = self.gated[b.to] or {}
-      self.gated[b.to][b.toInput or 0] = self.sourceItem[b.from]
+      self.gatedItems[b.to] = self.gatedItems[b.to] or {}
+      self.gatedItems[b.to][self.sourceItem[b.from]] = true
     end
   end
   -- containers named DEFAULT_OUT_<n> are the catch-all sinks for unroutable items.
@@ -215,19 +219,19 @@ function Router:_dispatch(sender, a, b)
     self:_routeAtSplitter(sender, id, itemName(a))     -- splitter sig: (item)
   elseif self.isMerger[id] then
     local input, item = a, b                           -- merger sig: (input, item)
-    if self.gated[id] and self.gated[id][input] ~= nil then
-      -- Gated networked source: release ONLY what an order still wants, so the
-      -- container outputs exactly what's ordered and otherwise stays stopped.
-      local ord = self:_needRelease(itemName(item))
-      -- count a release ONLY when the pull actually succeeds (transferItem can fail
-      -- under back-pressure when the merger output is full) — else the counter
-      -- over-reports and the source stops short.
+    local nm = itemName(item)
+    local gset = self.gatedItems[id]
+    if gset and gset[nm] then
+      -- Gated networked source item: release ONLY what an order still wants, so the
+      -- container outputs exactly what's ordered and otherwise stays stopped. Count a
+      -- release only when the pull SUCCEEDS (transferItem fails on a full output).
+      local ord = self:_needRelease(nm)
       if ord and sender:transferItem(input) then
         ord.released = ord.released + 1
       end
       -- else: do not pull -> the container holds its items (stopped)
     else
-      sender:transferItem(input)                       -- in-transit: always forward
+      sender:transferItem(input)                       -- in-transit (incl. unknown): forward
     end
   end
 end
@@ -268,15 +272,18 @@ function Router:pumpGated()
   local progressed = true
   while progressed do
     progressed = false
-    for id, inputs in pairs(self.gated) do
+    for id, gset in pairs(self.gatedItems) do
       local sender = self.getProxy(id)
       if sender and sender.getInput then
-        for input in pairs(inputs) do
-          local it = sender:getInput(input)
-          local ord = it and self:_needRelease(itemName(it))
-          if ord and sender:transferItem(input) then
-            ord.released = ord.released + 1
-            progressed = true
+        for input = 0, 2 do                       -- merger logic input ids (FIN getInput remap)
+          local ok, it = pcall(function() return sender:getInput(input) end)
+          local nm = ok and it and itemName(it)
+          if nm and gset[nm] then
+            local ord = self:_needRelease(nm)
+            if ord and sender:transferItem(input) then
+              ord.released = ord.released + 1
+              progressed = true
+            end
           end
         end
       end
