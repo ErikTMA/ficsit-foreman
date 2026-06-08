@@ -147,6 +147,7 @@ function App.build(modules, declared, getProxy, opts)
   end
   local router  = modules.Router.new(topo, getProxy)
   local planner = modules.Planner.new(topo, router, getProxy)
+  router:listenAll()        -- listen to all splitters/mergers (else NO signals arrive)
   local plan = planner:fillAll()
   router:pumpGated()        -- kick gated sources stuck from a previous cycle's overshoot
   App.report(topo, planner, plan, opts)

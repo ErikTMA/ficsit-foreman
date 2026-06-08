@@ -232,9 +232,21 @@ function Router:_dispatch(sender, a, b)
   end
 end
 
---- Register the signal handler that executes routing. Call once, then pump the
---- event loop (e.g. Router:run() or your own event.pull loop).
+--- Start listening to every splitter/merger so their ItemRequest signals actually
+--- reach this computer. CRITICAL: in FIN, event.registerListener only sets a callback
+--- filter — you must ALSO event.listen(component) for each signal source, or NOTHING
+--- arrives (the "items stuck at the first merger" symptom). Idempotent; safe per rebuild.
+function Router:listenAll()
+  if not (event and event.listen) then return end
+  local function listen(id) local p = self.getProxy(id); if p then pcall(function() event.listen(p) end) end end
+  for _, id in ipairs(self.topo.splitters or {}) do listen(id) end
+  for _, id in ipairs(self.topo.mergers or {}) do listen(id) end
+end
+
+--- Register the signal handler that executes routing AND listen to all codeable nodes.
+--- Call once, then pump the event loop (e.g. Router:run() or your own event.pull loop).
 function Router:install()
+  self:listenAll()
   event.registerListener(event.filter{ event = "ItemRequest" },
     function(_, sender, a, b) self:_dispatch(sender, a, b) end)
 end
