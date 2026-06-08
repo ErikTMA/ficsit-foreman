@@ -33,16 +33,18 @@ EOF_MARKER = "--[[FOREMAN_EOF]]"
 
 
 def strip_lua(src):
-    """Drop full-line comments and blank lines to keep the EEPROM lean. SAFE for our
-    libs: they use no long-bracket strings/comments ([[ ]]), so a line starting with
-    -- is always a comment, never string content. Trailing comments are left intact
-    (stripping those could touch a -- inside a string)."""
+    """Drop full-line comments + blank lines AND leading indentation to keep the EEPROM lean.
+    SAFE for our libs: they use no long-bracket strings/comments ([[ ]]) and no multi-line
+    strings, so (a) a line starting with -- is always a comment, never string content, and
+    (b) Lua is free-form — leading whitespace is purely cosmetic, so stripping each line's
+    indent never changes parsing (newlines still separate statements). Trailing comments are
+    left intact (stripping those could touch a -- inside a string)."""
     out = []
     for line in src.split("\n"):
         s = line.strip()
         if s == "" or s.startswith("--"):
             continue
-        out.append(line)
+        out.append(s)
     return "\n".join(out)
 
 
