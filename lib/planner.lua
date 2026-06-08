@@ -228,7 +228,14 @@ function Planner:produce(item, need, depth, cumNum, cumDen)
   local startN = #self.router.orders
   local claimed = { pick.opt.ctorId }
   self.busy[pick.opt.ctorId] = true              -- claim before recursing (no reuse)
-  pick.opt.ctor:setRecipe(pick.opt.recipe)
+  -- setRecipe EMPTIES the constructor's input inventory EVERY call (FIN moves input->output,
+  -- even when set to the SAME recipe). The persistent loop re-plans every ~2s, so calling it
+  -- unconditionally would dump partial inputs each rebuild — a constructor holding 1 of 2 wire
+  -- loses it, items vanish, and it burns several copper per crafted wire. ONLY set it when the
+  -- recipe actually CHANGES (compare by recipe name).
+  local okc, cur = pcall(function() return pick.opt.ctor:getRecipe() end)
+  local curName = okc and cur and cur.name
+  if curName ~= pick.opt.recipe.name then pick.opt.ctor:setRecipe(pick.opt.recipe) end
   local function rollback()
     self.router:_truncateOrders(startN)          -- drop the partial ingredient orders
     for _, c in ipairs(claimed) do self.busy[c] = nil end   -- release the constructors
