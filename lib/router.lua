@@ -73,23 +73,12 @@ function Router.new(topology, getProxy)
   -- route[splitterId][itemType] = { output=portIndex, order=orderRef, terminal=bool }
   self.route = {}
   self.orders = {}
-  -- Gated source release: a networked source container feeding a merger releases items
-  -- only when an order calls for them. Keyed by ITEM TYPE (not input index): the merger
-  -- ItemRequest signal's input id is FIN-remapped (Input1->1, Input2->0, Input3->2) and
-  -- need not match a discovered connector ordinal, so we gate on the item a source feeds
-  -- in and pass the SIGNAL's own input straight to transferItem (always the right FIN
-  -- index). gatedItems[mergerId][itemType] = true.
+  -- Source gating happens at the source container's OWN OUTPUT CONNECTOR (blocked +
+  -- addUnblockedTransfers), NOT by holding codeables mid-line — so an idle source stops
+  -- itself without ever stalling a shared belt. sourceItem[id]=item identifies sources.
   self.sourceItem = {}
-  self.sourceItems = {}                            -- set of every item type a source emits
   for _, c in ipairs(topology.containers or {}) do
-    if c.provides then self.sourceItem[c.id] = lc(c.provides); self.sourceItems[lc(c.provides)] = true end
-  end
-  self.gatedItems = {}
-  for _, b in ipairs(topology.belts or {}) do
-    if self.sourceItem[b.from] and self.isMerger[b.to] then
-      self.gatedItems[b.to] = self.gatedItems[b.to] or {}
-      self.gatedItems[b.to][self.sourceItem[b.from]] = true
-    end
+    if c.provides then self.sourceItem[c.id] = lc(c.provides) end
   end
   -- containers named DEFAULT_OUT_<n> are the catch-all sinks for unroutable items.
   self.defaults = {}
@@ -289,14 +278,13 @@ function Router:_routeAtSplitter(sender, id, item)
   for _, o in ipairs(self.ordersForItem[item] or {}) do
     if o.delivered < o.count then active[#active + 1] = o end
   end
+  -- DEMAND-WEIGHTED: send this item to the order FURTHEST from its quota (most remaining
+  -- = count-delivered). With two constructors each wanting N, the shared splitter feeds
+  -- whichever is most behind, so both converge to N — the "10 down each leg" balance.
+  table.sort(active, function(a, b) return (a.count - a.delivered) > (b.count - b.delivered) end)
   local targets, seen = {}, {}
   local function add(D) if D and not seen[D] then seen[D] = true; targets[#targets + 1] = D end end
-  local n = #active
-  if n > 0 then
-    local cur = self.rr[item] or 0
-    for k = 0, n - 1 do add(active[((cur + k) % n) + 1].dst) end   -- round-robin start
-    self.rr[item] = cur + 1
-  end
+  for _, o in ipairs(active) do add(o.dst) end
   for _, b in ipairs(self.buffersForItem[item] or {}) do add(b) end
 
   for _, D in ipairs(targets) do
@@ -320,23 +308,33 @@ function Router:_routeAtSplitter(sender, id, item)
     end
   end
 
-  -- A SOURCE-provided item with NO active order is just an idle source over-feeding —
-  -- HOLD it (back-pressure the source), never sink it. DEFAULT_OUT is only for unmanaged
-  -- items (per spec), not a source's own item. (An item WITH an active order whose
-  -- buffers are full falls through to the sink below as genuine overflow — reroute.)
-  if #active == 0 and self.sourceItems[item] then return false end
-
   -- last resort: the catch-all sink (an item with an order but full buffers, or an
   -- unknown/unmanaged item, drifts here — e.g. a path was removed).
   local sink = self.defaults[1]
   if sink then
     local belt = self:firstHopTo(id, sink)
-    if belt then return sender:transferItem(belt.fromOutput or 0) and true or false end
+    if belt then
+      -- diagnostic: surface misrouted items. If an ORDERED item sinks, its destination
+      -- isn't reachable from THIS splitter in the discovered graph (a directed dead-end,
+      -- often a DirectToSplitter snap that records as an edge but carries nothing).
+      if #active > 0 and computer and computer.log then
+        Router._sinkLog = (Router._sinkLog or 0)
+        if Router._sinkLog < 16 then
+          Router._sinkLog = Router._sinkLog + 1
+          computer.log(2, ("[Foreman] SINK: ordered '%s' at splitter %s -> %s not reachable from here (dead-end / snap)")
+            :format(item, tostring(id), tostring(active[1].dst)))
+        end
+      end
+      return sender:transferItem(belt.fromOutput or 0) and true or false
+    end
   end
-  -- no sink. If this item HAS a buffer that's merely FULL right now, just hold it
-  -- (back-pressure) — don't jam. Only an item with NO destination anywhere (unknown,
-  -- no buffer) jams the controller and asks for a DEFAULT_OUT.
-  if next(self.buffersForItem[item] or {}) then return false end
+  -- Couldn't route to a destination and couldn't reach a sink. A MANAGED item — one with
+  -- an active order (its path was deleted) or a buffer (merely full right now) — HOLDS on
+  -- the belt and waits for the path to be repaired (back-pressure). Don't jam: the order
+  -- keeps its path, and the next pump/ItemRequest retries — so rebuilding the missing
+  -- splitter/merger lets it flow again with no restart. Only an item with NO destination
+  -- anywhere (unknown, no order, no buffer) AND no sink jams + asks for a DEFAULT_OUT.
+  if #active > 0 or next(self.buffersForItem[item] or {}) then return false end
   computer.panic(("unroutable item '%s' at splitter %s: add a container named DEFAULT_OUT_%d and wire it into the network")
     :format(tostring(item), id, #self.defaults + 1))
 end
@@ -345,14 +343,41 @@ end
 -- order still wants; everything else (in-transit, incl. unknown) is forwarded. The
 -- `input` is the merger's own logic id (from the signal or a getInput poll), which is
 -- exactly what transferItem expects. Returns true if an item moved.
+-- Mergers never gate — they just forward whatever arrives (the source connector already
+-- limited what entered the network). Per-input, so it never blocks the merge.
 function Router:_mergerPush(sender, id, input, nm)
-  local gset = self.gatedItems[id]
-  if gset and gset[nm] then
-    local ord = self:_needRelease(nm)
-    if ord and sender:transferItem(input) then ord.released = ord.released + 1; return true end
-    return false                                     -- nothing ordered -> hold (gate)
-  end
   return sender:transferItem(input) and true or false
+end
+
+-- The OUTPUT FactoryConnection of a building (direction 1), or nil.
+function Router:_outputConnector(p)
+  if not (p and p.getFactoryConnectors) then return nil end
+  local ok, conns = pcall(function() return p:getFactoryConnectors() end)
+  if not ok then return nil end
+  for _, conn in ipairs(conns or {}) do if conn.direction == 1 then return conn end end
+end
+
+-- Gate every source container at its OWN output connector: block it, and authorize
+-- exactly the outstanding demand (sum of count-delivered over orders drawing from it)
+-- via addUnblockedTransfers. An un-demanded source authorizes 0 -> outputs nothing, so
+-- it never leaks into the network and never reaches the sink. Re-run each rebuild; the
+-- connector's unblockedTransfers persists and decrements as items leave, so we just
+-- top it up to the current demand.
+function Router:gateSources()
+  for _, c in ipairs(self.topo.containers or {}) do
+    if self.sourceItem[c.id] then
+      local conn = self:_outputConnector(self.getProxy(c.id))
+      if conn then
+        local demand = 0
+        for _, o in ipairs(self.orders) do
+          if o.src == c.id then demand = demand + math.max(0, o.count - o.delivered) end
+        end
+        pcall(function() conn.blocked = true end)
+        local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end)
+        if demand ~= cur then pcall(function() conn:addUnblockedTransfers(demand - cur) end) end
+      end
+    end
+  end
 end
 
 --- LEVEL-TRIGGERED routing sweep. ItemRequest is edge-triggered (fires once on arrival)

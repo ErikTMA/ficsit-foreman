@@ -240,6 +240,9 @@ function Planner:fillAll()
       plan[#plan + 1] = ("%s: %s"):format(c.id, msg)
     end
   end
+  -- now that all orders exist, gate each source at its own output connector so it
+  -- releases EXACTLY the demanded total (and an un-demanded source releases nothing).
+  if self.router and self.router.gateSources then self.router:gateSources() end
   return plan
 end
 

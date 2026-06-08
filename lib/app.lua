@@ -148,7 +148,7 @@ function App.build(modules, declared, getProxy, opts)
   local router  = modules.Router.new(topo, getProxy)
   local planner = modules.Planner.new(topo, router, getProxy)
   router:listenAll()        -- listen to all splitters/mergers (faster reactions)
-  local plan = planner:fillAll()
+  local plan = planner:fillAll()   -- places orders AND gates each source connector
   router:pump()             -- level-triggered: drain any items already held in codeables
   App.report(topo, planner, plan, opts)
   return router, planner, topo
