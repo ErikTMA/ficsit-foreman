@@ -242,6 +242,7 @@ function App.run(modules, topology, opts)
   -- but a fresh App.run is a fresh session and must start them empty.
   if modules.Router then
     modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {}
+    modules.Router._delivPrev = {}   -- stall back-pressure baseline; reset with _deliv so a fresh session has no stale progress
     -- stuck-machine recovery state is module-level so it survives the in-loop rebuilds; reset per session.
     modules.Router._idleEpochs = {}; modules.Router._draining = {}
     -- static connector cache + blocked-write shadow (gateSources perf): cleared per session and on every

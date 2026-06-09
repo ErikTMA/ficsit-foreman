@@ -992,6 +992,11 @@ Router._auth = Router._auth or {}     -- "item:<item>" -> cumulative units autho
 -- orders are windowed (a DIRECT buffer fill is absorbed by its destination buffer's capacity,
 -- so it doesn't flood). The terminal demand remains the hard upper bound (no over-release).
 Router.flowWindow = Router.flowWindow or 50   -- max in-flight ingredient units per order (tunable)
+-- STALL BACK-PRESSURE (gateSources): when an item is released but its consumer is blocked (output
+-- jammed), the surplus floods the manifold. Claw a stalled item's in-flight back toward inflightFloor;
+-- a consumer that delivers >= progressFloor units per gate is healthy and never throttled. Tunable.
+Router.inflightFloor = Router.inflightFloor or 32
+Router.progressFloor = Router.progressFloor or 8
 Router.stuckEpochs = Router.stuckEpochs or 3   -- empty-input epochs before temp-consumer-drain may fire
 function Router:_contribution(o)
   local t = o.term or o
@@ -1016,6 +1021,9 @@ function Router:_contribution(o)
   return math.min(full, consumed + window)   -- release only consumed + a window's worth of lookahead
 end
 function Router:gateSources()
+  -- STALL BACK-PRESSURE state: per-item cumulative delivered as of the previous gate, used below to
+  -- detect an item that is being RELEASED but not CONSUMED (its consumer's output is jammed).
+  Router._delivPrev = Router._delivPrev or {}
   -- Group source containers by the item they provide and gate PER ITEM, not per container.
   -- The cap (sum of terminal-scaled contributions) and the authorized total are aggregated
   -- across all of an item's sources, so the planner re-splitting demand across containers
@@ -1081,6 +1089,7 @@ function Router:gateSources()
       end
       Router._auth[k] = math.max(0, (Router._auth[k] or 0) - clawed)
     else
+      local justSeeded = (Router._auth[k] == nil)
       if Router._auth[k] == nil then
         -- first gate of the session: seed from the connectors' LEFTOVER budget so a program
         -- restart (ledgers cleared, but the live connectors keep their unblockedTransfers)
@@ -1092,6 +1101,24 @@ function Router:gateSources()
         Router._auth[k] = seed
       end
       local add = cap - Router._auth[k]
+      -- STALL BACK-PRESSURE: in-flight = released - delivered. If a lot of this item is in flight but
+      -- almost nothing reached a consumer this window, the consumer is blocked (its OUTPUT is jammed)
+      -- and the surplus is flooding the shared manifold — the overflow then reroutes it through other
+      -- items' belts, including machine-OUTPUT belts, clogging the very outputs whose jam started it.
+      -- Claw the stalled surplus back to ~inflightFloor so it stays in the source container; release
+      -- self-restores the instant delivery resumes (progress >= progressFloor). A HEALTHY high-throughput
+      -- item keeps delivering, so it is never throttled regardless of how much it has in flight.
+      local delivered = 0
+      for _, cid in ipairs(cids) do delivered = delivered + (Router._deliv[tostring(cid) .. "|" .. item] or 0) end
+      local prev = Router._delivPrev[item]
+      Router._delivPrev[item] = delivered
+      local inflight = Router._auth[k] - delivered
+      -- throttle ONLY with a valid prior baseline: prev exists AND didn't decrease (a decrease means
+      -- the _deliv ledger was reset by a session restart, so this epoch's progress is unmeasurable — a
+      -- fresh session must release its seeded budget, not get clawed on a phantom stall).
+      if not justSeeded and prev and delivered >= prev and inflight > Router.inflightFloor and (delivered - prev) < Router.progressFloor then
+        add = math.min(add, Router.inflightFloor - inflight)   -- negative: the claw-back path deducts (inflight - floor) from the leftover budget
+      end
       if add > 0 then
         -- distribute `add` across the sources weighted by their ordered demand, so budget lands
         -- where the stock/orders are. Only sources with a fundable (belted) connector take part —
