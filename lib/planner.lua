@@ -18,6 +18,16 @@
 local Planner = {}
 Planner.__index = Planner
 
+-- STAGING DEPTH for intermediate (crafted-and-consumed) hub buffers. Such a buffer is kept at ~this
+-- many units, NOT filled to its capacity: filling an intermediate to capacity demands the whole
+-- downstream chain's worth of feedstock up front (e.g. a 4800 plate buffer pulls 4800-worth of iron
+-- ingot), which over-produces the intermediate, hoards it, and floods the shared manifold with the
+-- raw it was made from. With staging, the producing machine only refills what the consumer drained,
+-- so its throughput auto-matches real downstream draw (the continuous level-triggered model). MUST
+-- exceed the bottleneck's peak per-epoch draw or the buffer empties mid-epoch and starves — tune via
+-- the debug dump's per-buffer have/cap, don't guess. See _needingBuffers + the flow-throttle spec.
+Planner.stageDepth = Planner.stageDepth or 100
+
 local function ceil(a, b) return math.floor((a + b - 1) / b) end
 -- Case-insensitive item names: reflection gives canonical (Title) case, nicks give
 -- lowercase. Key/compare everything lowercase so they match. (See router.lua.)
@@ -426,8 +436,35 @@ function Planner.bufferItemOf(id) return Planner.destItem({ id = id }) end
 
 -- DEMAND: per-item NEED (units) used to RANK what gets a machine — buffer shortfalls propagated
 -- through the craft DAG, PRODUCIBLE-CAPPED so a blocked item (no available feedstock) never ranks.
+-- INTERMEDIATE set: items that are BOTH a crafted demanded buffer AND consumed as an ingredient by
+-- some crafted demanded item — i.e. staging hubs (plate/screws/rod), not final products (RIP) or raw
+-- sources (iron ingot). _needingBuffers stages these to stageDepth instead of capacity.
+--   demanded  = has a buffer+target, not a declared source, and is producible VIA A RECIPE
+--               (recipesByProduct ~= nil — NOT producible()>0, which also returns recipe-less hub
+--               on-hand and would pull a final product into the set if a downstream sink holds stock).
+--   consumed  = ingredient of ANY recipe of a demanded item (union over all recipes, so an ingredient
+--               used by the assignment recipe but not a representative pick is never missed).
+function Planner:_intermediateSet()
+  local demanded, consumed = {}, {}
+  for _, c in ipairs(self.topo.containers or {}) do
+    local item = Planner.destItem(c)
+    local target = c.target or Planner.destTarget(c)
+    if item and target and not self.sources[item] and self.recipesByProduct[item] then
+      demanded[item] = true
+    end
+  end
+  for item in pairs(demanded) do
+    for _, opt in ipairs(self.recipesByProduct[item]) do
+      for _, ing in ipairs(opt.ingredients) do consumed[ing.name] = true end
+    end
+  end
+  local inter = {}
+  for item in pairs(demanded) do if consumed[item] then inter[item] = true end end
+  return inter
+end
 function Planner:computeNeed()
   self.need, self.hubDraw = {}, {}     -- hubDraw is tallied during propagation (each hub-buffered
+  self.intermediate = self:_intermediateSet()   -- staging hubs (read by _needingBuffers)
   for _, c in ipairs(self.topo.containers or {}) do          -- ingredient is a DRAW from its hub)
     local item = Planner.destItem(c)
     local target = c.target or Planner.destTarget(c)
@@ -594,8 +631,16 @@ function Planner:_needingBuffers(item)
     if Planner.destItem(c) == item then
       local target = c.target or Planner.destTarget(c)
       if target then
-        local need = target - count_in(self.getProxy(c.id), item)
-        if self.bufferOf[item] == c.id and self.hubDraw and self.hubDraw[item] then need = need + self.hubDraw[item] end
+        local need
+        if self.intermediate and self.intermediate[item] then
+          -- staging hub: keep ~stageDepth on hand, NO hubDraw. The consumer's draw shows up next
+          -- epoch as a lower count_in, refilling exactly what was drained — so production tracks
+          -- real consumption instead of the full downstream-to-capacity shortfall (the flood).
+          need = math.min(self.stageDepth or 100, target) - count_in(self.getProxy(c.id), item)
+        else
+          need = target - count_in(self.getProxy(c.id), item)
+          if self.bufferOf[item] == c.id and self.hubDraw and self.hubDraw[item] then need = need + self.hubDraw[item] end
+        end
         if need > 0 then out[#out + 1] = { id = c.id, need = need } end
       end
     end
