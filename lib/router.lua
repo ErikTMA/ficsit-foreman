@@ -357,6 +357,46 @@ function Router:pumpGated() return self:pump() end
 -- a merger are quota'd and decremented identically, so it does not matter whether the
 -- last hop into a constructor/container is a splitter or a merger. Call after orders are
 -- placed and on every rebuild (paths are recomputed there, so a deleted node re-quotas).
+-- count of `item` currently held at a destination. A machine dst is read via getInputInv (its
+-- input inventory); a container dst via getInventories. pcall-guarded; 0 on any failure.
+function Router:_countAt(dst, item, isMachine)
+  item = lc(item)
+  local p = self.getProxy(dst); if not p then return 0 end
+  local total = 0
+  local function tally(inv)
+    if not inv or not inv.getStack then return end
+    local sz = 0; pcall(function() sz = inv.size or 0 end)
+    for i = 0, sz - 1 do
+      local s = inv:getStack(i)
+      if s and (s.count or 0) > 0 and s.item and s.item.type and lc(s.item.type.name) == item then
+        total = total + s.count
+      end
+    end
+  end
+  if isMachine then
+    local ok, inv = pcall(function() return p:getInputInv() end); if ok then tally(inv) end
+  else
+    local ok, invs = pcall(function() return p:getInventories() end)
+    if ok then for _, inv in ipairs(invs or {}) do tally(inv) end end
+  end
+  return total
+end
+
+-- free room for an ORDER's delivery into its consumer = cap - have (spec §3). A machine ingredient
+-- order carries o.cap (stamped by the planner) and reads the machine input; a buffer/product order
+-- uses the buffer's capacity (target) and reads the container. Fail-open: a missing cap/unreadable
+-- consumer returns the order's full remaining demand (never worse than the old static quota).
+function Router:_orderRoom(o)
+  if o.cap then
+    local have = self:_countAt(o.dst, o.item, true)
+    return math.max(0, o.cap - have)
+  end
+  local cap = self.capacity[o.dst]
+  if not cap then return o.count - o.delivered end       -- non-buffer terminal (sink/constructor product): unbounded
+  local have = self:_countAt(o.dst, o.item, false)
+  return math.max(0, cap - have)
+end
+
 function Router:buildQuota()
   for _, belts in pairs(self.adj) do for _, b in ipairs(belts) do b._q = {} end end
   for _, o in ipairs(self.orders) do
