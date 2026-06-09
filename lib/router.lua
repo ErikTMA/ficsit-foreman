@@ -538,10 +538,10 @@ function Router:_overflow(sender, id, item)
       end
     end
   end
-  -- 3. SINK: buffers full / no buffer — clear the belt rather than HOLD (head-of-line). Over-supply
-  -- of an abundant ingredient lands here so the scarce one can get through.
-  local sink = self.defaults[1]
-  if sink then
+  -- 3. SINK: buffers full / no buffer — clear the belt rather than HOLD (head-of-line). Try EVERY
+  -- DEFAULT_OUT (a factory can have several): the first sink may be unreachable from this node while
+  -- another is reachable, especially on a looped manifold — so iterate, don't give up after defaults[1].
+  for _, sink in ipairs(self.defaults or {}) do
     local belt = self:firstHopTo(id, sink)
     if belt and sender:transferItem(belt.fromOutput or 0) then
       if #active > 0 and computer and computer.log then
@@ -556,11 +556,19 @@ function Router:_overflow(sender, id, item)
       return true
     end
   end
-  -- 4. LAST RESORT — no sink reachable at all. A managed item HOLDS (can't drop it into nowhere; it
-  -- waits for a belt repair); a destination-less unknown item jams + asks for a sink.
-  if #active > 0 or next(self.buffersForItem[item] or {}) then return false end
-  computer.panic(("unroutable item '%s' at %s: add a container named DEFAULT_OUT_%d and wire it into the network")
-    :format(tostring(item), id, #self.defaults + 1))
+  -- 4. LAST RESORT — nowhere reachable from here (no destination, no buffer with room, no sink path).
+  -- HOLD the item and warn (capped). NEVER panic: crashing computer.panic kills the WHOLE controller
+  -- over a single stray item — far worse than one item waiting on a belt. The held item resumes the
+  -- instant a path opens (a buffer drains, a sink is wired, a belt is repaired) with no restart.
+  if computer and computer.log then
+    Router._holdLog = Router._holdLog or 0
+    if Router._holdLog < 8 then
+      Router._holdLog = Router._holdLog + 1
+      computer.log(2, ("[Foreman] STUCK: '%s' at %s — no destination, buffer, or sink reachable from here; holding. Wire a DEFAULT_OUT_%d near this node, or a buffer for '%s'.")
+        :format(tostring(item), tostring(id), #self.defaults + 1, tostring(item)))
+    end
+  end
+  return false
 end
 
 -- Route the item at a SPLITTER input: send it out the highest-remaining-quota output leg
