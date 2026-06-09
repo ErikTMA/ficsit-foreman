@@ -536,19 +536,34 @@ end
 -- splitter feeding it diverts the item to a sibling buffer with room or to the bottleneck (load-
 -- balances a same-item buffer pool, stops over-filling).
 --
--- Room a destination has for an order's item RIGHT NOW. A storage buffer is capped by its capacity;
--- a MACHINE input is NOT port-capped — it fills to its full per-epoch demand. (An earlier portCap=12
--- per-ingredient cap was meant as a head-of-line guard, but per-input-port routing already puts each
--- ingredient on its OWN belt+port, so plate and screws never share a splitter at the machine. The cap
--- only starved the abundant ingredient — "plate stops filling even when the input isn't full" — so it
--- is gone. Manifold-level over-supply is the SOURCE gate's job, not the consumer's.)
+-- Room a destination has for an order's item RIGHT NOW. A storage buffer is capped by its capacity.
+--
+-- MULTI-INGREDIENT MACHINE — BALANCED DELIVERY: never hand a machine more of one ingredient than the
+-- SCARCEST other ingredient it holds (+ a small margin). A reinforced-iron-plate machine that is
+-- drowning in 200 iron plate but has only 1 screw can't craft — the plate just HOARDS, and (the killer)
+-- the plate machine keeps eating iron ingot to make that hoarded plate, which floods the shared manifold
+-- and starves the rod->screws chain. Capping plate to ~screws stops the hoard, lets the plate buffer
+-- fill, throttles the plate machine, and frees the feedstock for the scarce branch. (This is the
+-- per-ingredient cap done RIGHT: ratio-/scarcity-aware, not the too-low fixed portCap=12 that starved a
+-- healthy machine.) A single-input machine and a sink are uncapped (full demand).
+Router.balanceMargin = Router.balanceMargin or 24       -- per-ingredient lookahead buffer over the scarcest (tunable)
 function Router:_orderRoom(o)
   local cap = self.capacity[o.dst]
   if cap then                                            -- destination buffer: room = capacity - have
     local have = self:_countAt(o.dst, o.item, false)
     return math.max(0, cap - have)
   end
-  return o.count - o.delivered                           -- machine / sink: full per-epoch demand
+  local cons = self.isMachine[o.dst] and self.consumes[o.dst]
+  if cons then
+    local n = 0; for _ in pairs(cons) do n = n + 1 end
+    if n >= 2 then                                       -- multi-ingredient machine: balance to the scarcest
+      local have = self:_countAt(o.dst, o.item, true)
+      local minOther = math.huge
+      for it in pairs(cons) do if it ~= o.item then minOther = math.min(minOther, self:_countAt(o.dst, it, true)) end end
+      return math.max(0, (minOther + (Router.balanceMargin or 24)) - have)
+    end
+  end
+  return o.count - o.delivered                           -- single-input machine / sink: full per-epoch demand
 end
 
 function Router:buildQuota()
