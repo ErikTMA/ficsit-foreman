@@ -795,6 +795,62 @@ function Planner:_drainCandidate(cid, opt)
   return list[1].o2
 end
 
+-- JAM SWEEP for machines with NO assignment this epoch. The frozen+jammed drain trigger lives in
+-- produceFor, which only runs for ASSIGNED machines — so an unassigned machine (its item ran out
+-- of feedstock and dropped from the pool) with foreign items stranded on its dedicated lane was
+-- invisible: nobody ever cleared it (the live Reanimated-SAM constructor whose lane filled with
+-- the ~100 copper ingots in flight when the sheet machine got reassigned). The machine is that
+-- lane's ONLY consumer, so it must eat the blockage regardless of assignment: same trigger and
+-- progress-based hold, minus the restore (nothing assigned to restore to).
+function Planner:_jamSweep(servedCid)
+  for _, cid in ipairs(self.topo.constructors or {}) do
+    if not servedCid[cid] then
+      local inN = self:_inputCount(cid)
+      local d = Planner._drain[cid]
+      if d then
+        if d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true
+        else d.idle = (d.idle or 0) + 1 end
+        d.lastIn = inN
+        if d.idle >= (Planner.drainIdle or 3) then
+          if d.pulled then Planner._drainTried[cid] = nil end
+          Planner._drain[cid] = nil
+        end
+      else
+        local jammed = self.router._legFullMach and self.router._legFullMach[cid]
+        local st = Planner._starve[cid]
+        if type(st) ~= "table" then st = { n = 0 }; Planner._starve[cid] = st end
+        if st.lastIn == inN then st.n = st.n + 1 else st.n = 0 end
+        st.lastIn = inN
+        if jammed and st.n >= (Planner.drainAfter or 3) then
+          local p = self.getProxy(cid)
+          local okr, rec = pcall(function() return p:getRecipe() end)
+          local liveIt = okr and rec and rec.name and self.itemOfRecipe[tostring(rec.name)]
+          local opt
+          for _, o2 in ipairs((liveIt and self.recipesByProduct[liveIt]) or {}) do
+            if o2.ctorId == cid and tostring(o2.recipe.name) == tostring(rec.name) then opt = o2; break end
+          end
+          if opt then
+            local have = self:_inputMap(cid)
+            local canCraft = true
+            for _, ing in ipairs(opt.ingredients) do
+              if (have[ing.name] or 0) < ing.amount then canCraft = false; break end
+            end
+            local cand = (not canCraft) and self:_drainCandidate(cid, opt) or nil
+            if cand then
+              pcall(function() opt.ctor:setRecipe(cand.recipe) end)   -- partial leftovers eject to OUTPUT (routed) — user rule: losing a sub-craft remnant beats a clogged lane
+              Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
+              Planner._drainTried[cid] = tostring(cand.recipe.name)
+              st.n = 0
+              pcall(function() computer.log(1, ("[Foreman] DRAIN %s (idle): lane jammed; temp recipe '%s' pulls the blockage")
+                :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name))) end)
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
 -- EXECUTION: machine `cid` makes its `share` of `item`'s hub fill, delivered to the item's buffer.
 -- Lossless: if the live recipe ≠ assigned, switch only when canSwitch, else DRAIN (route the
 -- current recipe's finishing output, no new feed). Atomic rollback on any ingredient failure.
@@ -816,13 +872,20 @@ function Planner:produceFor(cid, item, share, dst)
   -- ---- FEED-DRAIN hold: a machine clearing its jammed entrance keeps the drain recipe ----
   local d = Planner._drain[cid]
   if d then
-    if inN > 0 then d.idle = 0; d.pulled = true else d.idle = (d.idle or 0) + 1 end
+    -- PROGRESS-based hold (not presence): the drain stays only while the input CHANGES. A stuck
+    -- sub-craft remnant (1 wire when Cable needs 2) used to reset the idle counter forever and
+    -- pin the drain recipe while the assigned ingredient jammed the entrance. Now it idles out;
+    -- the restore's setRecipe EJECTS the remnant to the output (routed away) — losing a partial
+    -- input below the craft requirement beats a clogged machine.
+    if d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true
+    else d.idle = (d.idle or 0) + 1 end
+    d.lastIn = inN
     if live and live ~= opt.recipe.name then d.recipe = tostring(live) end   -- adopt manual changes mid-drain
-    if d.idle >= (Planner.drainIdle or 3) and inN == 0 then
+    if d.idle >= (Planner.drainIdle or 3) then
       -- a drain that PULLED worked: clear the round-robin cursor so the same recipe is reused on
       -- the next jam; a drain that pulled nothing keeps the cursor so the next attempt advances.
       if d.pulled then Planner._drainTried[cid] = nil end
-      Planner._drain[cid] = nil       -- nothing pulled for a while: blockage cleared (or unpullable) -> restore below
+      Planner._drain[cid] = nil       -- no input movement for a while: drained (or unpullable) -> restore below
     else
       local di = live and self.itemOfRecipe[tostring(live)]                 -- route the drained product away
       if di and self.bufferOf[di] then
@@ -955,6 +1018,9 @@ function Planner:fillAll()
     if produced then Planner._infeas[item] = nil
     else Planner._infeas[item] = (Planner._infeas[item] or 0) + 1 end
   end
+  local servedCid = {}
+  for _, cids in pairs(self.served or {}) do for _, cid in ipairs(cids) do servedCid[cid] = true end end
+  self:_jamSweep(servedCid)   -- unassigned machines still clear their jammed lanes (drain trigger + hold)
   if self.router and self.router.buildQuota then self.router:buildQuota() end
   if self.router and self.router.gateSources then self.router:gateSources() end
   return plan
