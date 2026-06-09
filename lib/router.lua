@@ -847,11 +847,25 @@ function Router:gateSources()
           given = given + fund(cid, share)
         end
         Router._auth[k] = Router._auth[k] + given
+      elseif add < 0 then
+        -- demand DROPPED below what we have authorized: a consumer left or a machine changed recipe,
+        -- so this item is over-released. DEDUCT the excess (-add) from the sources' LEFTOVER budget —
+        -- NOT zero: cap still includes every REMAINING consumer's share, so the others keep getting
+        -- their items; we only remove the surplus that the departed consumer no longer needs. Only
+        -- ungranted-but-unreleased units can be reclaimed (already-released stock is in transit); we
+        -- reduce _auth by exactly what we reclaim so the ledger keeps tracking released units.
+        local want, removed = -add, 0
+        for _, outs in pairs(conns) do
+          for _, conn in ipairs(outs) do
+            if removed < want then
+              local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end)
+              local take = math.min(cur, want - removed)
+              if take > 0 then pcall(function() conn:addUnblockedTransfers(-take) end); removed = removed + take end
+            end
+          end
+        end
+        Router._auth[k] = math.max(0, (Router._auth[k] or 0) - removed)
       end
-      -- NOTE: we deliberately do NOT claw budget back when add < 0 AND orders still exist. cap
-      -- dips transiently below the authorized total as the dispatch-lag resolves (in-flight
-      -- items landing), and clawing on that jitter strips legitimate budget mid-fill. The
-      -- nOrders==0 branch above is a real, total stop — not jitter — so it claws to zero.
     end
   end
   -- DEFAULT-DENY every non-source container, then OPEN only the pass-throughs. The controller is
@@ -892,6 +906,16 @@ function Router:gateSources()
       local blockIt = not opens
       for _, conn in ipairs(self:_outputConnectors(self.getProxy(c.id))) do
         pcall(function() conn.blocked = blockIt end)
+        -- A blocked pure-destination must release NOTHING: claw any LEFTOVER unblockedTransfers to
+        -- zero. A buffer that was a funded hub-source in an earlier epoch (e.g. wire drawn for a cable
+        -- machine that is now gone) keeps its granted budget; once it stops being a source it lands
+        -- here, and without this it would keep emitting that budget — the item loops the manifold and
+        -- re-enters the same buffer (the wire round-trip). blocked=true alone does NOT stop a connector
+        -- that still has unblockedTransfers > 0.
+        if blockIt then
+          local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end)
+          if cur > 0 then pcall(function() conn:addUnblockedTransfers(-cur) end) end
+        end
       end
     end
   end
