@@ -735,7 +735,9 @@ function Router:_routeAtSplitter(sender, id, item)
         Router._dlog(("SPL %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, best.fromOutput or 0, tostring(best.to):sub(1,6)))
         return true
       end
-      -- chosen leg physically full right now: fall through and try the next-best quota leg
+      -- chosen leg physically full right now: log it (a starved consumer whose leg never accepts =
+      -- its input belt is backed up = its OUTPUT is blocked) and fall through to the next-best leg.
+      Router._dlog(("SPLFULL %s '%s' >out[%d] %s — leg full, diverting"):format(tostring(id):sub(1, 6), item, best.fromOutput or 0, tostring(best.to):sub(1, 6)))
     end
   end
   return self:_overflow(sender, id, item)
