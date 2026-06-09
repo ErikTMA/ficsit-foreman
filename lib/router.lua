@@ -386,10 +386,19 @@ end
 -- order carries o.cap (stamped by the planner) and reads the machine input; a buffer/product order
 -- uses the buffer's capacity (target) and reads the container. Fail-open: a missing cap/unreadable
 -- consumer returns the order's full remaining demand (never worse than the old static quota).
+--
+-- A MACHINE ingredient cap bounds STANDING input inventory, not per-epoch throughput: the machine
+-- consumes the ingredient continuously, so within one quota epoch it can pull far more than its
+-- standing cap. Quota therefore allocates the order's full remaining demand, but never beyond the
+-- cap's HEADROOM over what is already standing (cap - have) PLUS that remaining demand — i.e. an
+-- empty machine (have=0) gets its full demand (so a single-epoch batch is not starved), while a
+-- machine that already hoards >= cap + demand contributes 0 (no-hoard holds). This keeps exact
+-- splits (every demanded item is quota-routed) AND prevents a stocked machine from over-pulling.
 function Router:_orderRoom(o)
   if o.cap then
     local have = self:_countAt(o.dst, o.item, true)
-    return math.max(0, o.cap - have)
+    local demand = o.count - o.delivered
+    return math.max(0, (o.cap - have) + demand)
   end
   local cap = self.capacity[o.dst]
   if not cap then return o.count - o.delivered end       -- non-buffer terminal (sink/constructor product): unbounded
@@ -399,12 +408,14 @@ end
 
 function Router:buildQuota()
   for _, belts in pairs(self.adj) do for _, b in ipairs(belts) do b._q = {} end end
+  local left = {}                                   -- "dst|item" -> room remaining to allocate this pass
   for _, o in ipairs(self.orders) do
-    local remaining = o.count - o.delivered
-    if remaining > 0 and o.path then
-      for _, b in ipairs(o.path) do
-        b._q[o.item] = (b._q[o.item] or 0) + remaining
-      end
+    local key = tostring(o.dst) .. "|" .. o.item
+    if left[key] == nil then left[key] = self:_orderRoom(o) end
+    local contrib = math.min(o.count - o.delivered, left[key])
+    if contrib > 0 then
+      left[key] = left[key] - contrib               -- SHARE one consumer's room across all its orders
+      if o.path then for _, b in ipairs(o.path) do b._q[o.item] = (b._q[o.item] or 0) + contrib end end
     end
   end
 end
