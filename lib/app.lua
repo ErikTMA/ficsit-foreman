@@ -322,17 +322,42 @@ function App.run(modules, topology, opts)
     if ctx.planner and ctx.router._stuckScan then pcall(function() ctx.router:_stuckScan(ctx.planner) end) end
     lastMs = now()
   end
-  local lastFull = now()
+  -- TICK-DRIVEN loop. The cardinal rule: NEVER sleep while there is work to do. The old loop called
+  -- event.pull(replan=2s), which literally suspends the EEPROM for up to 2 SECONDS waiting for a signal
+  -- — and that idle wait happens precisely when a node is HOLDING an item (its output is full, so no new
+  -- arrival, so no new signal), so held items only got retried once every 2s -> the multi-second stutter.
+  -- Now: each pass drains the WHOLE ItemRequest burst (the listener routes each), retries the small held
+  -- set, then EITHER yields exactly one tick (computer.skip) if items are still pending — so retries run
+  -- every game tick, not every 2s — OR, only when genuinely idle (nothing held), blocks for the next
+  -- signal. Routing is cheap Lua; the freeze was the sleeping, not the work. A periodic perf line makes
+  -- the cost visible (set opts.logMs=0 to silence).
+  local function heldCount() local n = 0; for _ in pairs(modules.Router._retry or {}) do n = n + 1 end; return n end
+  local logMs = (opts.logMs == nil) and 10000 or opts.logMs
+  local lastFull, lastLog = now(), now()
+  local routed, maxWork, refreshMs = 0, 0, 0
   while true do
+    local w0 = now()
+    local g = 0
+    while event.pull(0) ~= nil do g = g + 1; if g > 2000 then break end end  -- drain the whole burst this tick
+    routed = routed + g
+    ctx.router:_drainRetry()                       -- retry held nodes EVERY pass (not every 2s)
+    local work = now() - w0; if work > maxWork then maxWork = work end       -- per-tick work cost (excl. idle waits)
     local t = now()
+    if logMs > 0 and t - lastLog >= logMs and computer and computer.log then
+      -- routed = items moved / window; refresh = ms of the periodic re-plan; maxwork = worst single tick's
+      -- routing cost (high -> a sync storm in routing); held = nodes back-pressured (output full).
+      computer.log(1, ("[Foreman] perf: routed %d in %.0fs, refresh %dms, maxwork %dms, held %d")
+        :format(routed, (t - lastLog) / 1000, refreshMs, maxWork, heldCount()))
+      routed, maxWork, lastLog = 0, 0, t
+    end
     if t - lastMs >= replanMs then
-      refresh()                                   -- wall-clock: re-plan / re-gate (re-crawl on change)
+      local r0 = now(); refresh(); refreshMs = now() - r0; lastMs = now()   -- wall-clock re-plan (fires even when busy)
     elseif t - lastFull >= fullMs then
-      ctx.router:pump(); lastFull = t             -- rare full-poll backstop: catch any item no signal covered
+      ctx.router:pump(); lastFull = t              -- rare full-poll backstop: catch a truly missed edge
+    elseif next(modules.Router._retry or {}) ~= nil then
+      computer.skip()                              -- WORK PENDING: yield ONE tick, retry next tick (never sleep)
     else
-      local sig = event.pull(replan)              -- block for the next ItemRequest -> _dispatch routes it
-      ctx.router:_drainRetry()                    -- retry the small active set of held nodes (cheap)
-      if sig == nil then refresh() end            -- timed out with no signal (idle): re-plan / re-discover now
+      if event.pull(replan) == nil then refresh(); refreshMs = 0; lastMs = now() end  -- truly idle: sleep to next signal, then re-plan
     end
   end
   return ctx.router, ctx.planner                  -- unreachable; kept for symmetry
