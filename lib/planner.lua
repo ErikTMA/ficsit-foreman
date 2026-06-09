@@ -165,14 +165,24 @@ end
 -- treat an intermediate (wire) as "available" even though it's only in a buffer/recipe.
 function Planner:producible(item, depth, seen)
   item = lc(item); depth = depth or 0; seen = seen or {}
-  if self.sources[item] then return self:available(item) end
+  -- MEMOIZE per epoch. producible recurses through the craft DAG; with only a path-local `seen` set it
+  -- re-descended every SHARED subtree once per path that reaches it (iron ingot sits under BOTH iron
+  -- plate AND screws->iron rod), and it is called from _addNeed, chooseRecipe AND _hubViable — an
+  -- EXPONENTIAL blowup, each node doing a count_in. That was the ~3.7s re-plan (the stutter). The value
+  -- depends only on the current inventory, which is constant during one fillAll, so caching each item's
+  -- result collapses it to linear. The cache is reset at the top of fillAll. The cycle (seen) early-out
+  -- is NOT cached (its value is path-dependent).
+  self._prodMemo = self._prodMemo or {}
+  local memo = self._prodMemo[item]
+  if memo ~= nil then return memo end
+  if self.sources[item] then local v = self:available(item); self._prodMemo[item] = v; return v end
   -- an item already sitting in a HUB buffer is available up to its on-hand (e.g. mined/
   -- imported straight into the buffer, or wire whose only supply is the hub) — so a consumer
   -- isn't judged un-producible just because its feedstock lives in a buffer rather than raw.
   local hubStock = (self.bufferOf and self.bufferOf[item]) and count_in(self.getProxy(self.bufferOf[item]), item) or 0
   if depth > 8 or seen[item] then return hubStock end
   local cands = self.recipesByProduct[item]
-  if not cands then return hubStock end
+  if not cands then self._prodMemo[item] = hubStock; return hubStock end
   seen[item] = true
   local best = hubStock
   for _, opt in ipairs(cands) do
@@ -183,6 +193,7 @@ function Planner:producible(item, depth, seen)
     if crafts ~= math.huge and crafts > 0 then best = math.max(best, crafts * opt.out) end
   end
   seen[item] = nil
+  self._prodMemo[item] = best
   return best
 end
 
@@ -632,6 +643,7 @@ end
 
 --- Fill every destination: DEMAND -> ASSIGNMENT -> EXECUTION, then edge-quota + source gating.
 function Planner:fillAll()
+  self._prodMemo = {}    -- reset the per-epoch producible cache (inventory snapshot for this re-plan)
   self:scan()
   self:computeNeed()     -- need[] for ranking + hubDraw[] for hub-fill sizing (folded into one pass)
   self:assign()
