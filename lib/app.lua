@@ -306,6 +306,7 @@ function App.run(modules, topology, opts)
     nref = nref + 1
     local cc = compCount()
     local changed = (cc ~= nil and lastCount ~= nil and cc ~= lastCount)
+    local p0 = now()
     if (not declared) and (changed or (nref % rediscover == 0)) then
       for k in pairs(_proxyCache) do _proxyCache[k] = nil end   -- rebuilt components may have new FGuids — drop stale proxies
       modules.Router._connCache = {}; modules.Router._blockShadow = {}  -- same: drop stale connector objects + their block shadow
@@ -314,9 +315,18 @@ function App.run(modules, topology, opts)
     else
       ctx.router, ctx.planner = App.plan(modules, ctx.topo, getProxy, opts)              -- cheap re-plan
     end
-    -- stuck-machine recovery runs once per re-plan epoch (not per pump): cheap, and multi-epoch
-    -- drain/revert state lives module-side so it survives the rebuild above.
-    if ctx.planner and ctx.router._stuckScan then pcall(function() ctx.router:_stuckScan(ctx.planner) end) end
+    App._planMs = now() - p0
+    -- STUCK-MACHINE RECOVERY is OPT-IN (opts.recovery) and OFF by default. In-game it caused a churn:
+    -- it temp-switches a starved screws machine to Iron Rod to drain a foreign iron ingot, but reverts
+    -- before it crafts — setRecipe EMPTIES the input, so the iron ingots are destroyed — and its bogus
+    -- iron-ingot order keeps the splitter routing more iron ingot to it, forever (user-diagnosed). It
+    -- also dominated the re-plan time (setRecipe is heavy). Until it routes the foreign item AWAY instead
+    -- of switching recipes, it stays off.
+    local s0 = now()
+    if opts.recovery and ctx.planner and ctx.router._stuckScan then
+      pcall(function() ctx.router:_stuckScan(ctx.planner) end)
+    end
+    App._stuckMs = now() - s0
     lastMs = now()
   end
   -- CONTINUOUS-PUMP loop (restored — this is what flowed smoothly before v0.13.5). Each iteration the
@@ -348,9 +358,10 @@ function App.run(modules, topology, opts)
     local t = now()
     if App._debug and t - lastDbg >= dbgMs then ctx.router:debugDump(); lastDbg = t end
     if logMs > 0 and t - lastLog >= logMs and computer and computer.log then
-      computer.log(1, ("[Foreman] perf: routed %d in %.0fs, present %d, sunk %d, stuck %d, refresh %dms, maxwork %dms")
+      computer.log(1, ("[Foreman] perf: routed %d in %.0fs, present %d, sunk %d, stuck %d, refresh %dms (plan %d/stuck %d), maxwork %dms")
         :format(routed, (t - lastLog) / 1000, present,
-                modules.Router._nSunk or 0, modules.Router._nStuck or 0, refreshMs, maxWork))
+                modules.Router._nSunk or 0, modules.Router._nStuck or 0, refreshMs,
+                App._planMs or 0, App._stuckMs or 0, maxWork))
       routed, maxWork = 0, 0; modules.Router._nSunk, modules.Router._nStuck = 0, 0; lastLog = t
     end
     if t - lastMs >= replanMs then
