@@ -559,6 +559,84 @@ function Router:_routeAtSplitter(sender, id, item)
   return self:_overflow(sender, id, item)
 end
 
+-- the item currently sitting at a machine's FEED (the head item on a belt whose `to` is this machine,
+-- read at the feeding splitter/merger). nil if nothing / unreadable.
+function Router:_feedItem(cid)
+  for _, belts in pairs(self.adj) do
+    for _, b in ipairs(belts) do
+      if b.to == cid and (self.isSplitter[b.from] or self.isMerger[b.from]) then
+        local p = self.getProxy(b.from); if p and p.getInput then
+          local ok, it
+          if self.isMerger[b.from] then ok, it = pcall(function() return p:getInput(b.toInput or 0) end)
+          else ok, it = pcall(function() return p:getInput() end) end
+          local nm = ok and itemName(it)
+          if nm then return nm end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+-- RECOVERY (spec §6): a machine starved (input empty) for >= stuckEpochs with a FOREIGN item on its
+-- feed that its assigned recipe can't consume -> temp-switch to the most-needed recipe that DOES
+-- consume it, drain, and (next scan, once cleared) revert. `planner` supplies need + the assignment.
+function Router:_stuckScan(planner)
+  self._idleEpochs = self._idleEpochs or {}
+  self._draining = self._draining or {}              -- cid -> assigned recipe name to revert to
+  for _, cid in ipairs(self.topo.constructors or {}) do
+    -- REVERT first: if we were draining and the feed foreign item is gone, restore the assignment
+    local revert = self._draining[cid]
+    if revert then
+      local feed = self:_feedItem(cid)
+      local p = self.getProxy(cid)
+      if feed == nil then
+        for _, r in ipairs((p and p.getRecipes and p:getRecipes()) or {}) do
+          if tostring(r.name) == revert then pcall(function() p:setRecipe(r) end) end
+        end
+        self._draining[cid] = nil
+      end
+    end
+    if not self._draining[cid] then
+      local have = 0
+      local a = planner._assign and planner._assign[cid]
+      local wantIng = {}
+      if a and a.opt and a.opt.ingredients then for _, ing in ipairs(a.opt.ingredients) do wantIng[ing.name] = true; have = have + self:_countAt(cid, ing.name, true) end end
+      if have == 0 then self._idleEpochs[cid] = (self._idleEpochs[cid] or 0) + 1 else self._idleEpochs[cid] = 0 end
+      if (self._idleEpochs[cid] or 0) >= self.stuckEpochs then
+        local feed = self:_feedItem(cid)
+        if feed and not wantIng[feed] then self:_drainStuck(cid, feed, planner) end
+      end
+    end
+  end
+end
+
+-- temp-switch `cid` to its most-needed recipe consuming `foreign`; remember the assigned recipe to
+-- revert to. Input is empty (starved) so setRecipe ejects nothing.
+function Router:_drainStuck(cid, foreign, planner)
+  local p = self.getProxy(cid); if not (p and p.getRecipes) then return end
+  local best, bestNeed
+  for _, r in ipairs(p:getRecipes() or {}) do
+    local consumes = false
+    local oki, ings = pcall(function() return r:getIngredients() end)
+    if oki then for _, ia in ipairs(ings or {}) do if lc(ia.type.name) == lc(foreign) then consumes = true end end end
+    if consumes then
+      local prod
+      local okp, prods = pcall(function() return r:getProducts() end)
+      if okp and prods and prods[1] then prod = lc(prods[1].type.name) end
+      local need = (planner.need and prod and planner.need[prod]) or 0
+      if not bestNeed or need > bestNeed then best, bestNeed = r, need end
+    end
+  end
+  if best then
+    local a = planner._assign and planner._assign[cid]
+    self._draining[cid] = a and a.recipe and a.recipe.name or nil
+    pcall(function() p:setRecipe(best) end)
+    self._idleEpochs[cid] = 0
+    Router._dlog(("DRAIN-STUCK %s consume '%s' via '%s'"):format(tostring(cid):sub(1,6), foreign, tostring(best.name)))
+  end
+end
+
 -- Route the item at one MERGER input: a merger has a single output, so there is no leg to
 -- choose — forward it (back-pressure stops it if the output is full). Decrement the output
 -- leg's quota and credit if that output feeds a destination. An item with no quota on the
@@ -627,6 +705,7 @@ Router._auth = Router._auth or {}     -- "item:<item>" -> cumulative units autho
 -- orders are windowed (a DIRECT buffer fill is absorbed by its destination buffer's capacity,
 -- so it doesn't flood). The terminal demand remains the hard upper bound (no over-release).
 Router.flowWindow = Router.flowWindow or 50   -- max in-flight ingredient units per order (tunable)
+Router.stuckEpochs = Router.stuckEpochs or 3   -- empty-input epochs before temp-consumer-drain may fire
 function Router:_contribution(o)
   local t = o.term or o
   local td = Router._deliv[tostring(t.src) .. "|" .. t.item] or 0

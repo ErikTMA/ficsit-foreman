@@ -225,6 +225,9 @@ function App.run(modules, topology, opts)
   if modules.Router then modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {} end
   -- ingredient flow-control window (max in-flight feedstock per order, anti belt-flood); tunable.
   if modules.Router and opts.flowWindow then modules.Router.flowWindow = opts.flowWindow end
+  if modules.Router and opts.stuckEpochs then modules.Router.stuckEpochs = opts.stuckEpochs end
+  if modules.Planner and opts.inputCapK then modules.Planner.inputCapK = opts.inputCapK end
+  if modules.Planner and opts.inputCapMin then modules.Planner.inputCapMin = opts.inputCapMin end
   -- The control model keeps a DURABLE machine->recipe assignment (+ epoch clock for hysteresis)
   -- module-side so it survives the ~2s rebuilds; a fresh session starts clean.
   if modules.Planner then modules.Planner._assign = {}; modules.Planner._epoch = 0 end
@@ -275,6 +278,7 @@ function App.run(modules, topology, opts)
   end
   while true do
     local moved = ctx.router:pump()
+    if ctx.planner and ctx.router._stuckScan then pcall(function() ctx.router:_stuckScan(ctx.planner) end) end
     if now() - lastMs >= replanMs then
       refresh()                                   -- wall-clock: refresh even while busy
     elseif moved == 0 then
