@@ -133,6 +133,16 @@ function Router.new(topology, getProxy)
   self.ordersForItem = {}         -- item -> { all orders } (multi-destination routing)
   self._fh = {}                   -- firstHop cache: [from][dst] = belt | false
   self._mrr = {}                  -- per-merger round-robin input cursor (fair input draining)
+  -- RAW INPUT ITEMS (copper ingot, iron ingot, concrete, ...): the items a physical input
+  -- container provides. At a merger these are drained at LOWEST priority and ROUND-ROBINED among
+  -- themselves — so the belt is emptied of products-in-transit before more raw material is injected
+  -- (back-pressure), AND the raw inputs MIX fairly instead of serializing copper->concrete->iron by
+  -- manifold position. Classifying by ITEM (not by port) is what makes this work no matter how far
+  -- down the manifold a given input merged in. Provides-based only; hub draws are not deprioritised.
+  self._rawItem = {}
+  for _, c in ipairs(topology.containers or {}) do
+    if c.provides then self._rawItem[lc(c.provides)] = true end
+  end
   return self
 end
 
@@ -727,16 +737,31 @@ function Router:pump()
         -- non-empty input at/after the cursor, then advance the cursor PAST it — so consecutive
         -- forwards rotate evenly across the active inputs (1:1:1). The while-loop re-runs to
         -- forward the rest in that rotated order.
+        -- PRIORITY by ITEM, not by port. Phase 1 forwards a PRODUCT/intermediate (anything NOT a
+        -- raw input item — e.g. iron plates arriving from a buffer); phase 2 forwards a RAW INPUT
+        -- item (copper/iron ingot/concrete) only when no product was waiting this pass. So the
+        -- merger drains products-in-transit off the belt FIRST, and injects raw material only into
+        -- the gaps — while round-robining (the _mrr cursor) keeps the raw inputs MIXED among
+        -- themselves instead of serialising copper->concrete->iron by manifold position. Item-based
+        -- is what makes a raw item low-priority no matter how far down the manifold it merged in.
+        local raw = self._rawItem
         local start = self._mrr[id] or 0
-        for k = 0, 2 do
-          local i = (start + k) % 3
-          local ok, it = pcall(function() return m:getInput(i) end)
-          local nm = ok and itemName(it)
-          if nm and self:_mergerPush(m, id, i, nm) then
-            total = total + 1; progressed = true
-            self._mrr[id] = (i + 1) % 3            -- next forward serves the input after this one
-            break
+        local moved = false
+        for phase = 1, 2 do
+          for k = 0, 2 do
+            local i = (start + k) % 3
+            local ok, it = pcall(function() return m:getInput(i) end)
+            local nm = ok and itemName(it)
+            if nm then
+              local isRaw = raw[nm] or false
+              if ((phase == 2) == isRaw) and self:_mergerPush(m, id, i, nm) then
+                total = total + 1; progressed = true; moved = true
+                self._mrr[id] = (i + 1) % 3          -- next forward serves the input after this one
+                break
+              end
+            end
           end
+          if moved then break end                    -- forwarded one; don't also pull a raw input this pass
         end
       end
     end
