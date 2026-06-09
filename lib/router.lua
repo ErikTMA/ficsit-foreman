@@ -319,14 +319,73 @@ end
 --- FIN signal payload is an FInventoryItem; the item name is item.type.name
 --- (item.type is the ItemType OBJECT, not a string). itemName() normalizes to
 --- lowercase so matching is case-insensitive vs reflection's canonical (Title) case.
+-- ACTIVE SET of codeable nodes that may still hold an item to route. Routing is EVENT-DRIVEN: an
+-- ItemRequest fires when an item ARRIVES, _dispatch routes it. But a route that FAILS (output full)
+-- leaves the item with no new signal, so we remember the node here and retry it (cheaply) until its
+-- input clears — instead of polling all ~120 ports every loop (the game-thread-sync freeze). Module-
+-- level so it survives the in-loop router rebuilds; stale ids self-clean (an empty/dead node is dropped).
+Router._retry = Router._retry or {}
+
 function Router:_dispatch(sender, a, b)
   local id = sender.id
+  local moved = true                                   -- empty/unhandled signal: nothing to retry
   if self.isSplitter[id] then
     local nm = itemName(a)                             -- splitter sig: (item)
-    if nm then self:_routeAtSplitter(sender, id, nm) end
+    if nm then moved = self:_routeAtSplitter(sender, id, nm) end
   elseif self.isMerger[id] then
     local nm = itemName(b)                             -- merger sig: (input, item)
-    if nm then self:_mergerPush(sender, id, a, nm) end
+    if nm then moved = self:_mergerPush(sender, id, a, nm) end
+  end
+  if not moved then Router._retry[id] = true end       -- output full / held: no new signal will come, retry it
+end
+
+-- Re-attempt the small ACTIVE SET (nodes that recently signaled / held an item); drop a node only once
+-- its input is confirmed EMPTY (or it is dead). O(active), NOT O(all nodes) — this is what replaces the
+-- poll-everything pump in the live loop. A downstream node freeing space is what lets a held item move;
+-- we just retry each loop. A node is KEPT if a read throws (transient) so a stray reflection error never
+-- abandons a held item. Mergers forward PRODUCT before RAW (same 2-phase priority as pump), round-robined.
+function Router:_drainRetry()
+  local r = Router._retry
+  local raw = self._rawItem or {}
+  for id in pairs(r) do
+    local keep = false
+    if self.isSplitter[id] then
+      local s = self.getProxy(id)
+      if s and s.getInput then
+        local ok, it = pcall(function() return s:getInput() end)
+        if not ok then keep = true                       -- transient read error: keep, retry next loop
+        else
+          local nm = itemName(it)
+          if nm then keep = true; self:_routeAtSplitter(s, id, nm) end   -- has item: route + keep
+        end                                              -- ok+empty -> keep stays false -> drop
+      end                                                -- dead proxy -> drop
+    elseif self.isMerger[id] then
+      local m = self.getProxy(id)
+      if m and m.getInput then
+        local items, any, err = {}, false, false
+        for i = 0, 2 do
+          local ok, it = pcall(function() return m:getInput(i) end)
+          if not ok then err = true else local nm = itemName(it); if nm then items[i] = nm; any = true end end
+        end
+        if any then                                      -- forward ONE item, PRODUCT (phase 1) before RAW (phase 2)
+          keep = true
+          local start = self._mrr[id] or 0
+          for phase = 1, 2 do
+            local moved = false
+            for k = 0, 2 do
+              local i = (start + k) % 3
+              local nm = items[i]
+              if nm and ((phase == 2) == (raw[nm] or false)) then
+                if self:_mergerPush(m, id, i, nm) then self._mrr[id] = (i + 1) % 3 end
+                moved = true; break
+              end
+            end
+            if moved then break end
+          end
+        elseif err then keep = true end                  -- couldn't read any port: keep, retry next loop
+      end
+    end
+    if not keep then r[id] = nil end                     -- input confirmed clear (or dead) -> drop from the set
   end
 end
 
@@ -445,27 +504,19 @@ end
 -- splitter feeding it diverts the item to a sibling buffer with room or to the bottleneck (load-
 -- balances a same-item buffer pool, stops over-filling).
 --
--- MULTI-INPUT MACHINE (assembler/manufacturer) ingredient: room = portCap - have(that ingredient in
--- the machine input). This is the HEAD-OF-LINE fix for per-port routing — a port-pinned ingredient
--- has a single quota leg, so when its port fills it would stall the shared per-machine splitter and
--- block the OTHER ingredient. Capping by the per-ingredient input level makes the abundant ingredient
--- stop flowing toward the splitter once its port is full (its quota -> 0 -> it diverts UPSTREAM where
--- buffers/sink are reachable), freeing the splitter so the scarce ingredient reaches its own port.
--- Only multi-input machines are capped; a single-input constructor routes its full demand (so the
--- single-input fill paths — regate/flow/balance — are unchanged).
-Router.portCap = Router.portCap or 12   -- standing per-ingredient input cap at a multi-input machine (tunable)
+-- Room a destination has for an order's item RIGHT NOW. A storage buffer is capped by its capacity;
+-- a MACHINE input is NOT port-capped — it fills to its full per-epoch demand. (An earlier portCap=12
+-- per-ingredient cap was meant as a head-of-line guard, but per-input-port routing already puts each
+-- ingredient on its OWN belt+port, so plate and screws never share a splitter at the machine. The cap
+-- only starved the abundant ingredient — "plate stops filling even when the input isn't full" — so it
+-- is gone. Manifold-level over-supply is the SOURCE gate's job, not the consumer's.)
 function Router:_orderRoom(o)
   local cap = self.capacity[o.dst]
-  if cap then                                            -- destination buffer
+  if cap then                                            -- destination buffer: room = capacity - have
     local have = self:_countAt(o.dst, o.item, false)
     return math.max(0, cap - have)
   end
-  local belts = self.inputBelts and self.inputBelts[o.dst]
-  if belts and #belts >= 2 then                          -- multi-input machine: per-ingredient input cap
-    local have = self:_countAt(o.dst, o.item, true)
-    return math.max(0, (Router.portCap or 12) - have)
-  end
-  return o.count - o.delivered                           -- single-input machine / sink: full demand
+  return o.count - o.delivered                           -- machine / sink: full per-epoch demand
 end
 
 function Router:buildQuota()

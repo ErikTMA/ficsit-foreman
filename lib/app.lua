@@ -266,15 +266,17 @@ function App.run(modules, topology, opts)
     return ctx.router, ctx.planner
   end
 
-  -- IN-GAME DEFAULT: a persistent control loop, LEVEL-TRIGGERED. Each iteration pumps
-  -- (actively drains every splitter/merger input — robust against missed ItemRequest edges).
-  -- REFRESH (re-plan, and every `rediscover`-th time a full belt re-crawl to pick up newly
-  -- built machines / repaired belts) is driven by a WALL-CLOCK timer, NOT by going idle: a
-  -- busy factory's belts keep pump() > 0 forever, so the old idle-only refresh never fired
-  -- while running — new assemblers and fixed belts were invisible until a restart. The idle
-  -- branch is kept too (it drives the offline emulator and reacts faster when truly quiet).
+  -- IN-GAME DEFAULT: a persistent control loop. ITEM MOVEMENT IS EVENT-DRIVEN — an ItemRequest fires
+  -- when an item ARRIVES at a codeable splitter/merger, and the registered listener routes it
+  -- (Router:_dispatch). We do NOT poll all ~120 ports every tick: that game-thread-sync storm is what
+  -- froze the whole network in visible pulses (items stop, then jump, at every splitter/merger). A
+  -- route that hits a full output emits no fresh signal, so the held node goes into a small ACTIVE SET
+  -- and is retried cheaply each loop (Router:_drainRetry) until its input clears. A rare full pump()
+  -- is only a safety BACKSTOP for any edge the listener missed. The periodic REFRESH is the ONLY
+  -- planning work — re-plan orders + re-gate sources (and re-crawl when the component count changes).
   local replan = opts.replan or 2                 -- seconds: idle wait + refresh cadence
   local replanMs = opts.replanMs or (replan * 1000)
+  local fullMs = opts.fullScanMs or 5000          -- safety backstop: full poll at most this often
   -- A full belt re-crawl (App.build) walks every connector — the single most sync-heavy operation,
   -- and it FREEZES routing while it runs (seconds, on a big factory). It only needs to run when the
   -- network actually CHANGED (the player built/removed something), which we detect cheaply by the
@@ -306,14 +308,17 @@ function App.run(modules, topology, opts)
     if ctx.planner and ctx.router._stuckScan then pcall(function() ctx.router:_stuckScan(ctx.planner) end) end
     lastMs = now()
   end
+  local lastFull = now()
   while true do
-    local moved = ctx.router:pump()
-    if now() - lastMs >= replanMs then
-      refresh()                                   -- wall-clock: refresh even while busy
-    elseif moved == 0 then
-      if event.pull(replan) == nil then refresh() end  -- idle: wait for a signal/timeout, then refresh
+    local t = now()
+    if t - lastMs >= replanMs then
+      refresh()                                   -- wall-clock: re-plan / re-gate (re-crawl on change)
+    elseif t - lastFull >= fullMs then
+      ctx.router:pump(); lastFull = t             -- rare full-poll backstop: catch any item no signal covered
     else
-      event.pull(0)                               -- busy: drain a queued signal / advance the conveyor
+      local sig = event.pull(replan)              -- block for the next ItemRequest -> _dispatch routes it
+      ctx.router:_drainRetry()                    -- retry the small active set of held nodes (cheap)
+      if sig == nil then refresh() end            -- timed out with no signal (idle): re-plan / re-discover now
     end
   end
   return ctx.router, ctx.planner                  -- unreachable; kept for symmetry
