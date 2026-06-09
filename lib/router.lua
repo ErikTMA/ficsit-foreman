@@ -458,67 +458,67 @@ function Router:_credit(belt, item)
   end
 end
 
--- Fallback for an item with NO remaining quota leg at this node (its quota is spent, or
--- it is overflow/unmanaged). In order: reroute to any reachable buffer for the item that
--- has room; else the catch-all sink; else HOLD (managed item waits for path repair); else
--- jam + panic (a destination-less unknown item with no sink). `fromOutput` is the
--- transferItem arg used for sink/reroute hops out of this node.
+-- Fallback for an item with NO remaining quota leg at this node (its quota is spent, or it is
+-- overflow/unmanaged). NEVER-HOLD policy (user rule: "reroute overflow — to a buffer, or if that's
+-- full, to the sink"): a held item blocks the belt behind it (head-of-line — the abundant ingredient
+-- stalls the shared splitter and starves the scarce one). So we always CLEAR the item off this node:
+--   1. DELIVER to an active order's destination (most-behind first) if a hop accepts it — the ideal;
+--   2. else REROUTE to a buffer for the item that has room (preserve it in storage, off the belt);
+--   3. else SINK it (over-supply / no room anywhere) — clears the belt so others pass;
+--   4. only if there is NO sink at all do we HOLD (can't drop it into nowhere) or panic (unknown item).
+-- Each step tries a DIFFERENT output leg, so a full destination leg is bypassed via the buffer/sink
+-- leg instead of stalling. `fromOutput` is the transferItem arg for the hop out of this node.
 function Router:_overflow(sender, id, item)
   local active = {}
   for _, o in ipairs(self.ordersForItem[item] or {}) do
     if o.delivered < o.count then active[#active + 1] = o end
   end
-  -- RECOVER an item that fell off its pre-built quota path. In a dense shared manifold an
-  -- item routed greedily (or merged onto a belt that isn't on its BFS route) can reach a
-  -- node carrying no quota for it; rather than dump it, RE-PATHFIND from HERE toward an
-  -- active order's destination — most-behind first, so balance is preserved — whether that
-  -- destination is a constructor or a buffer. This is the "recalculate a new way to the
-  -- destination" path; only if NO order's dst is reachable do we fall through to the sink.
+  -- 1. DELIVER to an active destination (re-pathfind from HERE, most-behind first). If the hop is
+  -- full/unreachable, DON'T hold — fall through to the buffer/sink so the belt keeps moving.
   table.sort(active, function(a, b) return (a.count - a.delivered) > (b.count - b.delivered) end)
   for _, o in ipairs(active) do
     local terminal = not self.bufferItem[o.dst]
     if terminal or self:hasRoom(o.dst, item) then
       local belt = self:firstHopTo(id, o.dst)
-      if belt then
-        if sender:transferItem(belt.fromOutput or 0) then
-          if belt.to == o.dst then self:_credit(belt, item) end
-          Router._dlog(("RECOVER %s '%s' >out[%d] %s ->%s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(belt.to):sub(1,6), tostring(o.dst):sub(1,6)))
-          return true
-        end
-        return false                                 -- chosen output full; retry later
+      if belt and sender:transferItem(belt.fromOutput or 0) then
+        if belt.to == o.dst then self:_credit(belt, item) end
+        Router._dlog(("RECOVER %s '%s' >out[%d] %s ->%s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(belt.to):sub(1,6), tostring(o.dst):sub(1,6)))
+        return true
       end
     end
   end
-  -- reroute/overflow: an alternate buffer for the same item (e.g. primary full).
+  -- 2. REROUTE to a buffer for the item that has room — preserves it (it waits in storage, available
+  -- when demand returns) instead of holding on the belt and blocking everything behind it.
   for _, D in ipairs(self.buffersForItem[item] or {}) do
     if self:hasRoom(D, item) then
       local belt = self:firstHopTo(id, D)
-      if belt then return sender:transferItem(belt.fromOutput or 0) and true or false end
+      if belt and sender:transferItem(belt.fromOutput or 0) then
+        if belt.to == D then self:_credit(belt, item) end
+        Router._dlog(("REROUTE %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(D):sub(1,6)))
+        return true
+      end
     end
   end
-  -- catch-all sink.
+  -- 3. SINK: buffers full / no buffer — clear the belt rather than HOLD (head-of-line). Over-supply
+  -- of an abundant ingredient lands here so the scarce one can get through.
   local sink = self.defaults[1]
   if sink then
     local belt = self:firstHopTo(id, sink)
-    if belt then
+    if belt and sender:transferItem(belt.fromOutput or 0) then
       if #active > 0 and computer and computer.log then
         Router._sinkLog = (Router._sinkLog or 0)
         if Router._sinkLog < 16 then
           Router._sinkLog = Router._sinkLog + 1
-          -- recovery already tried to re-pathfind to every active dst, so reaching here means
-          -- NO belt path exists from this node to the destination — the discovered graph is
-          -- disconnected here (a mis-mapped port, a one-way snap, or a genuinely missing belt).
-          computer.log(2, ("[Foreman] SINK: '%s' stuck at %s — NO belt path to %s (graph disconnected here)")
-            :format(item, tostring(id), tostring(active[1].dst)))
+          computer.log(2, ("[Foreman] SINK: '%s' overflow at %s — no room at its destination/buffer")
+            :format(item, tostring(id)))
         end
       end
-      Router._dlog(("SINK %s '%s' (no path to any dst)"):format(tostring(id):sub(1,6), item))
-      return sender:transferItem(belt.fromOutput or 0) and true or false
+      Router._dlog(("SINK %s '%s' (overflow, no room)"):format(tostring(id):sub(1,6), item))
+      return true
     end
   end
-  -- No route and no sink. A MANAGED item (active order whose path was deleted, or a buffer
-  -- merely full) HOLDS on the belt and waits for repair — rebuilding the missing node lets
-  -- it flow again with no restart. Only a destination-less unknown item jams + asks for a sink.
+  -- 4. LAST RESORT — no sink reachable at all. A managed item HOLDS (can't drop it into nowhere; it
+  -- waits for a belt repair); a destination-less unknown item jams + asks for a sink.
   if #active > 0 or next(self.buffersForItem[item] or {}) then return false end
   computer.panic(("unroutable item '%s' at %s: add a container named DEFAULT_OUT_%d and wire it into the network")
     :format(tostring(item), id, #self.defaults + 1))
