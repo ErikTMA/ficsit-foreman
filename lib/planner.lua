@@ -626,41 +626,25 @@ end
 -- the buffer(s) of `item` that still need filling: { {id=, need=} ... }. The hub (bufferOf) carries
 -- the draw on top of its own shortfall; other buffers just their shortfall.
 --
--- INTERMEDIATE (staging) items are sized on the item's TOTAL stock across ALL its buffers, with the
--- whole staging need placed on the HUB (bufferOf) — consumers draw from the hub. Per-buffer staging
--- was wrong: a second, empty buffer of an already-abundant item (e.g. a dead-end iron-plate buffer at
--- 0 while the plate HUB holds 1034) would pull SCARCE feedstock to fill itself, over-producing the
--- intermediate and starving a co-fed sibling chain (the iron-ingot-to-rod starvation). Total-stock
--- staging makes an abundant item demand NOTHING anywhere, freeing the shared raw for the starved chain.
+-- Each buffer of an item is an INDEPENDENT destination (it may be far across the factory; the hub
+-- cannot serve a buffer it is not wired to), so staging is sized PER BUFFER, not pooled. An
+-- intermediate (crafted-and-consumed) buffer is staged to ~stageDepth with NO hubDraw — the
+-- consumer's draw shows up next epoch as a lower count_in and is refilled then, so production tracks
+-- real consumption rather than the full downstream-to-capacity shortfall (the flood).
 function Planner:_needingBuffers(item)
   item = lc(item); local out = {}
-  local staged = self.intermediate and self.intermediate[item]
-  local totalHave, maxTarget = 0, nil
-  if staged then
-    for _, c in ipairs(self.topo.containers or {}) do
-      if Planner.destItem(c) == item then
-        totalHave = totalHave + count_in(self.getProxy(c.id), item)
-        local t = c.target or Planner.destTarget(c)
-        if t and (not maxTarget or t > maxTarget) then maxTarget = t end
-      end
-    end
-  end
   for _, c in ipairs(self.topo.containers or {}) do
     if Planner.destItem(c) == item then
       local target = c.target or Planner.destTarget(c)
       if target then
         local need
-        if staged then
-          -- keep ~stageDepth of the item on hand TOTAL, on the hub only, NO hubDraw. The consumer's
-          -- draw shows up next epoch as a lower total, refilling exactly what was drained — so
-          -- production tracks real consumption, not the full downstream-to-capacity shortfall (flood),
-          -- and not a sibling buffer's emptiness when the item is abundant elsewhere (sibling starve).
-          need = (self.bufferOf[item] == c.id) and (math.min(self.stageDepth or 100, maxTarget or target) - totalHave) or 0
+        if self.intermediate and self.intermediate[item] then
+          need = math.min(self.stageDepth or 100, target) - count_in(self.getProxy(c.id), item)
         else
           need = target - count_in(self.getProxy(c.id), item)
           if self.bufferOf[item] == c.id and self.hubDraw and self.hubDraw[item] then need = need + self.hubDraw[item] end
         end
-        if need and need > 0 then out[#out + 1] = { id = c.id, need = need } end
+        if need > 0 then out[#out + 1] = { id = c.id, need = need } end
       end
     end
   end
