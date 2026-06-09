@@ -486,7 +486,12 @@ end
 function Planner:_addNeed(item, units, depth, seen)
   item = lc(item)
   if units <= 0 or depth > 8 or seen[item] then return end
-  if self:producible(item) <= 0 then return end              -- producible cap (subsumes dead-hub)
+  -- producible is a CAP, not just a gate: 2 stray solid biofuel in a hub must not wave through a
+  -- 4798-unit demand for an item whose ingredient (biomass) doesn't exist anywhere — that bogus
+  -- rank steals a machine and churns its recipe against an impossible job. Demand = want ∧ can.
+  local can = self:producible(item)
+  if can <= 0 then return end
+  units = math.min(units, can)
   self.need[item] = (self.need[item] or 0) + units
   if self.sources[item] then return end                      -- raw leaf
   local pick = self:chooseRecipe(item, units, depth, false)  -- representative recipe (sizing only)
@@ -806,6 +811,7 @@ function Planner:produceFor(cid, item, share, dst)
   local function rollback() self.router:_truncateOrders(startN); for _, c in ipairs(claimed) do self.busy[c] = nil end; return false end
   local okc, cur = pcall(function() return opt.ctor:getRecipe() end)
   local live = okc and cur and cur.name or nil
+  local needSwitch = false
   local inN = self:_inputCount(cid)
   -- ---- FEED-DRAIN hold: a machine clearing its jammed entrance keeps the drain recipe ----
   local d = Planner._drain[cid]
@@ -875,7 +881,7 @@ function Planner:produceFor(cid, item, share, dst)
       return true
     end
     if self:canSwitch(cid, opt) then
-      pcall(function() opt.ctor:setRecipe(opt.recipe) end)
+      needSwitch = true    -- defer the actual setRecipe until the ingredient orders PLACE (below)
     else
       local curItem = live and self.itemOfRecipe[tostring(live)]   -- DRAIN: route finishing output
       if curItem and self.bufferOf[curItem] then
@@ -887,6 +893,10 @@ function Planner:produceFor(cid, item, share, dst)
   local crafts = ceil(share, opt.out)
   local ok, sub = self:_orderIngredients(opt, crafts, cid, 1, 1, 0)
   if not ok then return rollback() end
+  -- setRecipe ONLY after the ingredients are orderable: switching first churned the (expensive,
+  -- input-ejecting) setRecipe every epoch on an infeasible assignment — the live Solid Biofuel /
+  -- Reanimated SAM flip-flop on one constructor, retrying a job whose ingredient doesn't exist.
+  if needSwitch then pcall(function() opt.ctor:setRecipe(opt.recipe) end) end
   for _, c in ipairs(sub or {}) do claimed[#claimed + 1] = c end
   if self.router:order(item, share, dst, cid) then
     local terminal = self.router.orders[#self.router.orders]
