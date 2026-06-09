@@ -287,9 +287,6 @@ function App.run(modules, topology, opts)
   -- planning work — re-plan orders + re-gate sources (and re-crawl when the component count changes).
   local replan = opts.replan or 2                 -- seconds: idle wait + refresh cadence
   local replanMs = opts.replanMs or (replan * 1000)
-  local fullMs = opts.fullScanMs or 15000         -- safety backstop: full poll at most this often (~15s;
-                                                  -- routing is event-driven, so this is just insurance
-                                                  -- against a missed edge — a ~0.7s poll every 15s)
   -- A full belt re-crawl (App.build) walks every connector — the single most sync-heavy operation,
   -- and it FREEZES routing while it runs (seconds, on a big factory). It only needs to run when the
   -- network actually CHANGED (the player built/removed something), which we detect cheaply by the
@@ -322,42 +319,49 @@ function App.run(modules, topology, opts)
     if ctx.planner and ctx.router._stuckScan then pcall(function() ctx.router:_stuckScan(ctx.planner) end) end
     lastMs = now()
   end
-  -- TICK-DRIVEN loop. The cardinal rule: NEVER sleep while there is work to do. The old loop called
-  -- event.pull(replan=2s), which literally suspends the EEPROM for up to 2 SECONDS waiting for a signal
-  -- — and that idle wait happens precisely when a node is HOLDING an item (its output is full, so no new
-  -- arrival, so no new signal), so held items only got retried once every 2s -> the multi-second stutter.
-  -- Now: each pass drains the WHOLE ItemRequest burst (the listener routes each), retries the small held
-  -- set, then EITHER yields exactly one tick (computer.skip) if items are still pending — so retries run
-  -- every game tick, not every 2s — OR, only when genuinely idle (nothing held), blocks for the next
-  -- signal. Routing is cheap Lua; the freeze was the sleeping, not the work. A periodic perf line makes
-  -- the cost visible (set opts.logMs=0 to silence).
-  local function heldCount() local n = 0; for _ in pairs(modules.Router._retry or {}) do n = n + 1 end; return n end
+  -- CONTINUOUS-PUMP loop (restored — this is what flowed smoothly before v0.13.5). Each iteration the
+  -- LEVEL-TRIGGERED pump() polls every splitter/merger and moves what it can. It returns `present` = how
+  -- many codeables STILL hold an item (stuck/jammed right now). The rule:
+  --   * flowing (moved > 0)  -> event.pull(0): non-blocking, loop immediately, pump again. Smooth flow.
+  --   * jammed (present > 0) -> keep pumping (capped) so a CLEARING jam is caught the instant a downstream
+  --     frees — instead of sleeping 2s with items frozen at the codeables (THE stutter: v0.13.5+ pushed
+  --     the pump to a rare 15s backstop, so items only moved in 15s bursts).
+  --   * truly clear (moved 0, present 0) -> event.pull(replan): block for the next signal, then re-plan.
+  -- The level-triggered pump is what catches items that arrived but fired no fresh ItemRequest (a held
+  -- item never re-signals) — event-driven routing alone (v0.13.5-0.13.7) could not, hence the bursts.
+  -- pump() is CHEAP (the in-game perf line confirms maxwork ~0-1ms); it was removed on a wrong premise.
+  -- PERF LINE (every opts.logMs, default 10s; 0 silences): routed=items moved/window, present=current
+  -- jam depth, sunk/stuck=overflow rates (over-supply!), refresh=re-plan ms, maxwork=worst pump ms.
+  -- DEBUG (nick the Computer Case "debug" or opts.debug): adds a full buffer/source/machine dump every
+  -- opts.dbgMs (3s) plus the per-route SPL/RECOVER/SINK/STUCK/PATH trace.
   local logMs = (opts.logMs == nil) and 10000 or opts.logMs
-  local lastFull, lastLog = now(), now()
-  local routed, maxWork, refreshMs = 0, 0, 0
+  local dbgMs = opts.dbgMs or 3000
+  local jamSpin = opts.jamSpin or 200
+  local lastLog, lastDbg = now(), now()
+  local routed, maxWork, refreshMs, noProg = 0, 0, 0, 0
   while true do
     local w0 = now()
-    local g = 0
-    while event.pull(0) ~= nil do g = g + 1; if g > 2000 then break end end  -- drain the whole burst this tick
-    routed = routed + g
-    ctx.router:_drainRetry()                       -- retry held nodes EVERY pass (not every 2s)
-    local work = now() - w0; if work > maxWork then maxWork = work end       -- per-tick work cost (excl. idle waits)
+    local moved, present = ctx.router:pump()        -- level-triggered routing EVERY iteration (cheap)
+    ctx.router:_drainRetry()                         -- drain held-node set (bounded safety; pump also covers it)
+    routed = routed + moved
+    local work = now() - w0; if work > maxWork then maxWork = work end
     local t = now()
+    if App._debug and t - lastDbg >= dbgMs then ctx.router:debugDump(); lastDbg = t end
     if logMs > 0 and t - lastLog >= logMs and computer and computer.log then
-      -- routed = items moved / window; refresh = ms of the periodic re-plan; maxwork = worst single tick's
-      -- routing cost (high -> a sync storm in routing); held = nodes back-pressured (output full).
-      computer.log(1, ("[Foreman] perf: routed %d in %.0fs, refresh %dms, maxwork %dms, held %d")
-        :format(routed, (t - lastLog) / 1000, refreshMs, maxWork, heldCount()))
-      routed, maxWork, lastLog = 0, 0, t
+      computer.log(1, ("[Foreman] perf: routed %d in %.0fs, present %d, sunk %d, stuck %d, refresh %dms, maxwork %dms")
+        :format(routed, (t - lastLog) / 1000, present,
+                modules.Router._nSunk or 0, modules.Router._nStuck or 0, refreshMs, maxWork))
+      routed, maxWork = 0, 0; modules.Router._nSunk, modules.Router._nStuck = 0, 0; lastLog = t
     end
     if t - lastMs >= replanMs then
-      local r0 = now(); refresh(); refreshMs = now() - r0; lastMs = now()   -- wall-clock re-plan (fires even when busy)
-    elseif t - lastFull >= fullMs then
-      ctx.router:pump(); lastFull = t              -- rare full-poll backstop: catch a truly missed edge
-    elseif next(modules.Router._retry or {}) ~= nil then
-      computer.skip()                              -- WORK PENDING: yield ONE tick, retry next tick (never sleep)
+      local r0 = now(); refresh(); refreshMs = now() - r0; lastMs = now(); noProg = 0
+    elseif moved > 0 then
+      noProg = 0; event.pull(0)                      -- flowing: loop fast, pump again
+    elseif present > 0 and noProg < jamSpin then
+      noProg = noProg + 1; event.pull(0)             -- jammed: keep retrying (capped) — don't sleep on a clearing jam
     else
-      if event.pull(replan) == nil then refresh(); refreshMs = 0; lastMs = now() end  -- truly idle: sleep to next signal, then re-plan
+      noProg = 0
+      if event.pull(replan) == nil then refreshMs = 0; refresh(); lastMs = now() end  -- clear / hard jam: wait, re-plan
     end
   end
   return ctx.router, ctx.planner                  -- unreachable; kept for symmetry

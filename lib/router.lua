@@ -638,7 +638,8 @@ function Router:_overflow(sender, id, item)
   for _, sink in ipairs(self.defaults or {}) do
     local belt = self:firstHopTo(id, sink)
     if belt and sender:transferItem(belt.fromOutput or 0) then
-      if #active > 0 and computer and computer.log then
+      Router._nSunk = (Router._nSunk or 0) + 1            -- always-counted; the perf line reports the rate
+      if Router.DEBUG and #active > 0 and computer and computer.log then
         Router._sinkLog = (Router._sinkLog or 0)
         if Router._sinkLog < 16 then
           Router._sinkLog = Router._sinkLog + 1
@@ -654,7 +655,8 @@ function Router:_overflow(sender, id, item)
   -- HOLD the item and warn (capped). NEVER panic: crashing computer.panic kills the WHOLE controller
   -- over a single stray item — far worse than one item waiting on a belt. The held item resumes the
   -- instant a path opens (a buffer drains, a sink is wired, a belt is repaired) with no restart.
-  if computer and computer.log then
+  Router._nStuck = (Router._nStuck or 0) + 1             -- always-counted; the perf line reports the rate
+  if Router.DEBUG and computer and computer.log then
     Router._holdLog = Router._holdLog or 0
     if Router._holdLog < 8 then
       Router._holdLog = Router._holdLog + 1
@@ -1104,22 +1106,31 @@ end
 --- actively polls every codeable input each call and drains whatever is held, looping
 --- until no further progress. This is the real driver; the ItemRequest listener just
 --- makes it react faster. Returns the number of items moved.
+-- Returns: moved (items routed this call), present (codeables STILL holding an item on the final pass
+-- = items stuck/jammed right now). The loop uses `present` to decide whether to keep pumping (work to
+-- do) or block for the next signal (truly clear) — so it NEVER sleeps on a jam.
 function Router:pump()
   local total = 0
+  local present = 0
   local progressed, guard = true, 0
   while progressed and guard < 10000 do
     progressed = false; guard = guard + 1
+    present = 0
     for _, id in ipairs(self.topo.splitters or {}) do
       local s = self.getProxy(id)
       if s and s.getInput then
         local ok, it = pcall(function() return s:getInput() end)
         local nm = ok and itemName(it)               -- nil for an empty input (FIN empty struct)
-        if nm and self:_routeAtSplitter(s, id, nm) then total = total + 1; progressed = true end
+        if nm then
+          present = present + 1
+          if self:_routeAtSplitter(s, id, nm) then total = total + 1; progressed = true end
+        end
       end
     end
     for _, id in ipairs(self.topo.mergers or {}) do
       local m = self.getProxy(id)
       if m and m.getInput then
+        local hasItem = false
         -- ALTERNATE inputs fairly. A merger's output holds only 2 items, so always draining
         -- inputs 0,1,2 in fixed order lets the early inputs grab the freed slots and STARVE
         -- the rest (uneven, drifting ratios). Forward exactly ONE item per pass, from the next
@@ -1142,6 +1153,7 @@ function Router:pump()
             local ok, it = pcall(function() return m:getInput(i) end)
             local nm = ok and itemName(it)
             if nm then
+              hasItem = true
               local isRaw = raw[nm] or false
               if ((phase == 2) == isRaw) and self:_mergerPush(m, id, i, nm) then
                 total = total + 1; progressed = true; moved = true
@@ -1152,10 +1164,40 @@ function Router:pump()
           end
           if moved then break end                    -- forwarded one; don't also pull a raw input this pass
         end
+        if hasItem then present = present + 1 end
       end
     end
   end
-  return total
+  return total, present
+end
+
+--- DEBUG state dump (only when nick "debug" / opts.debug). One block per call so the operator can
+--- watch supply/demand live: every storage buffer's fill, every source's lifetime release + live
+--- leftover budget, every machine's recipe + input level. This is what shows an OVER-SUPPLY (a buffer
+--- pinned full + its source still releasing) or a STARVED machine (recipe set, input 0) at a glance.
+function Router:debugDump()
+  if not (Router.DEBUG and computer and computer.log) then return end
+  local function s6(x) return tostring(x):sub(1, 6) end
+  for _, c in ipairs(self.topo.containers or {}) do
+    local item = self.bufferItem[c.id]
+    if item and self.capacity[c.id] then
+      computer.log(1, ("[Foreman] dbg buf %s '%s' %d/%d"):format(s6(c.id), item, self:_count(c.id, item), self.capacity[c.id]))
+    end
+  end
+  for _, c in ipairs(self.topo.containers or {}) do
+    local item = self.sourceItem[c.id]
+    if item then
+      local ub = 0
+      for _, conn in ipairs(self:_connFor(c.id).conns) do local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end); ub = ub + cur end
+      computer.log(1, ("[Foreman] dbg src %s '%s' auth=%d ub=%d"):format(s6(c.id), item,
+        (Router._auth and (Router._auth["item:" .. item] or 0)) or 0, ub))
+    end
+  end
+  for _, cid in ipairs(self.topo.constructors or {}) do
+    local p = self.getProxy(cid)
+    local rec = "?"; if p then pcall(function() local r = p:getRecipe(); rec = (r and r.name) or "none" end) end
+    computer.log(1, ("[Foreman] dbg mac %s recipe=%s in=%d"):format(s6(cid), rec, self:_inputTotal(cid)))
+  end
 end
 
 --- Are all placed orders fulfilled (delivered to their primary dst)?
