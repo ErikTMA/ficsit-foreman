@@ -86,12 +86,18 @@ local function count_in(proxy, item)
   local invs = proxy:getInventories()
   local total = 0
   for _, inv in ipairs(invs) do
-    for i = 0, (inv.size or 0) - 1 do
-      local stack = inv:getStack(i)
-      -- in-game an empty slot returns a 0-count stack whose item.type is nil — guard
-      if stack and (stack.count or 0) > 0 and stack.item and stack.item.type
-         and lc(stack.item.type.name) == item then
-        total = total + stack.count
+    -- PERF: every getStack() is a game-thread sync; a storage container has 24-48 slots. Skip the
+    -- whole per-slot scan when the inventory's itemCount is 0 (a single property read) — most buffers
+    -- are empty or low, so this cuts the bulk of the planning-phase syncs on a big factory.
+    local n = 0; pcall(function() n = inv.itemCount or 0 end)
+    if n > 0 then
+      for i = 0, (inv.size or 0) - 1 do
+        local stack = inv:getStack(i)
+        -- in-game an empty slot returns a 0-count stack whose item.type is nil — guard
+        if stack and (stack.count or 0) > 0 and stack.item and stack.item.type
+           and lc(stack.item.type.name) == item then
+          total = total + stack.count
+        end
       end
     end
   end

@@ -276,17 +276,29 @@ function Router:firstHopTo(from, dst)
 end
 
 -- Current units of `item` in a destination (FIN-faithful inventory read).
+-- PERF: every getStack() is a game-thread sync, and a storage container has 24-48 slots — scanning
+-- them all per call (and hasRoom does it on every routing decision) is what makes a big factory stall.
+-- Two cheap shortcuts, both single-sync: (1) skip an inventory whose itemCount is 0; (2) when `item`
+-- is exactly the destination's DECLARED buffered item, the buffer holds only that item, so its
+-- itemCount IS the count — no slot scan. Only a mixed container falls back to the per-slot scan.
 function Router:_count(dst, item)
   local p = self.getProxy(dst)
   if not p or not p.getInventories then return 0 end
-  local total = 0
   item = lc(item)
+  local single = self.capacity[dst] ~= nil and self.bufferItem[dst] == item
+  local total = 0
   for _, inv in ipairs(p:getInventories()) do
-    for i = 0, (inv.size or 0) - 1 do
-      local s = inv:getStack(i)
-      -- empty slots return a 0-count stack with a nil item.type in-game — guard it
-      if s and (s.count or 0) > 0 and s.item and s.item.type and lc(s.item.type.name) == item then
-        total = total + s.count
+    local n = 0; pcall(function() n = inv.itemCount or 0 end)
+    if n > 0 then
+      if single then
+        total = total + n                              -- whole inventory is this item: 1 read, no slot scan
+      else
+        for i = 0, (inv.size or 0) - 1 do
+          local s = inv:getStack(i)
+          if s and (s.count or 0) > 0 and s.item and s.item.type and lc(s.item.type.name) == item then
+            total = total + s.count
+          end
+        end
       end
     end
   end
@@ -399,9 +411,17 @@ function Router:pumpGated() return self:pump() end
 function Router:_countAt(dst, item, isMachine)
   item = lc(item)
   local p = self.getProxy(dst); if not p then return 0 end
+  -- container branch for a declared buffer's OWN item: itemCount, no per-slot scan (see _count PERF note)
+  if not isMachine and self.capacity[dst] ~= nil and self.bufferItem[dst] == item then
+    local total = 0
+    local ok, invs = pcall(function() return p:getInventories() end)
+    if ok then for _, inv in ipairs(invs or {}) do local n = 0; pcall(function() n = inv.itemCount or 0 end); total = total + n end end
+    return total
+  end
   local total = 0
   local function tally(inv)
     if not inv or not inv.getStack then return end
+    local n = 0; pcall(function() n = inv.itemCount or 0 end); if n == 0 then return end  -- skip empty inventory
     local sz = 0; pcall(function() sz = inv.size or 0 end)
     for i = 0, sz - 1 do
       local s = inv:getStack(i)

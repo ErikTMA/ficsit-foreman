@@ -265,7 +265,11 @@ function App.run(modules, topology, opts)
   -- branch is kept too (it drives the offline emulator and reacts faster when truly quiet).
   local replan = opts.replan or 2                 -- seconds: idle wait + refresh cadence
   local replanMs = opts.replanMs or (replan * 1000)
-  local rediscover = opts.rediscover or 2         -- full re-discover every Nth refresh
+  -- A full belt re-crawl (App.build) walks every connector — the single most sync-heavy operation,
+  -- and it blocks routing while it runs. The topology rarely changes (the player isn't constantly
+  -- building), so re-crawl infrequently (every 6th refresh ~= 12s); the cheap re-plan every refresh
+  -- still re-routes. opts.rediscover overrides. A newly-built machine is picked up within ~12s.
+  local rediscover = opts.rediscover or 6         -- full re-discover every Nth refresh
   local nref = 0
   local function now() return (computer.millis and computer.millis()) or 0 end
   local lastMs = now()
