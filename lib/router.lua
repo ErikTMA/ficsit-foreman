@@ -732,11 +732,15 @@ function Router:_routeAtSplitter(sender, id, item)
         best._q[item] = (best._q[item] or 1) - 1
         self:_credit(best, item)
         if not terminal then self:_creditRoom(best.to, item) end   -- routed toward a buffer: bump its cached room
+        if self.isMachine[best.to] and Router._legFullMach then Router._legFullMach[best.to] = nil end   -- entrance accepted: jam (if any) cleared
         Router._dlog(("SPL %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, best.fromOutput or 0, tostring(best.to):sub(1,6)))
         return true
       end
       -- chosen leg physically full right now: log it (a starved consumer whose leg never accepts =
-      -- its input belt is backed up = its OUTPUT is blocked) and fall through to the next-best leg.
+      -- its input belt is backed up = its OUTPUT is blocked or a FOREIGN item the machine won't pull
+      -- is stranded at its entrance) and fall through to the next-best leg. Mark machine entrances
+      -- (module-durable: the planner's feed-drain reads it next epoch; cleared on a successful push).
+      if self.isMachine[best.to] then Router._legFullMach = Router._legFullMach or {}; Router._legFullMach[best.to] = true end
       Router._dlog(("SPLFULL %s '%s' >out[%d] %s — leg full, diverting"):format(tostring(id):sub(1, 6), item, best.fromOutput or 0, tostring(best.to):sub(1, 6)))
     end
   end
@@ -901,10 +905,16 @@ function Router:_mergerPush(sender, id, input, nm)
     Router._dlog(("MISROUTE %s '%s' >merge %s — machine doesn't consume it; holding"):format(tostring(id):sub(1, 6), nm, tostring(out.to):sub(1, 6)))
     return false
   end
-  if not sender:transferItem(input) then return false end
+  if not sender:transferItem(input) then
+    -- push failed: the merger's output belt is full. If it feeds a machine, mark the entrance jam
+    -- (same signal as _routeAtSplitter's SPLFULL) for the planner's feed-drain.
+    if out and self.isMachine[out.to] then Router._legFullMach = Router._legFullMach or {}; Router._legFullMach[out.to] = true end
+    return false
+  end
   if out then
     if out._q and (out._q[nm] or 0) > 0 then out._q[nm] = out._q[nm] - 1 end
     self:_credit(out, nm)
+    if self.isMachine[out.to] and Router._legFullMach then Router._legFullMach[out.to] = nil end   -- entrance accepted: jam cleared
   end
   return true
 end
@@ -997,6 +1007,10 @@ Router.flowWindow = Router.flowWindow or 50   -- max in-flight ingredient units 
 -- a consumer that delivers >= progressFloor units per gate is healthy and never throttled. Tunable.
 Router.inflightFloor = Router.inflightFloor or 32
 Router.progressFloor = Router.progressFloor or 8
+-- machine entrances whose feed leg is physically FULL (transferItem failed): set by _routeAtSplitter /
+-- _mergerPush, cleared when a push succeeds. Module-durable (router instances are rebuilt per epoch);
+-- the planner's FEED-DRAIN reads it to detect a foreign item stranded at a starved machine's entrance.
+Router._legFullMach = Router._legFullMach or {}
 Router.stuckEpochs = Router.stuckEpochs or 3   -- empty-input epochs before temp-consumer-drain may fire
 function Router:_contribution(o)
   local t = o.term or o
@@ -1116,8 +1130,11 @@ function Router:gateSources()
       -- throttle ONLY with a valid prior baseline: prev exists AND didn't decrease (a decrease means
       -- the _deliv ledger was reset by a session restart, so this epoch's progress is unmeasurable — a
       -- fresh session must release its seeded budget, not get clawed on a phantom stall).
-      if not justSeeded and prev and delivered >= prev and inflight > Router.inflightFloor and (delivered - prev) < Router.progressFloor then
-        add = math.min(add, Router.inflightFloor - inflight)   -- negative: the claw-back path deducts (inflight - floor) from the leftover budget
+      -- `>=` (not `>`): at exactly the floor the clamp yields add<=0, HOLDING release while still
+      -- stalled. With `>` the floor itself escapes the clamp and the gate re-grants the full cap,
+      -- oscillating claw->flood->claw every other epoch (seen live: ingot auth 32 -> 100 -> 32).
+      if not justSeeded and prev and delivered >= prev and inflight >= Router.inflightFloor and (delivered - prev) < Router.progressFloor then
+        add = math.min(add, Router.inflightFloor - inflight)   -- <=0 while stalled: claw down to / hold at the floor
       end
       if add > 0 then
         -- distribute `add` across the sources weighted by their ordered demand, so budget lands

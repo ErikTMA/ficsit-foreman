@@ -248,13 +248,17 @@ function App.run(modules, topology, opts)
     -- static connector cache + blocked-write shadow (gateSources perf): cleared per session and on every
     -- re-discover, since a rebuilt component exposes new connector objects.
     modules.Router._connCache = {}; modules.Router._blockShadow = {}; modules.Router._retry = {}
+    modules.Router._legFullMach = {}   -- machine-entrance jam marks (feed-drain signal); fresh per session
   end
   -- ingredient flow-control window (max in-flight feedstock per order, anti belt-flood); tunable.
   if modules.Router and opts.flowWindow then modules.Router.flowWindow = opts.flowWindow end
   if modules.Router and opts.stuckEpochs then modules.Router.stuckEpochs = opts.stuckEpochs end
   -- The control model keeps a DURABLE machine->recipe assignment (+ epoch clock for hysteresis)
   -- module-side so it survives the ~2s rebuilds; a fresh session starts clean.
-  if modules.Planner then modules.Planner._assign = {}; modules.Planner._epoch = 0; modules.Planner._scanCache = nil end
+  if modules.Planner then
+    modules.Planner._assign = {}; modules.Planner._epoch = 0; modules.Planner._scanCache = nil
+    modules.Planner._drain = {}; modules.Planner._starve = {}; modules.Planner._drainTried = {}   -- feed-drain state; fresh per session
+  end
 
   -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by
   -- default for clean output. Enable by passing opts.debug=true OR nicking the Computer Case
