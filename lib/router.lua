@@ -532,15 +532,29 @@ function Router:_routeAtSplitter(sender, id, item)
     if not cur then return false end                 -- input empty: stale signal, no-op
     item = cur
   end
-  local best = self:_bestEdge(id, item)
-  if best then
-    if sender:transferItem(best.fromOutput or 0) then
-      best._q[item] = (best._q[item] or 1) - 1       -- reserve-on-dispatch: this leg got one
-      self:_credit(best, item)
-      Router._dlog(("SPL %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, best.fromOutput or 0, tostring(best.to):sub(1,6)))
-      return true
+  -- candidate legs carrying quota for `item`, sorted by remaining quota (desc). Divert-on-full:
+  -- try each in turn; the first that physically accepts wins, so a full leg never stalls the belt.
+  local legs = {}
+  for _, b in ipairs(self.adj[id] or {}) do
+    local q = (b._q and b._q[item]) or 0
+    if q > 0 then legs[#legs + 1] = b end
+  end
+  table.sort(legs, function(a, b)
+    local qa, qb = (a._q and a._q[item]) or 0, (b._q and b._q[item]) or 0
+    if qa ~= qb then return qa > qb end
+    return (a.fromOutput or 0) < (b.fromOutput or 0)  -- tiebreak: equal-quota legs alternate deterministically
+  end)
+  for _, best in ipairs(legs) do
+    local terminal = not self.bufferItem[best.to]
+    if terminal or self:hasRoom(best.to, item) then
+      if sender:transferItem(best.fromOutput or 0) then
+        best._q[item] = (best._q[item] or 1) - 1
+        self:_credit(best, item)
+        Router._dlog(("SPL %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, best.fromOutput or 0, tostring(best.to):sub(1,6)))
+        return true
+      end
+      -- chosen leg physically full right now: fall through and try the next-best quota leg
     end
-    return false                                     -- chosen output full; retry later
   end
   return self:_overflow(sender, id, item)
 end
