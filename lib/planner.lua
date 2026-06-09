@@ -27,6 +27,9 @@ Planner.__index = Planner
 -- exceed the bottleneck's peak per-epoch draw or the buffer empties mid-epoch and starves — tune via
 -- the debug dump's per-buffer have/cap, don't guess. See _needingBuffers + the flow-throttle spec.
 Planner.stageDepth = Planner.stageDepth or 100
+-- rank multiplier for a fully-DRAINED intermediate buffer (assign): rank scales linearly with
+-- emptiness from 1x stageDepth (full) to (1+rankBoost)x (empty). Tunable.
+Planner.rankBoost = Planner.rankBoost or 3
 
 local function ceil(a, b) return math.floor((a + b - 1) / b) end
 -- Case-insensitive item names: reflection gives canonical (Title) case, nicks give
@@ -465,11 +468,18 @@ end
 function Planner:computeNeed()
   self.need, self.hubDraw = {}, {}     -- hubDraw is tallied during propagation (each hub-buffered
   self.intermediate = self:_intermediateSet()   -- staging hubs (read by _needingBuffers)
+  self.bufShort = {}                   -- intermediate item -> { short=, target= } (emptiness for assign's rank)
   for _, c in ipairs(self.topo.containers or {}) do          -- ingredient is a DRAW from its hub)
     local item = Planner.destItem(c)
     local target = c.target or Planner.destTarget(c)
     if item and target and not self.sources[item] then
-      self:_addNeed(item, target - count_in(self.getProxy(c.id), item), 0, {})
+      local have = count_in(self.getProxy(c.id), item)
+      if self.intermediate[item] then
+        local e = self.bufShort[item] or { short = 0, target = 0 }
+        e.short = e.short + math.max(0, target - have); e.target = e.target + target
+        self.bufShort[item] = e
+      end
+      self:_addNeed(item, target - have, 0, {})
     end
   end
 end
@@ -562,7 +572,18 @@ function Planner:assign()
       -- frame production never got a machine because need[RIP] (inflated by the frame demand
       -- itself) beat need[frames] forever. With the cap, consumers win machines once the staging
       -- buffer is primed, and the staged refill keeps drawing as they consume.
-      if self.intermediate and self.intermediate[it] then n = math.min(n, self.stageDepth or 100) end
+      if self.intermediate and self.intermediate[it] then
+        -- EMPTINESS-SCALED rank: the emptier an intermediate buffer, the higher its claim on
+        -- spare machines — from one slice (nearly full) up to (1+rankBoost) slices (drained).
+        -- A depleted hub pulls machines back urgently (consumers starve without it anyway);
+        -- a comfortable one never "maxes out iron plates" over consumer products.
+        local bs, slice = self.bufShort and self.bufShort[it], self.stageDepth or 100
+        if bs and bs.target > 0 then
+          n = math.min(bs.short, math.ceil(slice * (1 + (Planner.rankBoost or 3) * bs.short / bs.target)))
+        else
+          n = math.min(n, slice)
+        end
+      end
       -- INFEASIBILITY YIELD: an item whose production failed for 2+ epochs (its hub-drawn
       -- ingredient is dry and the machines it holds are the only ones that could prime it) sits
       -- out ONE assignment round so the ingredient wins a machine; it re-enters next epoch and,
@@ -658,7 +679,13 @@ function Planner:_needingBuffers(item)
       if target then
         local need
         if self.intermediate and self.intermediate[item] then
-          need = math.min(self.stageDepth or 100, target) - count_in(self.getProxy(c.id), item)
+          -- PACED FILL: intermediates fill toward their FULL target (targets are goals, per the
+          -- user — not ceilings), but only a stageDepth SLICE per epoch. The slice is what made
+          -- the original capacity-fill safe to restore: a 4800 buffer never demands its whole
+          -- chain's feedstock at once (the flood), release stays inside the flow window, and the
+          -- slice-sized rank (assign) keeps CONSUMER products out-ranking trickle-fills — finals
+          -- first, then every buffer tops up to target, then the factory idles genuinely done.
+          need = math.min(self.stageDepth or 100, target - count_in(self.getProxy(c.id), item))
         else
           need = target - count_in(self.getProxy(c.id), item)
           if self.bufferOf[item] == c.id and self.hubDraw and self.hubDraw[item] then need = need + self.hubDraw[item] end
