@@ -215,7 +215,17 @@ end
 
 function App.run(modules, topology, opts)
   opts = opts or {}
-  local getProxy = opts.getProxy or function(id) return component.proxy(id) end
+  -- PERF: component.proxy(id) is a game-thread sync, and getProxy is called HUNDREDS of times per
+  -- epoch (every count, connector, recipe, inventory access). Cache the proxy per id — a component's
+  -- proxy is stable for its lifetime, so this turns hundreds of syncs per epoch into one sync per id
+  -- per session. The cache is cleared on a full re-discover (a rebuilt component gets a new FGuid).
+  local _rawProxy = opts.getProxy or function(id) return component.proxy(id) end
+  local _proxyCache = {}
+  local getProxy = function(id)
+    local p = _proxyCache[id]
+    if p == nil then p = _rawProxy(id); _proxyCache[id] = p end
+    return p
+  end
   local declared = topology                       -- nil => auto-discover (and re-discover)
 
   -- New session: clear the source-gating ledgers. Router._auth (cumulative authorized) and
@@ -266,17 +276,28 @@ function App.run(modules, topology, opts)
   local replan = opts.replan or 2                 -- seconds: idle wait + refresh cadence
   local replanMs = opts.replanMs or (replan * 1000)
   -- A full belt re-crawl (App.build) walks every connector — the single most sync-heavy operation,
-  -- and it blocks routing while it runs. The topology rarely changes (the player isn't constantly
-  -- building), so re-crawl infrequently (every 6th refresh ~= 12s); the cheap re-plan every refresh
-  -- still re-routes. opts.rediscover overrides. A newly-built machine is picked up within ~12s.
-  local rediscover = opts.rediscover or 6         -- full re-discover every Nth refresh
-  local nref = 0
+  -- and it FREEZES routing while it runs (seconds, on a big factory). It only needs to run when the
+  -- network actually CHANGED (the player built/removed something), which we detect cheaply by the
+  -- component count (one sync) instead of on a timer. A large periodic backstop catches re-snaps that
+  -- keep the count the same. So in steady state there is NO crawl freeze. opts.rediscover overrides
+  -- the backstop cadence.
+  local rediscover = opts.rediscover or 30        -- periodic backstop re-crawl (~60s); count-change re-crawls immediately
+  local nref, lastCount = 0, nil
+  local function compCount()
+    local ok, all = pcall(function() return component.findComponent("") end)
+    return (ok and all) and #all or nil
+  end
+  lastCount = compCount()
   local function now() return (computer.millis and computer.millis()) or 0 end
   local lastMs = now()
   local function refresh()
     nref = nref + 1
-    if (not declared) and (nref % rediscover == 0) then
+    local cc = compCount()
+    local changed = (cc ~= nil and lastCount ~= nil and cc ~= lastCount)
+    if (not declared) and (changed or (nref % rediscover == 0)) then
+      for k in pairs(_proxyCache) do _proxyCache[k] = nil end   -- rebuilt components may have new FGuids — drop stale proxies
       ctx.router, ctx.planner, ctx.topo = App.build(modules, declared, getProxy, opts)  -- full re-crawl
+      lastCount = cc
     else
       ctx.router, ctx.planner = App.plan(modules, ctx.topo, getProxy, opts)              -- cheap re-plan
     end
