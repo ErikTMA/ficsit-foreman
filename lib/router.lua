@@ -88,6 +88,11 @@ function Router.new(topology, getProxy)
   self.isSplitter, self.isMerger = {}, {}
   for _, id in ipairs(topology.splitters or {}) do self.isSplitter[id] = true end
   for _, id in ipairs(topology.mergers or {}) do self.isMerger[id] = true end
+  -- MACHINE set + per-machine CONSUMED items (populated by order(): an order to a constructor means it
+  -- consumes that item). Used to GUARD a delivery — a splitter must never hand a constructor an item its
+  -- recipe doesn't take (iron rod into an iron-ingot machine, etc.) — and to dump the input item.
+  self.isMachine, self.consumes = {}, {}
+  for _, id in ipairs(topology.constructors or {}) do self.isMachine[id] = true end
   -- adjacency: node -> list of belts leaving it
   self.adj = {}
   for _, b in ipairs(topology.belts or {}) do
@@ -248,7 +253,19 @@ function Router:order(item, count, dst, src, toInput)
   self.ordersByItem[item] = order                 -- latest (back-compat)
   self.ordersForItem[item] = self.ordersForItem[item] or {}
   table.insert(self.ordersForItem[item], order)   -- ALL orders for this item (multi-destination)
+  if self.isMachine[dst] then self.consumes[dst] = self.consumes[dst] or {}; self.consumes[dst][item] = true end
   return true
+end
+
+-- May a splitter hand `item` to next-node `to`? Always yes UNLESS `to` is a constructor that does NOT
+-- consume `item` this epoch — a machine must never be fed a foreign item (it can't craft it, and it jams
+-- the input). `consumes[to]` is built from the orders to `to`; if a machine has NO orders yet we don't
+-- guard (avoid a false block before the plan reaches it).
+function Router:_machineAccepts(to, item)
+  if not self.isMachine[to] then return true end
+  local c = self.consumes[to]
+  if not c or not next(c) then return true end
+  return c[item] == true
 end
 
 --- Remove orders placed after index `n` (the planner's atomic rollback: if a craft plan
@@ -692,7 +709,10 @@ function Router:_routeAtSplitter(sender, id, item)
   end)
   for _, best in ipairs(legs) do
     local terminal = not self.bufferItem[best.to]
-    if terminal or self:hasRoom(best.to, item) then
+    if not self:_machineAccepts(best.to, item) then
+      Router._dlog(("MISROUTE %s '%s' >out[%d] %s — machine doesn't consume it; skipping leg")
+        :format(tostring(id):sub(1, 6), item, best.fromOutput or 0, tostring(best.to):sub(1, 6)))
+    elseif terminal or self:hasRoom(best.to, item) then
       if sender:transferItem(best.fromOutput or 0) then
         best._q[item] = (best._q[item] or 1) - 1
         self:_credit(best, item)
@@ -737,6 +757,22 @@ function Router:_inputTotal(cid)
   local total, sz = 0, 0; pcall(function() sz = inv.size or 0 end)
   for i = 0, sz - 1 do local s = inv:getStack(i); if s and (s.count or 0) > 0 then total = total + s.count end end
   return total
+end
+
+-- the ITEMS in a machine's input, as "item:n,item:n" (debug) — so a foreign item (iron rod in an
+-- iron-ingot machine) is visible at a glance. "" if empty/unreadable.
+function Router:_inputItems(cid)
+  local p = self.getProxy(cid); if not p then return "" end
+  local ok, inv = pcall(function() return p:getInputInv() end); if not (ok and inv and inv.getStack) then return "" end
+  local agg, sz = {}, 0; pcall(function() sz = inv.size or 0 end)
+  for i = 0, sz - 1 do
+    local s = inv:getStack(i)
+    if s and (s.count or 0) > 0 and s.item and s.item.type then
+      local nm = lc(s.item.type.name); agg[nm] = (agg[nm] or 0) + s.count
+    end
+  end
+  local parts = {}; for nm, n in pairs(agg) do parts[#parts + 1] = nm .. ":" .. n end
+  return table.concat(parts, ",")
 end
 
 -- RECOVERY (spec §6): a machine starved (input empty) for >= stuckEpochs with a FOREIGN item on its
@@ -1196,7 +1232,9 @@ function Router:debugDump()
   for _, cid in ipairs(self.topo.constructors or {}) do
     local p = self.getProxy(cid)
     local rec = "?"; if p then pcall(function() local r = p:getRecipe(); rec = (r and r.name) or "none" end) end
-    computer.log(1, ("[Foreman] dbg mac %s recipe=%s in=%d"):format(s6(cid), rec, self:_inputTotal(cid)))
+    local wants = {}; for it in pairs(self.consumes[cid] or {}) do wants[#wants + 1] = it end
+    computer.log(1, ("[Foreman] dbg mac %s recipe=%s in=%d [%s] wants[%s]")
+      :format(s6(cid), rec, self:_inputTotal(cid), self:_inputItems(cid), table.concat(wants, ",")))
   end
 end
 
