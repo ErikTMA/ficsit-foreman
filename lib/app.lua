@@ -222,12 +222,14 @@ function App.run(modules, topology, opts)
   -- Router._deliv (cumulative delivered) are module-global so they PERSIST across the
   -- rebuilds inside this loop (that is what stops a rebuild re-releasing in-flight stock);
   -- but a fresh App.run is a fresh session and must start them empty.
-  if modules.Router then modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {} end
+  if modules.Router then
+    modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {}
+    -- stuck-machine recovery state is module-level so it survives the in-loop rebuilds; reset per session.
+    modules.Router._idleEpochs = {}; modules.Router._draining = {}
+  end
   -- ingredient flow-control window (max in-flight feedstock per order, anti belt-flood); tunable.
   if modules.Router and opts.flowWindow then modules.Router.flowWindow = opts.flowWindow end
   if modules.Router and opts.stuckEpochs then modules.Router.stuckEpochs = opts.stuckEpochs end
-  if modules.Planner and opts.inputCapK then modules.Planner.inputCapK = opts.inputCapK end
-  if modules.Planner and opts.inputCapMin then modules.Planner.inputCapMin = opts.inputCapMin end
   -- The control model keeps a DURABLE machine->recipe assignment (+ epoch clock for hysteresis)
   -- module-side so it survives the ~2s rebuilds; a fresh session starts clean.
   if modules.Planner then modules.Planner._assign = {}; modules.Planner._epoch = 0 end
@@ -274,11 +276,13 @@ function App.run(modules, topology, opts)
     else
       ctx.router, ctx.planner = App.plan(modules, ctx.topo, getProxy, opts)              -- cheap re-plan
     end
+    -- stuck-machine recovery runs once per re-plan epoch (not per pump): cheap, and multi-epoch
+    -- drain/revert state lives module-side so it survives the rebuild above.
+    if ctx.planner and ctx.router._stuckScan then pcall(function() ctx.router:_stuckScan(ctx.planner) end) end
     lastMs = now()
   end
   while true do
     local moved = ctx.router:pump()
-    if ctx.planner and ctx.router._stuckScan then pcall(function() ctx.router:_stuckScan(ctx.planner) end) end
     if now() - lastMs >= replanMs then
       refresh()                                   -- wall-clock: refresh even while busy
     elseif moved == 0 then

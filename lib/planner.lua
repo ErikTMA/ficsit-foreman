@@ -18,11 +18,6 @@
 local Planner = {}
 Planner.__index = Planner
 
--- consumer input-cap tunables (spec §3): a machine holds at most max(inputCapMin, ingAmount*inputCapK)
--- of an ingredient — small enough to load-balance + kill hoarding, big enough not to starve per epoch.
-Planner.inputCapK = 3
-Planner.inputCapMin = 4
-
 local function ceil(a, b) return math.floor((a + b - 1) / b) end
 -- Case-insensitive item names: reflection gives canonical (Title) case, nicks give
 -- lowercase. Key/compare everything lowercase so they match. (See router.lua.)
@@ -598,21 +593,6 @@ function Planner:fillAll()
         if best and self:produceFor(cid, item, best.need, best.id) then best.need = 0 end
       end
       plan[#plan + 1] = ("%s: across %d buffers"):format(item, #buffers)
-    end
-  end
-  -- stamp each MACHINE ingredient order with its consumer input cap (spec §3/§4). An ingredient
-  -- order's dst is the consuming constructor; its cap bounds how much of that ingredient may sit in
-  -- the machine input (room-weighted quota reads it). Product orders (dst = buffer) get no cap and
-  -- fall back to the buffer target in _room.
-  local isCtor = {}; for _, id in ipairs(self.topo.constructors or {}) do isCtor[id] = true end
-  for _, o in ipairs(self.router.orders or {}) do
-    if isCtor[o.dst] then
-      local amt = 1
-      local a = Planner._assign[o.dst]
-      if a and a.opt and a.opt.ingredients then
-        for _, ing in ipairs(a.opt.ingredients) do if ing.name == o.item then amt = ing.amount; break end end
-      end
-      o.cap = math.max(Planner.inputCapMin, amt * Planner.inputCapK)
     end
   end
   if self.router and self.router.buildQuota then self.router:buildQuota() end

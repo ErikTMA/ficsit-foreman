@@ -157,33 +157,38 @@ end
 -- Breadth-first search src -> dst over the belt graph. Returns the ordered list of
 -- belts forming the path, or nil if unreachable.
 function Router:findPath(src, dst)
-  local prev, seen, queue, head = {}, { [src] = true }, { src }, 1
-  while head <= #queue do
-    local node = queue[head]; head = head + 1
-    if node == dst then break end
-    -- a declared buffer (storage for a specific item) is NOT a relay: a different item cannot transit
-    -- it, so we never expand through one as an intermediate — this removes the spurious "route through
-    -- a buffer" path that mis-marks it pass-through (the self-loop). The path's own src, splitters,
-    -- mergers, and PLAIN conduit containers (no buffered item) remain traversable, so a genuine
-    -- pass-through container still carries flow.
-    local isBuffer = self.bufferItem[node] ~= nil and node ~= dst
-    if node == src or self.isSplitter[node] or self.isMerger[node] or not isBuffer then
-      for _, b in ipairs(self.adj[node] or {}) do
-        if not seen[b.to] then
-          seen[b.to] = true
-          prev[b.to] = b
-          queue[#queue + 1] = b.to
+  -- TWO-PHASE BFS. Phase 1 does NOT transit a declared buffer (storage for a specific item is not a
+  -- relay — a different item cannot pass through it). This is the normal case and is what stops an
+  -- unrelated order's shortest path from running THROUGH a buffer and mis-marking it pass-through
+  -- (the wire self-loop). Phase 2 is a fallback: if dst is reachable ONLY through a relay buffer
+  -- (a storage container deliberately wired belt-in/belt-out as the sole route), allow buffer
+  -- transit so the destination is not silently orphaned. The common manifold always has a
+  -- splitter/merger route, so phase 1 succeeds and no buffer is ever transited there.
+  local function bfs(allowBuffer)
+    local prev, seen, queue, head = {}, { [src] = true }, { src }, 1
+    while head <= #queue do
+      local node = queue[head]; head = head + 1
+      if node == dst then break end
+      local isBuffer = self.bufferItem[node] ~= nil and node ~= dst
+      if node == src or self.isSplitter[node] or self.isMerger[node] or not isBuffer or allowBuffer then
+        for _, b in ipairs(self.adj[node] or {}) do
+          if not seen[b.to] then
+            seen[b.to] = true
+            prev[b.to] = b
+            queue[#queue + 1] = b.to
+          end
         end
       end
     end
+    if not prev[dst] and src ~= dst then return nil end
+    local path, node = {}, dst
+    while prev[node] do
+      table.insert(path, 1, prev[node])
+      node = prev[node].from
+    end
+    return path
   end
-  if not prev[dst] and src ~= dst then return nil end
-  local path, node = {}, dst
-  while prev[node] do
-    table.insert(path, 1, prev[node])
-    node = prev[node].from
-  end
-  return path
+  return bfs(false) or bfs(true)
 end
 
 --- Route `count` of `item` to `dst`. Discovers the path and programs every
@@ -387,21 +392,19 @@ end
 -- uses the buffer's capacity (target) and reads the container. Fail-open: a missing cap/unreadable
 -- consumer returns the order's full remaining demand (never worse than the old static quota).
 --
--- A MACHINE ingredient cap bounds STANDING input inventory, not per-epoch throughput: the machine
--- consumes the ingredient continuously, so within one quota epoch it can pull far more than its
--- standing cap. Quota therefore allocates the order's full remaining demand, but never beyond the
--- cap's HEADROOM over what is already standing (cap - have) PLUS that remaining demand — i.e. an
--- empty machine (have=0) gets its full demand (so a single-epoch batch is not starved), while a
--- machine that already hoards >= cap + demand contributes 0 (no-hoard holds). This keeps exact
--- splits (every demanded item is quota-routed) AND prevents a stocked machine from over-pulling.
+-- Room-weight DESTINATION BUFFERS only. A buffer at/over its target contributes 0 quota, so the
+-- splitter feeding it diverts the item to a sibling buffer with room or to the bottleneck (this is
+-- what load-balances a same-item buffer pool and stops over-filling). A MACHINE ingredient order is
+-- deliberately NOT room-capped here: a static per-epoch quota cannot separate a machine's STANDING
+-- input from its THROUGHPUT, and an undersized standing cap starves the machine within the epoch.
+-- Machine distribution (feed the empty bottleneck, not the backed-up consumer) is handled at the
+-- PHYSICAL layer by divert-on-full (a backed-up machine's input fills -> its leg's transferItem
+-- fails -> the item diverts to a sibling/bottleneck with room) plus the demand layer's assignment.
+-- So a machine/sink order routes its full remaining demand. (An explicit standing-input cap needs
+-- multi-epoch quota semantics + throughput sizing — deferred to a follow-up.)
 function Router:_orderRoom(o)
-  if o.cap then
-    local have = self:_countAt(o.dst, o.item, true)
-    local demand = o.count - o.delivered
-    return math.max(0, (o.cap - have) + demand)
-  end
   local cap = self.capacity[o.dst]
-  if not cap then return o.count - o.delivered end       -- non-buffer terminal (sink/constructor product): unbounded
+  if not cap then return o.count - o.delivered end       -- machine / sink / unbounded terminal: full demand
   local have = self:_countAt(o.dst, o.item, false)
   return math.max(0, cap - have)
 end
@@ -559,18 +562,23 @@ function Router:_routeAtSplitter(sender, id, item)
   return self:_overflow(sender, id, item)
 end
 
--- the item currently sitting at a machine's FEED (the head item on a belt whose `to` is this machine,
--- read at the feeding splitter/merger). nil if nothing / unreadable.
+-- the foreign item sitting on a machine's FEED (the head item on a belt whose `to` is this machine,
+-- read at the feeding splitter/merger). A merger has up to 3 input ports — scan ALL of them (a
+-- splitter has one input). nil if nothing / unreadable.
 function Router:_feedItem(cid)
   for _, belts in pairs(self.adj) do
     for _, b in ipairs(belts) do
       if b.to == cid and (self.isSplitter[b.from] or self.isMerger[b.from]) then
         local p = self.getProxy(b.from); if p and p.getInput then
-          local ok, it
-          if self.isMerger[b.from] then ok, it = pcall(function() return p:getInput(b.toInput or 0) end)
-          else ok, it = pcall(function() return p:getInput() end) end
-          local nm = ok and itemName(it)
-          if nm then return nm end
+          if self.isMerger[b.from] then
+            for i = 0, 2 do
+              local ok, it = pcall(function() return p:getInput(i) end)
+              local nm = ok and itemName(it); if nm then return nm end
+            end
+          else
+            local ok, it = pcall(function() return p:getInput() end)
+            local nm = ok and itemName(it); if nm then return nm end
+          end
         end
       end
     end
@@ -578,32 +586,41 @@ function Router:_feedItem(cid)
   return nil
 end
 
+-- total items currently in a machine's input inventory (any item). 0 if empty/unreadable.
+function Router:_inputTotal(cid)
+  local p = self.getProxy(cid); if not p then return 0 end
+  local ok, inv = pcall(function() return p:getInputInv() end); if not (ok and inv and inv.getStack) then return 0 end
+  local total, sz = 0, 0; pcall(function() sz = inv.size or 0 end)
+  for i = 0, sz - 1 do local s = inv:getStack(i); if s and (s.count or 0) > 0 then total = total + s.count end end
+  return total
+end
+
 -- RECOVERY (spec §6): a machine starved (input empty) for >= stuckEpochs with a FOREIGN item on its
 -- feed that its assigned recipe can't consume -> temp-switch to the most-needed recipe that DOES
--- consume it, drain, and (next scan, once cleared) revert. `planner` supplies need + the assignment.
+-- consume it, drain, and (once the feed AND input clear) revert. State is MODULE-LEVEL (Router._draining
+-- / Router._idleEpochs) so it survives the ~2s App.run router rebuilds; App.run resets it per session.
 function Router:_stuckScan(planner)
-  self._idleEpochs = self._idleEpochs or {}
-  self._draining = self._draining or {}              -- cid -> assigned recipe name to revert to
+  Router._idleEpochs = Router._idleEpochs or {}
+  Router._draining = Router._draining or {}          -- cid -> { revert = assigned recipe NAME, foreign = item }
   for _, cid in ipairs(self.topo.constructors or {}) do
-    -- REVERT first: if we were draining and the feed foreign item is gone, restore the assignment
-    local revert = self._draining[cid]
-    if revert then
-      local feed = self:_feedItem(cid)
-      local p = self.getProxy(cid)
-      if feed == nil then
+    local d = Router._draining[cid]
+    if d then
+      -- REVERT only when the feed foreign item is gone AND the machine input is empty, so setRecipe
+      -- (which ejects the whole input) ejects nothing — the FIN-safe invariant.
+      if self:_feedItem(cid) == nil and self:_inputTotal(cid) == 0 then
+        local p = self.getProxy(cid)
         for _, r in ipairs((p and p.getRecipes and p:getRecipes()) or {}) do
-          if tostring(r.name) == revert then pcall(function() p:setRecipe(r) end) end
+          if tostring(r.name) == d.revert then pcall(function() p:setRecipe(r) end) end
         end
-        self._draining[cid] = nil
+        Router._draining[cid] = nil
       end
-    end
-    if not self._draining[cid] then
-      local have = 0
-      local a = planner._assign and planner._assign[cid]
-      local wantIng = {}
-      if a and a.opt and a.opt.ingredients then for _, ing in ipairs(a.opt.ingredients) do wantIng[ing.name] = true; have = have + self:_countAt(cid, ing.name, true) end end
-      if have == 0 then self._idleEpochs[cid] = (self._idleEpochs[cid] or 0) + 1 else self._idleEpochs[cid] = 0 end
-      if (self._idleEpochs[cid] or 0) >= self.stuckEpochs then
+    else
+      local have, a, wantIng = 0, planner._assign and planner._assign[cid], {}
+      if a and a.opt and a.opt.ingredients then
+        for _, ing in ipairs(a.opt.ingredients) do wantIng[ing.name] = true; have = have + self:_countAt(cid, ing.name, true) end
+      end
+      Router._idleEpochs[cid] = (have == 0) and ((Router._idleEpochs[cid] or 0) + 1) or 0
+      if a and (Router._idleEpochs[cid] or 0) >= self.stuckEpochs then
         local feed = self:_feedItem(cid)
         if feed and not wantIng[feed] then self:_drainStuck(cid, feed, planner) end
       end
@@ -611,8 +628,8 @@ function Router:_stuckScan(planner)
   end
 end
 
--- temp-switch `cid` to its most-needed recipe consuming `foreign`; remember the assigned recipe to
--- revert to. Input is empty (starved) so setRecipe ejects nothing.
+-- temp-switch `cid` to its most-needed recipe consuming `foreign`; remember the assigned recipe NAME
+-- to revert to. Caller guarantees the input is empty (starved) so setRecipe ejects nothing.
 function Router:_drainStuck(cid, foreign, planner)
   local p = self.getProxy(cid); if not (p and p.getRecipes) then return end
   local best, bestNeed
@@ -630,9 +647,10 @@ function Router:_drainStuck(cid, foreign, planner)
   end
   if best then
     local a = planner._assign and planner._assign[cid]
-    self._draining[cid] = a and a.recipe and a.recipe.name or nil
+    -- _assign.recipe is the recipe NAME (a string), not a table — store it directly for revert.
+    Router._draining[cid] = { revert = a and a.recipe or nil, foreign = lc(foreign) }
     pcall(function() p:setRecipe(best) end)
-    self._idleEpochs[cid] = 0
+    Router._idleEpochs[cid] = 0
     Router._dlog(("DRAIN-STUCK %s consume '%s' via '%s'"):format(tostring(cid):sub(1,6), foreign, tostring(best.name)))
   end
 end
