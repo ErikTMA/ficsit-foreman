@@ -790,6 +790,35 @@ function Router:_inputItems(cid)
   return table.concat(parts, ",")
 end
 
+-- DEBUG: each DISCOVERED feeding belt into a machine, as "<feeder6>@<port>:<item at the feeder's input>".
+-- A foreign item BLOCKING a machine sits on the belt / backs up to the feeder (the machine won't pull an
+-- item its recipe rejects), so getInputInv reads empty while the entrance is jammed — this shows it. It
+-- ALSO prints the discovered feeder+port, so the operator can verify it against the PHYSICAL wiring: if a
+-- port recorded as feeding this machine is physically wired to a different one, items route "correctly"
+-- yet land at the wrong machine (a splitter port mis-discovery = the item CROSS).
+function Router:_feedDump(cid)
+  local parts = {}
+  for _, belts in pairs(self.adj) do
+    for _, b in ipairs(belts) do
+      if b.to == cid then
+        local nm = "-"
+        if self.isSplitter[b.from] or self.isMerger[b.from] then
+          local p = self.getProxy(b.from)
+          if p and p.getInput then
+            if self.isMerger[b.from] then
+              for i = 0, 2 do local ok, x = pcall(function() return p:getInput(i) end); local n = ok and itemName(x); if n then nm = n; break end end
+            else
+              local ok, x = pcall(function() return p:getInput() end); nm = (ok and itemName(x)) or "-"
+            end
+          end
+        end
+        parts[#parts + 1] = ("%s@%d:%s"):format(tostring(b.from):sub(1, 6), b.fromOutput or 0, nm)
+      end
+    end
+  end
+  return table.concat(parts, " ")
+end
+
 -- RECOVERY (spec §6): a machine starved (input empty) for >= stuckEpochs with a FOREIGN item on its
 -- feed that its assigned recipe can't consume -> temp-switch to the most-needed recipe that DOES
 -- consume it, drain, and (once the feed AND input clear) revert. State is MODULE-LEVEL (Router._draining
@@ -865,8 +894,12 @@ function Router:_mergerPush(sender, id, input, nm)
     if not cur then return false end                 -- input empty: stale signal, no-op
     nm = cur
   end
-  if not sender:transferItem(input) then return false end
   local out = (self.adj[id] or {})[1]                -- merger's single output belt
+  if out and not self:_machineAccepts(out.to, nm) then  -- never push a foreign item into a constructor
+    Router._dlog(("MISROUTE %s '%s' >merge %s — machine doesn't consume it; holding"):format(tostring(id):sub(1, 6), nm, tostring(out.to):sub(1, 6)))
+    return false
+  end
+  if not sender:transferItem(input) then return false end
   if out then
     if out._q and (out._q[nm] or 0) > 0 then out._q[nm] = out._q[nm] - 1 end
     self:_credit(out, nm)
@@ -1248,8 +1281,8 @@ function Router:debugDump()
     local p = self.getProxy(cid)
     local rec = "?"; if p then pcall(function() local r = p:getRecipe(); rec = (r and r.name) or "none" end) end
     local wants = {}; for it in pairs(self.consumes[cid] or {}) do wants[#wants + 1] = it end
-    computer.log(1, ("[Foreman] dbg mac %s recipe=%s in=%d [%s] wants[%s]")
-      :format(s6(cid), rec, self:_inputTotal(cid), self:_inputItems(cid), table.concat(wants, ",")))
+    computer.log(1, ("[Foreman] dbg mac %s recipe=%s in=%d [%s] wants[%s] fed[%s]")
+      :format(s6(cid), rec, self:_inputTotal(cid), self:_inputItems(cid), table.concat(wants, ","), self:_feedDump(cid)))
   end
 end
 
