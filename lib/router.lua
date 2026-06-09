@@ -672,7 +672,14 @@ function Router:_overflow(sender, id, item)
   table.sort(active, function(a, b) return (a.count - a.delivered) > (b.count - b.delivered) end)
   for _, o in ipairs(active) do
     local terminal = not self.bufferItem[o.dst]
-    if terminal or self:hasRoom(o.dst, item) then
+    -- ADMISSION CONTROL on machine destinations: a machine is NOT "always accepts" — recovery
+    -- deliveries beyond the balanced/ordered room stuffed inputs to the stack cap (plate 200) and
+    -- froze the shared feeder lane (everything behind the unpullable surplus stopped). On a shared
+    -- transit chain the only safe invariant is: every item pushed somewhere WILL be absorbed — so
+    -- overflow honors the same room bound the quota legs already use.
+    local roomOK = true
+    if self.isMachine[o.dst] then roomOK = self:_orderRoom(o) > 0 end
+    if roomOK and (terminal or self:hasRoom(o.dst, item)) then
       local belt = self:firstHopTo(id, o.dst)
       -- _beltAccepts: the recovery hop must honor PORT PINS — re-pathfinding "any way to the
       -- machine" used to land iron plate on the SCREWS port's belt, where the machine (plate slot
