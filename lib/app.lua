@@ -257,7 +257,7 @@ function App.run(modules, topology, opts)
   -- module-side so it survives the ~2s rebuilds; a fresh session starts clean.
   if modules.Planner then
     modules.Planner._assign = {}; modules.Planner._epoch = 0; modules.Planner._scanCache = nil
-    modules.Planner._drain = {}; modules.Planner._starve = {}; modules.Planner._drainTried = {}   -- feed-drain state; fresh per session
+    modules.Planner._drain = {}; modules.Planner._starve = {}; modules.Planner._drainTried = {}; modules.Planner._infeas = {}   -- feed-drain + infeasibility state; fresh per session
   end
 
   -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by

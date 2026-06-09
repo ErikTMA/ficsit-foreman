@@ -554,7 +554,26 @@ function Planner:assign()
   for cid in pairs(Planner._assign) do if not liveCid[cid] then Planner._assign[cid] = nil end end
   local pool = {}
   for it, n in pairs(self.need) do
-    if n > 0 and self.bufferOf[it] and self.recipesByProduct[it] and not self.sources[it] then pool[it] = n end
+    if n > 0 and self.bufferOf[it] and self.recipesByProduct[it] and not self.sources[it] then
+      -- an INTERMEDIATE's per-epoch fill is capped at its staging slice (_needingBuffers), so rank
+      -- it by that ceiling — NOT by the recursion-propagated demand of its consumers. Else a staged
+      -- item (RIP, needed by frames) OUTRANKS the very consumers (frames) that would draw it and
+      -- hogs every machine while its own fill orders are ~0: the live RIP-pinned-at-100 stall where
+      -- frame production never got a machine because need[RIP] (inflated by the frame demand
+      -- itself) beat need[frames] forever. With the cap, consumers win machines once the staging
+      -- buffer is primed, and the staged refill keeps drawing as they consume.
+      if self.intermediate and self.intermediate[it] then n = math.min(n, self.stageDepth or 100) end
+      -- INFEASIBILITY YIELD: an item whose production failed for 2+ epochs (its hub-drawn
+      -- ingredient is dry and the machines it holds are the only ones that could prime it) sits
+      -- out ONE assignment round so the ingredient wins a machine; it re-enters next epoch and,
+      -- once feasible, out-ranks the (staged) ingredient again. With one machine this ping-pongs
+      -- ingredient/consumer in stageDepth-sized batches; with N machines they split stably.
+      if (Planner._infeas[it] or 0) >= 2 then
+        Planner._infeas[it] = 0
+      else
+        pool[it] = n
+      end
+    end
   end
   local cap = {}                              -- ctorId -> { item -> opt }; FIRST opt per (cid,item) wins (deterministic)
   for it in pairs(pool) do
@@ -663,6 +682,7 @@ end
 -- A MANUAL recipe change on a starved+jammed machine is adopted as a drain (never fought) — the
 -- user clearing a blockage by hand must not be reverted seconds later. setRecipe is safe here:
 -- the input is empty by construction (starved), so nothing is ejected.
+Planner._infeas     = Planner._infeas or {}       -- item -> consecutive epochs every produceFor failed (assign yields at 2)
 Planner._drain      = Planner._drain or {}        -- cid -> { recipe = name, idle = n }
 Planner._starve     = Planner._starve or {}       -- cid -> consecutive starved epochs while on the assigned recipe
 Planner._drainTried = Planner._drainTried or {}   -- cid -> last drain recipe name (round-robin cursor)
@@ -870,6 +890,7 @@ function Planner:fillAll()
   -- here, so the common path stays cheap).
   for item, cids in pairs(self.served or {}) do
     local buffers = self:_needingBuffers(item)
+    local produced = false
     if #buffers == 1 then
       local amt, k = buffers[1].need, #cids
       local base, extra, placed = math.floor(amt / k), amt % k, 0
@@ -877,6 +898,7 @@ function Planner:fillAll()
         local sh = base + (i <= extra and 1 or 0)
         if sh > 0 and self:produceFor(cid, item, sh, buffers[1].id) then placed = placed + 1 end
       end
+      produced = placed > 0
       plan[#plan + 1] = ("%s: %d across %d/%d ctor"):format(item, amt, placed, k)
     elseif #buffers > 1 then
       for _, cid in ipairs(cids) do                 -- each machine -> a reachable needing buffer (max remaining)
@@ -884,10 +906,17 @@ function Planner:fillAll()
         for _, b in ipairs(buffers) do
           if b.need > 0 and self.router:findPath(cid, b.id) and (not best or b.need > best.need) then best = b end
         end
-        if best and self:produceFor(cid, item, best.need, best.id) then best.need = 0 end
+        if best and self:produceFor(cid, item, best.need, best.id) then best.need = 0; produced = true end
       end
       plan[#plan + 1] = ("%s: across %d buffers"):format(item, #buffers)
+    else
+      produced = true                               -- nothing to fill: not an infeasibility
     end
+    -- INFEASIBILITY tracking: an assigned item whose every produceFor failed (e.g. its hub-drawn
+    -- ingredient is empty and nothing fills it because THIS item holds the machines) must
+    -- eventually YIELD its machines so the ingredient can be primed — see assign().
+    if produced then Planner._infeas[item] = nil
+    else Planner._infeas[item] = (Planner._infeas[item] or 0) + 1 end
   end
   if self.router and self.router.buildQuota then self.router:buildQuota() end
   if self.router and self.router.gateSources then self.router:gateSources() end
