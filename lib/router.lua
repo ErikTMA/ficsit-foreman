@@ -84,6 +84,7 @@ function Router.new(topology, getProxy)
   local self = setmetatable({}, Router)
   self.topo = topology
   self.getProxy = getProxy or function(id) return component.proxy(id) end
+  Router._roomCount = {}          -- per-epoch buffer room cache (a new Router == a new ~2s epoch); see hasRoom
   self.isSplitter, self.isMerger = {}, {}
   for _, id in ipairs(topology.splitters or {}) do self.isSplitter[id] = true end
   for _, id in ipairs(topology.mergers or {}) do self.isMerger[id] = true end
@@ -307,10 +308,26 @@ end
 
 -- Does a destination have room for one more of `item`? Non-buffer dests
 -- (constructor, sink) always accept.
+--
+-- PER-EPOCH ROOM CACHE: _count is getInventories+itemCount (game-thread syncs). _routeAtSplitter calls
+-- hasRoom for EVERY buffer-bound item, and on a looped manifold each item crosses many splitters — so a
+-- live _count per crossing was a continuous throughput cap. Instead, seed the count ONCE per buffer per
+-- epoch and add 1 each time we route an item toward it (Router:_creditRoom). The estimate only ever
+-- OVER-counts (it ignores the buffer draining mid-epoch), so it diverts CONSERVATIVELY (never overfills);
+-- the next ~2s epoch (a fresh Router) re-seeds from the live count. Router._roomCount is cleared in Router.new.
 function Router:hasRoom(dst, item)
   local cap = self.capacity[dst]
   if not cap then return true end
-  return self:_count(dst, item) < cap
+  local key = tostring(dst) .. "|" .. lc(item)
+  local c = Router._roomCount[key]
+  if c == nil then c = self:_count(dst, item); Router._roomCount[key] = c end
+  return c < cap
+end
+-- bump the cached room usage of a buffer we just routed an item toward (keeps hasRoom sync-free after
+-- the first read this epoch). No-op if the buffer was never seeded (hasRoom will read it live on demand).
+function Router:_creditRoom(dst, item)
+  local key = tostring(dst) .. "|" .. lc(item)
+  if Router._roomCount[key] ~= nil then Router._roomCount[key] = Router._roomCount[key] + 1 end
 end
 
 --- Handle one ItemRequest. Separated from install() so a long-lived listener can
@@ -442,9 +459,7 @@ end
 -- funds and the pass-through relays. Idempotent, so it's also a safe assertion on every rebuild.
 function Router:blockAllOutputs()
   for _, c in ipairs(self.topo.containers or {}) do
-    for _, conn in ipairs(self:_outputConnectors(self.getProxy(c.id))) do
-      pcall(function() conn.blocked = true end)
-    end
+    for _, conn in ipairs(self:_connFor(c.id).conns) do self:_setBlocked(conn, true) end
   end
 end
 
@@ -591,7 +606,12 @@ function Router:_overflow(sender, id, item)
     if terminal or self:hasRoom(o.dst, item) then
       local belt = self:firstHopTo(id, o.dst)
       if belt and sender:transferItem(belt.fromOutput or 0) then
-        if belt.to == o.dst then self:_credit(belt, item) end
+        -- credit delivery + (on the DIRECT hop into a buffer dst) the room cache, so a chain of recovery
+        -- deliveries to the same buffer caps at capacity instead of flooding past the stale cached count.
+        if belt.to == o.dst then
+          self:_credit(belt, item)
+          if self.bufferItem[o.dst] then self:_creditRoom(o.dst, item) end
+        end
         Router._dlog(("RECOVER %s '%s' >out[%d] %s ->%s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(belt.to):sub(1,6), tostring(o.dst):sub(1,6)))
         return true
       end
@@ -603,7 +623,10 @@ function Router:_overflow(sender, id, item)
     if self:hasRoom(D, item) then
       local belt = self:firstHopTo(id, D)
       if belt and sender:transferItem(belt.fromOutput or 0) then
-        if belt.to == D then self:_credit(belt, item) end
+        -- Credit room ONLY on the DIRECT hop into D (same gate as _credit). An intermediate hop must
+        -- NOT credit — the item continues and is credited at the final splitter before D (best.to == D),
+        -- so crediting here too would double-count and falsely fill the cache (the reroute under-fill bug).
+        if belt.to == D then self:_credit(belt, item); self:_creditRoom(D, item) end
         Router._dlog(("REROUTE %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(D):sub(1,6)))
         return true
       end
@@ -671,6 +694,7 @@ function Router:_routeAtSplitter(sender, id, item)
       if sender:transferItem(best.fromOutput or 0) then
         best._q[item] = (best._q[item] or 1) - 1
         self:_credit(best, item)
+        if not terminal then self:_creditRoom(best.to, item) end   -- routed toward a buffer: bump its cached room
         Router._dlog(("SPL %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, best.fromOutput or 0, tostring(best.to):sub(1,6)))
         return true
       end
@@ -812,6 +836,45 @@ function Router:_outputConnectors(p)
   return outs
 end
 
+-- STATIC connector cache (module-level, cleared on re-discover — same lifecycle as the proxy cache).
+-- A container's output FactoryConnection objects, and each one's `isConnected` (belted?) flag, do NOT
+-- change between full re-crawls; getFactoryConnectors + isConnected are game-thread syncs, and gateSources
+-- read them for EVERY container EVERY ~2s re-plan (~2/3 of its sync cost). `_connFor` reads them once per
+-- container per discover and reuses the SAME connector objects, so `_setBlocked` can also shadow each
+-- connector's last-written `blocked` and skip the redundant write (a container's block verdict is almost
+-- always identical epoch-to-epoch). conns: every output; fund: the belted subset (fallback: all).
+-- Keyed by the PROXY OBJECT, not the cid: getProxy caches a stable proxy per cid in-game (so this hits
+-- across the ~2s rebuilds), but a re-discover (or a fresh test world) yields a NEW proxy object, which
+-- naturally MISSES and re-reads — so a stale connector from a torn-down network can never be reused
+-- (cids are reused across test worlds; FGuids are not, but proxy-keying is correct for both).
+Router._connCache = Router._connCache or {}        -- proxy -> { conns = {...}, fund = {...} }
+Router._blockShadow = Router._blockShadow or {}     -- connector object -> last-written blocked bool
+function Router:_connFor(cid)
+  local p = self.getProxy(cid)
+  if not p then return { conns = {}, fund = {} } end
+  local e = Router._connCache[p]
+  if e then return e end
+  local conns = self:_outputConnectors(p)
+  local fund = {}
+  for _, conn in ipairs(conns) do
+    local cc = false; pcall(function() cc = conn.isConnected or false end)
+    if cc then fund[#fund + 1] = conn end
+  end
+  e = { conns = conns, fund = (#fund > 0) and fund or conns }
+  Router._connCache[p] = e
+  return e
+end
+-- Write conn.blocked only when it differs from the last value we wrote — the actual game-thread write
+-- is the cost; the verdict rarely changes. (Nothing OUTSIDE gateSources/blockAllOutputs writes .blocked,
+-- and both go through here; the shadow is cleared on re-discover with the connector cache, so a rebuilt
+-- connector starts fresh and gets its first write.)
+function Router:_setBlocked(conn, b)
+  if Router._blockShadow[conn] ~= b then
+    pcall(function() conn.blocked = b end)
+    Router._blockShadow[conn] = b
+  end
+end
+
 -- Gate every source container at its OWN output connector: block it, and authorize only the
 -- items it still needs to release, against a LIFETIME cap so a rebuild never re-releases
 -- stock it already released. The naive "top the connector budget up to demand each rebuild"
@@ -895,15 +958,10 @@ function Router:gateSources()
     -- the belted subset that receives addUnblockedTransfers (fallback: all, if none report connected).
     local conns, fundOuts = {}, {}
     for _, cid in ipairs(cids) do
-      local outs = self:_outputConnectors(self.getProxy(cid))
-      conns[cid] = outs
-      for _, conn in ipairs(outs) do pcall(function() conn.blocked = true end) end
-      local connected = {}
-      for _, conn in ipairs(outs) do
-        local cc = false; pcall(function() cc = conn.isConnected or false end)
-        if cc then connected[#connected + 1] = conn end
-      end
-      fundOuts[cid] = (#connected > 0) and connected or outs
+      local e = self:_connFor(cid)                  -- cached: connector list + belted (isConnected) subset
+      conns[cid] = e.conns
+      for _, conn in ipairs(e.conns) do self:_setBlocked(conn, true) end   -- shadowed: skips redundant write
+      fundOuts[cid] = e.fund
     end
     -- grant `n` release units to a source, split evenly across its belted outputs; returns the
     -- amount ACTUALLY granted (0 if the source has no fundable connector).
@@ -1022,14 +1080,15 @@ function Router:gateSources()
         opens = flowsOut[c.id] or false
       end
       local blockIt = not opens
-      for _, conn in ipairs(self:_outputConnectors(self.getProxy(c.id))) do
-        pcall(function() conn.blocked = blockIt end)
+      for _, conn in ipairs(self:_connFor(c.id).conns) do
+        self:_setBlocked(conn, blockIt)             -- shadowed: skips the write when the verdict is unchanged
         -- A blocked pure-destination must release NOTHING: claw any LEFTOVER unblockedTransfers to
         -- zero. A buffer that was a funded hub-source in an earlier epoch (e.g. wire drawn for a cable
         -- machine that is now gone) keeps its granted budget; once it stops being a source it lands
         -- here, and without this it would keep emitting that budget — the item loops the manifold and
         -- re-enters the same buffer (the wire round-trip). blocked=true alone does NOT stop a connector
-        -- that still has unblockedTransfers > 0.
+        -- that still has unblockedTransfers > 0. (unblockedTransfers stays a LIVE read — only the static
+        -- connector list + isConnected + the blocked write are cached.)
         if blockIt then
           local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end)
           if cur > 0 then pcall(function() conn:addUnblockedTransfers(-cur) end) end

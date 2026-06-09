@@ -139,7 +139,12 @@ function App.plan(modules, topo, getProxy, opts)
   local planner = modules.Planner.new(topo, router, getProxy, opts and opts.replan)
   router:listenAll()        -- listen to all splitters/mergers (once per session; faster reactions)
   local plan = planner:fillAll()   -- places orders AND gates each source connector
-  router:pump()             -- level-triggered: drain any items already held in codeables
+  -- NOTE: NO pump() here. App.plan runs every ~2s (the cheap re-plan); pump() polls getInput on ALL
+  -- ~60 codeables (each a game-thread sync) and was the dominant freeze — the old whole-network stall
+  -- reintroduced on a 2s timer, which the event-driven loop could never remove because it lived in the
+  -- re-plan, not the loop. Routing is event-driven (Router:_dispatch) + the held-node retry set
+  -- (Router:_drainRetry); a full pump() runs only on App.build (rare: a network change) and as a rare
+  -- ~15s loop backstop. So the 2s re-plan is now cheap.
   App.report(topo, planner, plan, opts)
   return router, planner
 end
@@ -161,6 +166,9 @@ function App.build(modules, declared, getProxy, opts)
     modules.Namer.new(getProxy):scan()
   end
   local router, planner = App.plan(modules, topo, getProxy, opts)
+  router:pump()             -- SEED routing once per build (initial + each re-discover, both rare): drain
+                            -- items already sitting in codeables that fired no fresh edge. The 2s re-plan
+                            -- (App.plan) does NOT pump; steady-state routing is event-driven.
   return router, planner, topo
 end
 
@@ -236,6 +244,9 @@ function App.run(modules, topology, opts)
     modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {}
     -- stuck-machine recovery state is module-level so it survives the in-loop rebuilds; reset per session.
     modules.Router._idleEpochs = {}; modules.Router._draining = {}
+    -- static connector cache + blocked-write shadow (gateSources perf): cleared per session and on every
+    -- re-discover, since a rebuilt component exposes new connector objects.
+    modules.Router._connCache = {}; modules.Router._blockShadow = {}; modules.Router._retry = {}
   end
   -- ingredient flow-control window (max in-flight feedstock per order, anti belt-flood); tunable.
   if modules.Router and opts.flowWindow then modules.Router.flowWindow = opts.flowWindow end
@@ -276,7 +287,9 @@ function App.run(modules, topology, opts)
   -- planning work — re-plan orders + re-gate sources (and re-crawl when the component count changes).
   local replan = opts.replan or 2                 -- seconds: idle wait + refresh cadence
   local replanMs = opts.replanMs or (replan * 1000)
-  local fullMs = opts.fullScanMs or 5000          -- safety backstop: full poll at most this often
+  local fullMs = opts.fullScanMs or 15000         -- safety backstop: full poll at most this often (~15s;
+                                                  -- routing is event-driven, so this is just insurance
+                                                  -- against a missed edge — a ~0.7s poll every 15s)
   -- A full belt re-crawl (App.build) walks every connector — the single most sync-heavy operation,
   -- and it FREEZES routing while it runs (seconds, on a big factory). It only needs to run when the
   -- network actually CHANGED (the player built/removed something), which we detect cheaply by the
@@ -298,6 +311,7 @@ function App.run(modules, topology, opts)
     local changed = (cc ~= nil and lastCount ~= nil and cc ~= lastCount)
     if (not declared) and (changed or (nref % rediscover == 0)) then
       for k in pairs(_proxyCache) do _proxyCache[k] = nil end   -- rebuilt components may have new FGuids — drop stale proxies
+      modules.Router._connCache = {}; modules.Router._blockShadow = {}  -- same: drop stale connector objects + their block shadow
       ctx.router, ctx.planner, ctx.topo = App.build(modules, declared, getProxy, opts)  -- full re-crawl
       lastCount = cc
     else
