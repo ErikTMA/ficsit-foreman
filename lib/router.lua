@@ -161,11 +161,19 @@ function Router:findPath(src, dst)
   while head <= #queue do
     local node = queue[head]; head = head + 1
     if node == dst then break end
-    for _, b in ipairs(self.adj[node] or {}) do
-      if not seen[b.to] then
-        seen[b.to] = true
-        prev[b.to] = b
-        queue[#queue + 1] = b.to
+    -- a declared buffer (storage for a specific item) is NOT a relay: a different item cannot transit
+    -- it, so we never expand through one as an intermediate — this removes the spurious "route through
+    -- a buffer" path that mis-marks it pass-through (the self-loop). The path's own src, splitters,
+    -- mergers, and PLAIN conduit containers (no buffered item) remain traversable, so a genuine
+    -- pass-through container still carries flow.
+    local isBuffer = self.bufferItem[node] ~= nil and node ~= dst
+    if node == src or self.isSplitter[node] or self.isMerger[node] or not isBuffer then
+      for _, b in ipairs(self.adj[node] or {}) do
+        if not seen[b.to] then
+          seen[b.to] = true
+          prev[b.to] = b
+          queue[#queue + 1] = b.to
+        end
       end
     end
   end
@@ -695,13 +703,31 @@ function Router:gateSources()
   -- are gated above (blocked + metered budget) and are skipped here. Setting blocked explicitly in
   -- BOTH directions — not just blocking dead-ends — means a relay that was momentarily blocked (or
   -- a future start-of-session block-all) is reliably re-opened, and nothing emits by default.
-  local flowsOut = {}
+  -- A non-source container's output opens only if some order legitimately routes OUT of it. flowsOut
+  -- records every container an order's path leaves (belt.from). With findPath no longer traversing a
+  -- DECLARED BUFFER, an unrelated item can never transit a buffer, so an idle pure-destination buffer
+  -- never appears in flowsOut and stays blocked (kills the self-loop). For a DECLARED BUFFER we add a
+  -- defence-in-depth item-match: its output opens only when its OWN buffered item flows out of it
+  -- (a genuine relay/hub re-emitting what it stores), never because a foreign item merely transits.
+  -- A plain conduit container (no buffered item) opens whenever it is on a path (legit pass-through).
+  local flowsOut, flowsOutItem = {}, {}
   for _, o in ipairs(self.orders) do
-    for _, b in ipairs(o.path or {}) do flowsOut[b.from] = true end
+    for _, b in ipairs(o.path or {}) do
+      flowsOut[b.from] = true
+      flowsOutItem[b.from] = flowsOutItem[b.from] or {}
+      flowsOutItem[b.from][o.item] = true
+    end
   end
   for _, c in ipairs(self.topo.containers or {}) do
     if not self.sourceItem[c.id] then
-      local blockIt = not flowsOut[c.id]
+      local item = self.bufferItem[c.id]
+      local opens
+      if item then
+        opens = flowsOutItem[c.id] and flowsOutItem[c.id][item] or false
+      else
+        opens = flowsOut[c.id] or false
+      end
+      local blockIt = not opens
       for _, conn in ipairs(self:_outputConnectors(self.getProxy(c.id))) do
         pcall(function() conn.blocked = blockIt end)
       end
