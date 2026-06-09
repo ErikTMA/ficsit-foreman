@@ -311,7 +311,19 @@ end
 
 --- Register the signal handler that executes routing AND listen to all codeable nodes.
 --- Call once, then pump the event loop (e.g. Router:run() or your own event.pull loop).
+-- DEFAULT-DENY: block every container's output. The controller asserts "nothing emits" the
+-- instant it takes over; gateSources (end of the first fillAll) then OPENS exactly the sources it
+-- funds and the pass-through relays. Idempotent, so it's also a safe assertion on every rebuild.
+function Router:blockAllOutputs()
+  for _, c in ipairs(self.topo.containers or {}) do
+    for _, conn in ipairs(self:_outputConnectors(self.getProxy(c.id))) do
+      pcall(function() conn.blocked = true end)
+    end
+  end
+end
+
 function Router:install()
+  self:blockAllOutputs()        -- close everything first; gateSources re-opens only what flows
   self:listenAll()
   event.registerListener(event.filter{ event = "ItemRequest" },
     function(_, sender, a, b) self:_dispatch(sender, a, b) end)
@@ -488,12 +500,19 @@ function Router:_mergerPush(sender, id, input, nm)
   return true
 end
 
--- The OUTPUT FactoryConnection of a building (direction 1), or nil.
-function Router:_outputConnector(p)
-  if not (p and p.getFactoryConnectors) then return nil end
+-- ALL output FactoryConnections of a building (direction 1). A real container exposes
+-- one connector PER PHYSICAL conveyor port — an Industrial Storage Container has TWO
+-- outputs — and getFactoryConnectors returns every one. The old code blocked only the
+-- FIRST, so a source kept emitting out its second (un-gated) port in-game: the copper
+-- source dribbling onto the belt with nothing to consume it. The emulator never caught
+-- this because it only materialises the belted connectors. Always gate EVERY output.
+function Router:_outputConnectors(p)
+  if not (p and p.getFactoryConnectors) then return {} end
   local ok, conns = pcall(function() return p:getFactoryConnectors() end)
-  if not ok then return nil end
-  for _, conn in ipairs(conns or {}) do if conn.direction == 1 then return conn end end
+  if not ok then return {} end
+  local outs = {}
+  for _, conn in ipairs(conns or {}) do if conn.direction == 1 then outs[#outs + 1] = conn end end
+  return outs
 end
 
 -- Gate every source container at its OWN output connector: block it, and authorize only the
@@ -561,69 +580,121 @@ function Router:gateSources()
   for item, cids in pairs(byItem) do
     local isSrc = {}; for _, id in ipairs(cids) do isSrc[id] = true end
     -- aggregate cap + per-source order weights for this item
-    local cap, weight, wtotal = 0, {}, 0
+    local cap, weight, wtotal, nOrders = 0, {}, 0, 0
     for _, o in ipairs(self.orders) do
       if isSrc[o.src] then
         cap = cap + self:_contribution(o)
         local w = math.max(0, o.count - o.delivered)
-        weight[o.src] = (weight[o.src] or 0) + w; wtotal = wtotal + w
+        weight[o.src] = (weight[o.src] or 0) + w; wtotal = wtotal + w; nOrders = nOrders + 1
       end
     end
-    -- block every source; collect their connectors
-    local conns = {}
+    -- BLOCK every output connector of every source. Fund the metered release ONLY on the
+    -- connectors that are actually belted (isConnected) — split evenly across them, so a source
+    -- wired out two ports still releases its full share (and no faster), while bare ports stay
+    -- blocked at zero. Funding a single guessed port can strand the whole budget on a dead port
+    -- (permanent under-fill); funding every port including bare ones wastes budget. Connected-only
+    -- is the safe middle. conns[cid] = all outputs (for the claw-back/seed scans); fundOuts[cid] =
+    -- the belted subset that receives addUnblockedTransfers (fallback: all, if none report connected).
+    local conns, fundOuts = {}, {}
     for _, cid in ipairs(cids) do
-      local conn = self:_outputConnector(self.getProxy(cid))
-      if conn then pcall(function() conn.blocked = true end); conns[cid] = conn end
+      local outs = self:_outputConnectors(self.getProxy(cid))
+      conns[cid] = outs
+      for _, conn in ipairs(outs) do pcall(function() conn.blocked = true end) end
+      local connected = {}
+      for _, conn in ipairs(outs) do
+        local cc = false; pcall(function() cc = conn.isConnected or false end)
+        if cc then connected[#connected + 1] = conn end
+      end
+      fundOuts[cid] = (#connected > 0) and connected or outs
+    end
+    -- grant `n` release units to a source, split evenly across its belted outputs; returns the
+    -- amount ACTUALLY granted (0 if the source has no fundable connector).
+    local function fund(cid, n)
+      local outs = fundOuts[cid]
+      if not outs or #outs == 0 or n <= 0 then return 0 end
+      local base, extra, g = math.floor(n / #outs), n % #outs, 0
+      for i, conn in ipairs(outs) do
+        local s = base + (i <= extra and 1 or 0)
+        if s > 0 then pcall(function() conn:addUnblockedTransfers(s) end); g = g + s end
+      end
+      return g
     end
     local k = "item:" .. item
-    if Router._auth[k] == nil then
-      -- first gate of the session: seed from the connectors' LEFTOVER budget so a program
-      -- restart (ledgers cleared, but the live connectors keep their unblockedTransfers)
-      -- doesn't re-grant what is already authorized in-game.
-      local seed = 0
-      for _, conn in pairs(conns) do local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end); seed = seed + cur end
-      Router._auth[k] = seed
-    end
-    local add = cap - Router._auth[k]
-    if add > 0 then
-      Router._auth[k] = Router._auth[k] + add
-      -- distribute `add` across the sources weighted by their ordered demand, so budget lands
-      -- where the stock/orders are — never on an order-less source (which would have no quota
-      -- leg and leak straight to the sink).
-      local list = {}
-      for cid in pairs(conns) do if (weight[cid] or 0) > 0 then list[#list + 1] = cid end end
-      if #list == 0 then for cid in pairs(conns) do list[#list + 1] = cid end end   -- safety fallback
-      local given = 0
-      for i, cid in ipairs(list) do
-        local share
-        if wtotal > 0 then share = math.floor(add * (weight[cid] or 0) / wtotal)
-        else share = math.floor(add / #list) end
-        if i == #list then share = add - given end          -- last source mops up rounding remainder
-        if share > 0 then local s = share; pcall(function() conns[cid]:addUnblockedTransfers(s) end); given = given + share end
+    if nOrders == 0 then
+      -- NO CONSUMER for this item this epoch. Force every source output's leftover budget to
+      -- ZERO (addUnblockedTransfers clamps but accepts negatives) so the source stops dead and
+      -- the item stays IN ITS CONTAINER rather than dribbling onto the belt and into the sink.
+      -- This is the copper-with-no-wire case — the analog of a product simply waiting in its
+      -- buffer. Decrement the lifetime ledger by exactly what we claw back (the granted-but-
+      -- unreleased units) so _auth keeps tracking units ACTUALLY released: demand returning
+      -- then re-authorizes the right delta, no double-grant, no overshoot.
+      local clawed = 0
+      for _, outs in pairs(conns) do
+        for _, conn in ipairs(outs) do
+          local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end)
+          if cur > 0 then pcall(function() conn:addUnblockedTransfers(-cur) end); clawed = clawed + cur end
+        end
       end
+      Router._auth[k] = math.max(0, (Router._auth[k] or 0) - clawed)
+    else
+      if Router._auth[k] == nil then
+        -- first gate of the session: seed from the connectors' LEFTOVER budget so a program
+        -- restart (ledgers cleared, but the live connectors keep their unblockedTransfers)
+        -- doesn't re-grant what is already authorized in-game.
+        local seed = 0
+        for _, outs in pairs(conns) do
+          for _, conn in ipairs(outs) do local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end); seed = seed + cur end
+        end
+        Router._auth[k] = seed
+      end
+      local add = cap - Router._auth[k]
+      if add > 0 then
+        -- distribute `add` across the sources weighted by their ordered demand, so budget lands
+        -- where the stock/orders are. Only sources with a fundable (belted) connector take part —
+        -- an order-less or unwired source would have no quota leg and would leak straight to the
+        -- sink. Credit the ledger by what is ACTUALLY granted (a dropped share must not inflate
+        -- _auth, or the next epoch under-releases).
+        local list = {}
+        for cid in pairs(conns) do if (weight[cid] or 0) > 0 and #(fundOuts[cid] or {}) > 0 then list[#list + 1] = cid end end
+        if #list == 0 then for cid in pairs(conns) do if #(fundOuts[cid] or {}) > 0 then list[#list + 1] = cid end end end
+        local intended, given = 0, 0
+        for i, cid in ipairs(list) do
+          local share
+          if wtotal > 0 then share = math.floor(add * (weight[cid] or 0) / wtotal)
+          else share = math.floor(add / #list) end
+          if i == #list then share = add - intended end        -- last source mops up rounding remainder
+          intended = intended + share
+          given = given + fund(cid, share)
+        end
+        Router._auth[k] = Router._auth[k] + given
+      end
+      -- NOTE: we deliberately do NOT claw budget back when add < 0 AND orders still exist. cap
+      -- dips transiently below the authorized total as the dispatch-lag resolves (in-flight
+      -- items landing), and clawing on that jitter strips legitimate budget mid-fill. The
+      -- nOrders==0 branch above is a real, total stop — not jitter — so it claws to zero.
     end
-    -- NOTE: we deliberately do NOT claw budget back when add < 0. cap dips transiently below
-    -- the authorized total as the dispatch-lag resolves (in-flight items landing), and clawing
-    -- on that jitter strips legitimate budget mid-fill. A genuine demand drop (a buffer the
-    -- player hand-fills or deletes) therefore leaves a small, bounded leftover budget that can
-    -- leak to the sink — a rare manual-intervention edge, accepted over breaking normal fills.
   end
-  -- BLOCK the output of PURE-DESTINATION containers only. A terminal buffer (concrete: nothing
-  -- consumes it) or the sink must not re-emit its contents back into the belt loop (the
-  -- "fills the buffer but also takes from it" re-circulation). BUT a PASS-THROUGH container —
-  -- one that some order's path legitimately routes OUT of (a source, or a wire buffer wired
-  -- into the cable constructor that draws from it) — must stay OPEN so that flow continues.
-  -- A container is pass-through iff it appears as `belt.from` on some order's path; everything
-  -- else with no outbound flow is a dead-end store and gets blocked. (Sources are pass-through
-  -- by construction and are gated above.)
+  -- DEFAULT-DENY every non-source container, then OPEN only the pass-throughs. The controller is
+  -- the complete authority over each container's output every rebuild: closed unless flow is
+  -- actually needed there. A PASS-THROUGH — one that some order's path legitimately routes OUT of
+  -- (a wire buffer wired into the cable constructor that draws from it) — is set OPEN so flow
+  -- continues; everything else is a DEAD-END store (a terminal buffer like concrete, or the sink)
+  -- and is BLOCKED so it can't re-emit its contents back into the belt loop ("fills the buffer but
+  -- also takes from it" re-circulation; a buffer with two output ports leaking out the un-routed
+  -- one). A container is pass-through iff it appears as `belt.from` on some order's path. Sources
+  -- are gated above (blocked + metered budget) and are skipped here. Setting blocked explicitly in
+  -- BOTH directions — not just blocking dead-ends — means a relay that was momentarily blocked (or
+  -- a future start-of-session block-all) is reliably re-opened, and nothing emits by default.
   local flowsOut = {}
   for _, o in ipairs(self.orders) do
     for _, b in ipairs(o.path or {}) do flowsOut[b.from] = true end
   end
   for _, c in ipairs(self.topo.containers or {}) do
-    if not self.sourceItem[c.id] and not flowsOut[c.id] then
-      local conn = self:_outputConnector(self.getProxy(c.id))
-      if conn then pcall(function() conn.blocked = true end) end
+    if not self.sourceItem[c.id] then
+      local blockIt = not flowsOut[c.id]
+      for _, conn in ipairs(self:_outputConnectors(self.getProxy(c.id))) do
+        pcall(function() conn.blocked = blockIt end)
+      end
     end
   end
 end
