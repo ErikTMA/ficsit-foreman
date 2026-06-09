@@ -113,7 +113,7 @@ end
 -- source. A single order would pin the whole qty to ONE source — the router gates the
 -- others to 0 and their stock is stranded, so a buffer fed from two input containers can
 -- never fill. Returns true if at least one order was placed, and the qty left unplaced.
-function Planner:orderFrom(item, qty, dst, ratioNum, ratioDen)
+function Planner:orderFrom(item, qty, dst, ratioNum, ratioDen, toInput)
   item = lc(item)
   local srcs = self.sources[item] or {}
   if #srcs == 0 then return false, qty end
@@ -127,7 +127,7 @@ function Planner:orderFrom(item, qty, dst, ratioNum, ratioDen)
     -- only stamp/credit a placement that ACTUALLY happened: order() returns false (and
     -- appends nothing) when there's no belt path src->dst, so stamping orders[#orders]
     -- blindly would corrupt a previous order's ratio (or index nil).
-    if take > 0 and self.router:order(item, take, dst, sid) then
+    if take > 0 and self.router:order(item, take, dst, sid, toInput) then
       stamp(); remaining = remaining - take; placed = true
     end
   end
@@ -135,7 +135,7 @@ function Planner:orderFrom(item, qty, dst, ratioNum, ratioDen)
   -- the gate AUTHORIZES that source to release as stock refills within the epoch. Without this
   -- a source that is momentarily empty at plan time (a miner/belt still catching up) would be
   -- gated shut for the whole ~2s replan interval even though demand exists.
-  if remaining > 0 and self.router:order(item, remaining, dst, srcs[1]) then
+  if remaining > 0 and self.router:order(item, remaining, dst, srcs[1], toInput) then
     stamp(); placed = true; remaining = 0
   end
   return placed, remaining
@@ -248,8 +248,66 @@ end
 -- cumNum/cumDen carry the cumulative ratio of this ingredient per TERMINAL product (for gating).
 -- Returns ok, subClaimed (constructors the recursion claimed) — or false on any failure (caller
 -- rolls back). Places NO product order; the caller does that.
+-- Assign each ingredient of a MULTI-INPUT machine to a DISTINCT input port (one item type per belt).
+-- Returns ingredientName -> toInput (a partial map: only ingredients with a KNOWN source and a valid
+-- port assignment; crafted ingredients and unmatched ones are omitted -> routed normally). Reachability
+-- is the INTERSECTION over ALL of an ingredient's source containers (orderFrom splits across them, all
+-- pinned to the same port), so a port is valid only if EVERY co-source can reach it. The assignment is a
+-- maximum bipartite matching (Kuhn) so a full injective assignment is found whenever one exists.
+function Planner:_assignPorts(cid, opt)
+  local belts = self.router.inputBelts and self.router.inputBelts[cid]
+  local ings = opt.ingredients or {}
+  if not belts or #belts < 2 or #ings < 2 then return nil end
+  local function sourcesOf(name)                      -- raw: all providers; hub: the buffer; crafted: none
+    if self.sources[name] then return self.sources[name] end
+    if self.bufferOf[name] then return { self.bufferOf[name] } end
+    return nil
+  end
+  local feederOf, portList = {}, {}                   -- distinct ports (toInput) and each port's feeder node
+  for _, e in ipairs(belts) do
+    if feederOf[e.port] == nil then feederOf[e.port] = e.feeder; portList[#portList + 1] = e.port end
+  end
+  table.sort(portList)                                -- deterministic: matching is a pure fn of topology, not pairs() order
+  if #portList < 2 then return nil end
+  if #ings > #portList then
+    pcall(function()
+      computer.log(2, ("[Foreman] machine %s: %d ingredients but %d input belts — wire one belt per ingredient")
+        :format(tostring(cid):sub(1, 6), #ings, #portList))
+    end)
+  end
+  local reach = {}                                    -- reach[i][port] = ALL of ingredient i's sources reach it
+  for i, ing in ipairs(ings) do
+    reach[i] = {}; local srcs = sourcesOf(ing.name)
+    for _, p in ipairs(portList) do
+      local ok = srcs ~= nil and #srcs > 0
+      if ok then
+        for _, s in ipairs(srcs or {}) do
+          if not (s == feederOf[p] or self.router:findPath(s, feederOf[p])) then ok = false; break end
+        end
+      end
+      reach[i][p] = ok
+    end
+  end
+  -- Kuhn maximum bipartite matching: ingredients (left) -> distinct ports (right).
+  local matchPort = {}                                -- port -> ingredient index
+  local function aug(i, seen)
+    for _, p in ipairs(portList) do
+      if reach[i][p] and not seen[p] then
+        seen[p] = true
+        if matchPort[p] == nil or aug(matchPort[p], seen) then matchPort[p] = i; return true end
+      end
+    end
+    return false
+  end
+  for i = 1, #ings do aug(i, {}) end
+  local assign = {}
+  for p, i in pairs(matchPort) do assign[ings[i].name] = p end
+  return assign
+end
+
 function Planner:_orderIngredients(opt, crafts, cid, cumNum, cumDen, depth)
   local sub, out = {}, opt.out or 1
+  local ports = self:_assignPorts(cid, opt)           -- ingredientName -> toInput (nil for single-input machines)
   -- ATOMIC: if any ingredient fails partway, un-claim the constructors EARLIER ingredients' recursive
   -- produce() already claimed (else they leak busy + a setRecipe, re-churning every epoch). The
   -- caller truncates the orders; this releases the machines.
@@ -257,19 +315,20 @@ function Planner:_orderIngredients(opt, crafts, cid, cumNum, cumDen, depth)
   for _, ing in ipairs(opt.ingredients) do
     local qty = crafts * ing.amount
     local rNum, rDen = cumNum * ing.amount, cumDen * out   -- this ingredient per terminal product
+    local port = ports and ports[ing.name]                 -- assigned input port (nil = route normally)
     if self.sources[ing.name] then
-      if not self:orderFrom(ing.name, qty, cid, rNum, rDen) then return fail() end
+      if not self:orderFrom(ing.name, qty, cid, rNum, rDen, port) then return fail() end
     elseif self.bufferOf[ing.name] then
       local hub = self.bufferOf[ing.name]
       if not self:_hubViable(ing.name, hub) then return fail() end   -- never draw from a DEAD hub
-      if not self.router:order(ing.name, qty, cid, hub) then return fail() end
+      if not self.router:order(ing.name, qty, cid, hub, port) then return fail() end
       local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
       self.router.sourceItem[hub] = lc(ing.name)
     else
       local src, sc = self:produce(ing.name, qty, (depth or 0) + 1, rNum, rDen)
       if not src then return fail() end
       for _, c in ipairs(sc or {}) do sub[#sub + 1] = c end   -- record claims BEFORE the order so fail() releases them
-      if not self.router:order(ing.name, qty, cid, src) then return fail() end
+      if not self.router:order(ing.name, qty, cid, src, port) then return fail() end
       local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
     end
   end

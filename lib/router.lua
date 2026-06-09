@@ -143,6 +143,20 @@ function Router.new(topology, getProxy)
   for _, c in ipairs(topology.containers or {}) do
     if c.provides then self._rawItem[lc(c.provides)] = true end
   end
+  -- INPUT BELTS PER MACHINE: the physical conveyor ports of a constructor/assembler/manufacturer,
+  -- one belt per port. A multi-ingredient machine must get each ingredient on its OWN port (one item
+  -- type per belt) or the abundant ingredient floods the shared belt and the scarce one never reaches
+  -- the machine. inputBelts[machineId] = { { belt, port = toInput, feeder = belt.from }, ... }.
+  self.inputBelts = {}
+  do
+    local isCtor = {}; for _, id in ipairs(topology.constructors or {}) do isCtor[id] = true end
+    for _, b in ipairs(topology.belts or {}) do
+      if isCtor[b.to] then
+        self.inputBelts[b.to] = self.inputBelts[b.to] or {}
+        table.insert(self.inputBelts[b.to], { belt = b, port = b.toInput or 0, feeder = b.from })
+      end
+    end
+  end
   return self
 end
 
@@ -191,16 +205,34 @@ function Router:findPath(src, dst)
   return bfs(false) or bfs(true)
 end
 
+-- the input belt of a machine wired to a specific port (toInput), or nil.
+function Router:_beltToPort(machine, port)
+  for _, e in ipairs(self.inputBelts[machine] or {}) do if e.port == port then return e end end
+  return nil
+end
+
 --- Route `count` of `item` to `dst`. Discovers the path and programs every
 --- splitter on it. `src` is optional — if omitted, the container declared to
 --- `provide` the item is used (the double-pass production case passes the
---- constructor as the explicit src for the crafted product). Returns true, or
---- false + reason if no path/source.
-function Router:order(item, count, dst, src)
+--- constructor as the explicit src for the crafted product). `toInput` (optional) pins delivery to a
+--- SPECIFIC input port of `dst`: the path is forced to END on that port's belt, so a multi-ingredient
+--- machine gets each ingredient on its own belt. Returns true, or false + reason if no path/source.
+function Router:order(item, count, dst, src, toInput)
   item = lc(item)
   src = src or self:sourceOf(item)
   if not src then return false, "no source provides " .. item end
-  local path = self:findPath(src, dst)
+  local path
+  if toInput ~= nil then
+    local pb = self:_beltToPort(dst, toInput)
+    if pb then
+      local pre = self:findPath(src, pb.feeder)       -- route to the port's feeder, then its final belt
+      if pre then path = pre; path[#path + 1] = pb.belt end
+    end
+    if not path then   -- pinning failed (port belt missing / feeder unreachable from this src): observable,
+      Router._dlog(("PORT-UNPIN %s '%s' ->%s port %s — falling back to any-port"):format(tostring(src):sub(1,6), item, tostring(dst):sub(1,6), tostring(toInput)))
+    end
+  end
+  path = path or self:findPath(src, dst)              -- fallback: any path to the machine
   if not path then return false, ("no path %s -> %s"):format(src, dst) end
   -- the order REMEMBERS its full path (the ordered list of belts src->dst). Edge quota
   -- is summed from these paths (see buildQuota); on a rebuild the path is recomputed, so
@@ -387,26 +419,33 @@ function Router:_countAt(dst, item, isMachine)
   return total
 end
 
--- free room for an ORDER's delivery into its consumer = cap - have (spec §3). A machine ingredient
--- order carries o.cap (stamped by the planner) and reads the machine input; a buffer/product order
--- uses the buffer's capacity (target) and reads the container. Fail-open: a missing cap/unreadable
--- consumer returns the order's full remaining demand (never worse than the old static quota).
+-- free room for an ORDER's delivery into its consumer = cap - have.
 --
--- Room-weight DESTINATION BUFFERS only. A buffer at/over its target contributes 0 quota, so the
--- splitter feeding it diverts the item to a sibling buffer with room or to the bottleneck (this is
--- what load-balances a same-item buffer pool and stops over-filling). A MACHINE ingredient order is
--- deliberately NOT room-capped here: a static per-epoch quota cannot separate a machine's STANDING
--- input from its THROUGHPUT, and an undersized standing cap starves the machine within the epoch.
--- Machine distribution (feed the empty bottleneck, not the backed-up consumer) is handled at the
--- PHYSICAL layer by divert-on-full (a backed-up machine's input fills -> its leg's transferItem
--- fails -> the item diverts to a sibling/bottleneck with room) plus the demand layer's assignment.
--- So a machine/sink order routes its full remaining demand. (An explicit standing-input cap needs
--- multi-epoch quota semantics + throughput sizing — deferred to a follow-up.)
+-- DESTINATION BUFFER: room = target - have. A buffer at/over target contributes 0 quota, so the
+-- splitter feeding it diverts the item to a sibling buffer with room or to the bottleneck (load-
+-- balances a same-item buffer pool, stops over-filling).
+--
+-- MULTI-INPUT MACHINE (assembler/manufacturer) ingredient: room = portCap - have(that ingredient in
+-- the machine input). This is the HEAD-OF-LINE fix for per-port routing — a port-pinned ingredient
+-- has a single quota leg, so when its port fills it would stall the shared per-machine splitter and
+-- block the OTHER ingredient. Capping by the per-ingredient input level makes the abundant ingredient
+-- stop flowing toward the splitter once its port is full (its quota -> 0 -> it diverts UPSTREAM where
+-- buffers/sink are reachable), freeing the splitter so the scarce ingredient reaches its own port.
+-- Only multi-input machines are capped; a single-input constructor routes its full demand (so the
+-- single-input fill paths — regate/flow/balance — are unchanged).
+Router.portCap = Router.portCap or 12   -- standing per-ingredient input cap at a multi-input machine (tunable)
 function Router:_orderRoom(o)
   local cap = self.capacity[o.dst]
-  if not cap then return o.count - o.delivered end       -- machine / sink / unbounded terminal: full demand
-  local have = self:_countAt(o.dst, o.item, false)
-  return math.max(0, cap - have)
+  if cap then                                            -- destination buffer
+    local have = self:_countAt(o.dst, o.item, false)
+    return math.max(0, cap - have)
+  end
+  local belts = self.inputBelts and self.inputBelts[o.dst]
+  if belts and #belts >= 2 then                          -- multi-input machine: per-ingredient input cap
+    local have = self:_countAt(o.dst, o.item, true)
+    return math.max(0, (Router.portCap or 12) - have)
+  end
+  return o.count - o.delivered                           -- single-input machine / sink: full demand
 end
 
 function Router:buildQuota()
