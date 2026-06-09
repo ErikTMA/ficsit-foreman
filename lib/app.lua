@@ -232,7 +232,7 @@ function App.run(modules, topology, opts)
   if modules.Router and opts.stuckEpochs then modules.Router.stuckEpochs = opts.stuckEpochs end
   -- The control model keeps a DURABLE machine->recipe assignment (+ epoch clock for hysteresis)
   -- module-side so it survives the ~2s rebuilds; a fresh session starts clean.
-  if modules.Planner then modules.Planner._assign = {}; modules.Planner._epoch = 0 end
+  if modules.Planner then modules.Planner._assign = {}; modules.Planner._epoch = 0; modules.Planner._scanCache = nil end
 
   -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by
   -- default for clean output. Enable by passing opts.debug=true OR nicking the Computer Case

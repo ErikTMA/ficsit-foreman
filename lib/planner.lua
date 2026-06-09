@@ -53,7 +53,25 @@ function Planner.new(topology, router, getProxy, epochSeconds)
 end
 
 -- ---- reflection: discover constructors + recipes ---------------------------
+-- PERF: getRecipes()/getIngredients()/getProducts() are game-thread syncs and a machine exposes ~30
+-- recipes — re-reading them on every ~2s re-plan is hundreds of syncs that BLOCK routing. A machine's
+-- recipe LIST never changes, so cache the scan module-side, keyed by the constructor set, and on reuse
+-- only refresh the live ctor proxy (pure Lua). A full re-discover with a different machine set (or a
+-- new session — App.run clears the cache) re-reads. itemOfRecipe/recipesByProduct are not mutated
+-- after scan, so the cached tables are safely shared across the per-epoch Planner instances.
 function Planner:scan()
+  local ids = {}
+  for _, cid in ipairs(self.topo.constructors or {}) do ids[#ids + 1] = tostring(cid) end
+  table.sort(ids)
+  local sig = table.concat(ids, ",")
+  local cache = Planner._scanCache
+  if cache and cache.sig == sig then
+    self.recipesByProduct, self.itemOfRecipe = cache.recipesByProduct, cache.itemOfRecipe
+    for _, list in pairs(self.recipesByProduct) do
+      for _, opt in ipairs(list) do opt.ctor = self.getProxy(opt.ctorId) end   -- refresh the live proxy (no sync vs the game thread for cached recipe data)
+    end
+    return
+  end
   for _, cid in ipairs(self.topo.constructors or {}) do
     local ctor = self.getProxy(cid)
     for _, recipe in ipairs(ctor:getRecipes()) do
@@ -78,28 +96,20 @@ function Planner:scan()
       end
     end
   end
+  Planner._scanCache = { sig = sig, recipesByProduct = self.recipesByProduct, itemOfRecipe = self.itemOfRecipe }
 end
 
 -- ---- inventory reads (FIN-faithful: getInventories -> getStack) -------------
+-- PERF: every planner count_in reads a SINGLE-ITEM container (a source holds its provided item; a
+-- buffer/hub holds its stored item — overflow only ever routes an item to its OWN buffer, so they
+-- don't get mixed), so the inventory's itemCount IS the count of `item`. That's ONE property read per
+-- inventory instead of a 24-48-slot getStack scan (each slot is a game-thread sync) — the dominant
+-- cost of the ~2s re-plan on a big factory. (`item` is kept for the call signature / intent.)
 local function count_in(proxy, item)
-  item = lc(item)
-  local invs = proxy:getInventories()
   local total = 0
-  for _, inv in ipairs(invs) do
-    -- PERF: every getStack() is a game-thread sync; a storage container has 24-48 slots. Skip the
-    -- whole per-slot scan when the inventory's itemCount is 0 (a single property read) — most buffers
-    -- are empty or low, so this cuts the bulk of the planning-phase syncs on a big factory.
+  for _, inv in ipairs(proxy:getInventories()) do
     local n = 0; pcall(function() n = inv.itemCount or 0 end)
-    if n > 0 then
-      for i = 0, (inv.size or 0) - 1 do
-        local stack = inv:getStack(i)
-        -- in-game an empty slot returns a 0-count stack whose item.type is nil — guard
-        if stack and (stack.count or 0) > 0 and stack.item and stack.item.type
-           and lc(stack.item.type.name) == item then
-          total = total + stack.count
-        end
-      end
-    end
+    total = total + n
   end
   return total
 end
