@@ -678,32 +678,54 @@ function Planner:_inputCount(cid)
   return n
 end
 
--- the next drain recipe to try on `cid` (≠ the assigned `opt`). Prefer one that consumes the item
--- visible at the machine's FEEDER (the best available hint for what is blocking); else round-robin
--- through the machine's other recipes so repeated jams eventually find the one that pulls.
+-- the next drain recipe to try on `cid` (≠ the assigned `opt`). The blockage is BY DEFINITION an
+-- item the assigned recipe does NOT consume (the machine would already pull its own feedstock), so:
+--   * a feeder-item hint matching the assigned ingredients is in-transit feedstock, NOT the jam —
+--     ignore it (the live bug: B13DC6 assigned Iron Rod(<-ingot) was hinted 'iron ingot' and picked
+--     Iron Plate(<-ingot), a recipe that by construction can never pull the jam);
+--   * a candidate that consumes ONLY assigned ingredients is equally useless — rank it last.
+-- Ranking: tier 1 = recipes consuming another assignment's ingredient (strays come from the shared
+-- manifold's own flows: rod/plate/screws); tier 2 = recipes consuming any buffered/sourced item;
+-- tier 3 = the rest (a player-dropped stray). Alphabetical within a tier. The round-robin cursor
+-- (_drainTried) is only set by a drain that pulled NOTHING — a working recipe is reused next jam.
 function Planner:_drainCandidate(cid, opt)
+  local assignedIng = {}
+  for _, ing in ipairs(opt.ingredients) do assignedIng[ing.name] = true end
+  local tier1, tier2 = {}, {}
+  for _, a in pairs(Planner._assign) do
+    if a.opt then for _, ing in ipairs(a.opt.ingredients) do if not assignedIng[ing.name] then tier1[ing.name] = true end end end
+  end
+  for it in pairs(self.bufferOf) do if not assignedIng[it] then tier2[it] = true end end
+  for it in pairs(self.sources) do if not assignedIng[it] then tier2[it] = true end end
   local seen, list = {}, {}
   for _, opts in pairs(self.recipesByProduct) do
     for _, o2 in ipairs(opts) do
       local nm = tostring(o2.recipe.name)
       if o2.ctorId == cid and nm ~= tostring(opt.recipe.name) and not seen[nm] then
-        seen[nm] = true; list[#list + 1] = o2
+        seen[nm] = true
+        local t = 3
+        for _, ing in ipairs(o2.ingredients) do
+          if tier1[ing.name] then t = 1; break elseif tier2[ing.name] then t = math.min(t, 2) end
+        end
+        list[#list + 1] = { o2 = o2, tier = t, nm = nm }
       end
     end
   end
   if #list == 0 then return nil end
-  table.sort(list, function(a, b) return tostring(a.recipe.name) < tostring(b.recipe.name) end)
+  table.sort(list, function(a, b) if a.tier ~= b.tier then return a.tier < b.tier end return a.nm < b.nm end)
+  local lastFail = Planner._drainTried[cid]          -- set only when the previous drain pulled nothing
   local hint = self.router._feedItem and self.router:_feedItem(cid)
-  if hint then
-    for _, o2 in ipairs(list) do
-      for _, ing in ipairs(o2.ingredients) do if ing.name == hint then return o2 end end
+  if hint and not assignedIng[hint] then             -- assigned feedstock at the feeder = in transit, not the jam
+    for _, e in ipairs(list) do
+      if e.nm ~= lastFail then
+        for _, ing in ipairs(e.o2.ingredients) do if ing.name == hint then return e.o2 end end
+      end
     end
   end
-  local last = Planner._drainTried[cid]
-  if last then
-    for i, o2 in ipairs(list) do if tostring(o2.recipe.name) == last then return list[(i % #list) + 1] end end
+  if lastFail then
+    for i, e in ipairs(list) do if e.nm == lastFail then return list[(i % #list) + 1].o2 end end
   end
-  return list[1]
+  return list[1].o2
 end
 
 -- EXECUTION: machine `cid` makes its `share` of `item`'s hub fill, delivered to the item's buffer.

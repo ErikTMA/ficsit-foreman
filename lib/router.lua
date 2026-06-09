@@ -91,7 +91,7 @@ function Router.new(topology, getProxy)
   -- MACHINE set + per-machine CONSUMED items (populated by order(): an order to a constructor means it
   -- consumes that item). Used to GUARD a delivery — a splitter must never hand a constructor an item its
   -- recipe doesn't take (iron rod into an iron-ingot machine, etc.) — and to dump the input item.
-  self.isMachine, self.consumes = {}, {}
+  self.isMachine, self.consumes, self.portItem = {}, {}, {}
   for _, id in ipairs(topology.constructors or {}) do self.isMachine[id] = true end
   -- adjacency: node -> list of belts leaving it
   self.adj = {}
@@ -254,6 +254,12 @@ function Router:order(item, count, dst, src, toInput)
   self.ordersForItem[item] = self.ordersForItem[item] or {}
   table.insert(self.ordersForItem[item], order)   -- ALL orders for this item (multi-destination)
   if self.isMachine[dst] then self.consumes[dst] = self.consumes[dst] or {}; self.consumes[dst][item] = true end
+  if toInput ~= nil and self.isMachine[dst] and path[#path] and (path[#path].toInput or 0) == toInput then
+    -- the pin DEDICATES the port: this epoch, port `toInput` of `dst` carries `item` and NOTHING else
+    -- (see _beltAccepts — one foreign head item on a dedicated port's belt kills the port forever).
+    self.portItem[dst] = self.portItem[dst] or {}
+    self.portItem[dst][toInput] = item
+  end
   return true
 end
 
@@ -266,6 +272,24 @@ function Router:_machineAccepts(to, item)
   local c = self.consumes[to]
   if not c or not next(c) then return true end
   return c[item] == true
+end
+
+-- May `item` ride `belt` into belt.to? Adds PORT EXCLUSIVITY on top of _machineAccepts: a machine
+-- input port pinned to an ingredient (portItem, set by a port-pinned order) takes that ingredient
+-- and NOTHING else — EVER. One foreign head item on a dedicated port's belt kills the port forever
+-- (the machine's slot for it is full, so it is never pulled, and the real ingredient can never get
+-- past it — the assembler both-ports-blocked-by-plate bug). This binds EVERY push path, including
+-- the _overflow recovery that re-pathfinds "any way to the machine" and used to land plates on the
+-- screws port.
+function Router:_beltAccepts(belt, item)
+  if not belt then return false end
+  if not self:_machineAccepts(belt.to, item) then return false end
+  local pm = self.portItem and self.portItem[belt.to]
+  if pm then
+    local want = pm[belt.toInput or 0]
+    if want ~= nil and want ~= item then return false end
+  end
+  return true
 end
 
 --- Remove orders placed after index `n` (the planner's atomic rollback: if a craft plan
@@ -588,7 +612,7 @@ function Router:_bestEdge(id, item)
   local best, bestq = nil, 0
   for _, b in ipairs(self.adj[id] or {}) do
     local q = (b._q and b._q[item]) or 0
-    if q > bestq then
+    if q > bestq and self:_beltAccepts(b, item) then
       local terminal = not self.bufferItem[b.to]
       if terminal or self:hasRoom(b.to, item) then best, bestq = b, q end
     end
@@ -637,7 +661,10 @@ function Router:_overflow(sender, id, item)
     local terminal = not self.bufferItem[o.dst]
     if terminal or self:hasRoom(o.dst, item) then
       local belt = self:firstHopTo(id, o.dst)
-      if belt and sender:transferItem(belt.fromOutput or 0) then
+      -- _beltAccepts: the recovery hop must honor PORT PINS — re-pathfinding "any way to the
+      -- machine" used to land iron plate on the SCREWS port's belt, where the machine (plate slot
+      -- full) never pulls it and the port is dead forever. A dedicated port takes its item ONLY.
+      if belt and self:_beltAccepts(belt, item) and sender:transferItem(belt.fromOutput or 0) then
         -- credit delivery + (on the DIRECT hop into a buffer dst) the room cache, so a chain of recovery
         -- deliveries to the same buffer caps at capacity instead of flooding past the stale cached count.
         if belt.to == o.dst then
@@ -724,8 +751,8 @@ function Router:_routeAtSplitter(sender, id, item)
   end)
   for _, best in ipairs(legs) do
     local terminal = not self.bufferItem[best.to]
-    if not self:_machineAccepts(best.to, item) then
-      Router._dlog(("MISROUTE %s '%s' >out[%d] %s — machine doesn't consume it; skipping leg")
+    if not self:_beltAccepts(best, item) then
+      Router._dlog(("MISROUTE %s '%s' >out[%d] %s — machine/port doesn't take it; skipping leg")
         :format(tostring(id):sub(1, 6), item, best.fromOutput or 0, tostring(best.to):sub(1, 6)))
     elseif terminal or self:hasRoom(best.to, item) then
       if sender:transferItem(best.fromOutput or 0) then
@@ -901,8 +928,8 @@ function Router:_mergerPush(sender, id, input, nm)
     nm = cur
   end
   local out = (self.adj[id] or {})[1]                -- merger's single output belt
-  if out and not self:_machineAccepts(out.to, nm) then  -- never push a foreign item into a constructor
-    Router._dlog(("MISROUTE %s '%s' >merge %s — machine doesn't consume it; holding"):format(tostring(id):sub(1, 6), nm, tostring(out.to):sub(1, 6)))
+  if out and not self:_beltAccepts(out, nm) then     -- never push a foreign item into a machine OR a pinned port
+    Router._dlog(("MISROUTE %s '%s' >merge %s — machine/port doesn't take it; holding"):format(tostring(id):sub(1, 6), nm, tostring(out.to):sub(1, 6)))
     return false
   end
   if not sender:transferItem(input) then
