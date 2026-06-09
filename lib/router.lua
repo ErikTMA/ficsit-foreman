@@ -156,10 +156,23 @@ function Router.new(topology, getProxy)
   self.inputBelts = {}
   do
     local isCtor = {}; for _, id in ipairs(topology.constructors or {}) do isCtor[id] = true end
+    local used = {}   -- machineId -> { port -> true }: dedupe colliding connector indices
     for _, b in ipairs(topology.belts or {}) do
       if isCtor[b.to] then
         self.inputBelts[b.to] = self.inputBelts[b.to] or {}
-        table.insert(self.inputBelts[b.to], { belt = b, port = b.toInput or 0, feeder = b.from })
+        -- PORT IDENTITY = THE PHYSICAL BELT, not the game's connector index. In-game, an
+        -- assembler's two input connectors can BOTH report toInput=0; trusting that collapses the
+        -- two ports into one, _assignPorts sees "<2 ports" and silently skips pinning, and the
+        -- port-exclusivity guard never arms (the plates-on-both-assembler-legs bug, round 2 —
+        -- the debug dump's fed[..@0 ..@0] was the giveaway). Each belt into a machine is a
+        -- distinct physical port, so disambiguate colliding indices and stamp the belt (b._port);
+        -- _beltAccepts reads the stamp. Works for N machines with N input belts.
+        used[b.to] = used[b.to] or {}
+        local p = b.toInput or 0
+        while used[b.to][p] do p = p + 1 end
+        used[b.to][p] = true
+        b._port = p
+        table.insert(self.inputBelts[b.to], { belt = b, port = p, feeder = b.from })
       end
     end
   end
@@ -254,7 +267,7 @@ function Router:order(item, count, dst, src, toInput)
   self.ordersForItem[item] = self.ordersForItem[item] or {}
   table.insert(self.ordersForItem[item], order)   -- ALL orders for this item (multi-destination)
   if self.isMachine[dst] then self.consumes[dst] = self.consumes[dst] or {}; self.consumes[dst][item] = true end
-  if toInput ~= nil and self.isMachine[dst] and path[#path] and (path[#path].toInput or 0) == toInput then
+  if toInput ~= nil and self.isMachine[dst] and path[#path] and (path[#path]._port or path[#path].toInput or 0) == toInput then
     -- the pin DEDICATES the port: this epoch, port `toInput` of `dst` carries `item` and NOTHING else
     -- (see _beltAccepts — one foreign head item on a dedicated port's belt kills the port forever).
     self.portItem[dst] = self.portItem[dst] or {}
@@ -286,7 +299,7 @@ function Router:_beltAccepts(belt, item)
   if not self:_machineAccepts(belt.to, item) then return false end
   local pm = self.portItem and self.portItem[belt.to]
   if pm then
-    local want = pm[belt.toInput or 0]
+    local want = pm[belt._port or belt.toInput or 0]   -- _port: belt-identity port (toInput collides in-game)
     if want ~= nil and want ~= item then return false end
   end
   return true

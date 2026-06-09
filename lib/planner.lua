@@ -678,6 +678,21 @@ function Planner:_inputCount(cid)
   return n
 end
 
+-- a machine's INPUT inventory as item -> count (empty map on read error)
+function Planner:_inputMap(cid)
+  local p = self.getProxy(cid)
+  local ok, inv = pcall(function() return p:getInputInv() end)
+  local have = {}
+  if not (ok and inv and inv.getStack) then return have end
+  for i = 0, (inv.size or 0) - 1 do
+    local s = inv:getStack(i)
+    if s and (s.count or 0) > 0 and s.item and s.item.type then
+      have[lc(s.item.type.name)] = (have[lc(s.item.type.name)] or 0) + s.count
+    end
+  end
+  return have
+end
+
 -- the next drain recipe to try on `cid` (≠ the assigned `opt`). The blockage is BY DEFINITION an
 -- item the assigned recipe does NOT consume (the machine would already pull its own feedstock), so:
 --   * a feeder-item hint matching the assigned ingredients is in-transit feedstock, NOT the jam —
@@ -748,9 +763,12 @@ function Planner:produceFor(cid, item, share, dst)
   -- ---- FEED-DRAIN hold: a machine clearing its jammed entrance keeps the drain recipe ----
   local d = Planner._drain[cid]
   if d then
-    if inN > 0 then d.idle = 0 else d.idle = (d.idle or 0) + 1 end
+    if inN > 0 then d.idle = 0; d.pulled = true else d.idle = (d.idle or 0) + 1 end
     if live and live ~= opt.recipe.name then d.recipe = tostring(live) end   -- adopt manual changes mid-drain
     if d.idle >= (Planner.drainIdle or 3) and inN == 0 then
+      -- a drain that PULLED worked: clear the round-robin cursor so the same recipe is reused on
+      -- the next jam; a drain that pulled nothing keeps the cursor so the next attempt advances.
+      if d.pulled then Planner._drainTried[cid] = nil end
       Planner._drain[cid] = nil       -- nothing pulled for a while: blockage cleared (or unpullable) -> restore below
     else
       local di = live and self.itemOfRecipe[tostring(live)]                 -- route the drained product away
@@ -762,17 +780,32 @@ function Planner:produceFor(cid, item, share, dst)
   end
   local jammed = self.router._legFullMach and self.router._legFullMach[cid]
   if live == opt.recipe.name then
-    -- starvation tracking on the assigned recipe; starved + a physically full entrance can only
-    -- mean the belt head is an item this recipe won't pull -> temp-switch to a recipe that will.
-    if inN == 0 then Planner._starve[cid] = (Planner._starve[cid] or 0) + 1 else Planner._starve[cid] = 0 end
-    if jammed and (Planner._starve[cid] or 0) >= (Planner.drainAfter or 3) then
-      local cand = self:_drainCandidate(cid, opt)
+    -- FROZEN tracking on the assigned recipe: the machine is STUCK when its input count AND its
+    -- production are both UNCHANGED across epochs. This covers an empty input, a PARTIAL input
+    -- below the recipe requirement (a machine holding 1 of 3 ingots with a stray blocking its
+    -- entrance freezes exactly like an empty one — the live C5504C case "in=1" that the old
+    -- inN==0 test missed), and an uncraftable mix. Generic for any machine, any recipe.
+    local prodN = ((self.router._deliv or {})[tostring(cid) .. "|" .. lc(item)]) or 0
+    local st = Planner._starve[cid]
+    if type(st) ~= "table" then st = { n = 0 }; Planner._starve[cid] = st end
+    if st.lastIn == inN and st.lastProd == prodN then st.n = st.n + 1 else st.n = 0 end
+    st.lastIn, st.lastProd = inN, prodN
+    if jammed and st.n >= (Planner.drainAfter or 3) then
+      -- a frozen machine that COULD craft from what it holds is OUTPUT-blocked — its fix is
+      -- downstream; never touch its recipe (setRecipe would eject full feedstock into the very
+      -- path that is blocked — the live B13DC6 "in=100, output jammed" case).
+      local have = self:_inputMap(cid)
+      local canCraft = true
+      for _, ing in ipairs(opt.ingredients) do
+        if (have[ing.name] or 0) < ing.amount then canCraft = false; break end
+      end
+      local cand = (not canCraft) and self:_drainCandidate(cid, opt) or nil
       if cand then
-        pcall(function() opt.ctor:setRecipe(cand.recipe) end)               -- input empty (starved): nothing ejected
+        pcall(function() opt.ctor:setRecipe(cand.recipe) end)   -- leftovers (if any) eject to OUTPUT and are routed
         Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
         Planner._drainTried[cid] = tostring(cand.recipe.name)
-        Planner._starve[cid] = 0
-        pcall(function() computer.log(1, ("[Foreman] DRAIN %s: entrance jammed while starved; temp recipe '%s' pulls the blockage (assigned '%s')")
+        st.n = 0
+        pcall(function() computer.log(1, ("[Foreman] DRAIN %s: entrance jammed while frozen; temp recipe '%s' pulls the blockage (assigned '%s')")
           :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name), tostring(opt.recipe.name))) end)
         local di = self.itemOfRecipe[tostring(cand.recipe.name)]
         if di and self.bufferOf[di] then
@@ -782,11 +815,12 @@ function Planner:produceFor(cid, item, share, dst)
       end
     end
   else
-    -- live ≠ assigned. A starved+jammed machine whose recipe was changed by hand is DRAINING its
+    -- live ≠ assigned. A frozen+jammed machine whose recipe was changed by hand is DRAINING its
     -- blockage — ADOPT it (switching back would re-block the belt and fight the user).
-    if live ~= nil and (Planner._starve[cid] or 0) > 0 and jammed then
+    local stA = Planner._starve[cid]
+    if live ~= nil and type(stA) == "table" and stA.n > 0 and jammed then
       Planner._drain[cid] = { recipe = tostring(live), idle = 0 }
-      Planner._starve[cid] = 0
+      stA.n = 0
       local di = self.itemOfRecipe[tostring(live)]
       if di and self.bufferOf[di] then
         self.router:order(di, math.max(1, self:_fillAmount(di)), self.bufferOf[di], cid)
