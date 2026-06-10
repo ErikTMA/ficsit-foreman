@@ -244,6 +244,7 @@ function App.run(modules, topology, opts)
     modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {}
     modules.Router._delivPrev = {}   -- stall back-pressure baseline; reset with _deliv so a fresh session has no stale progress
     modules.Router._stallGates = {}  -- in-flight amnesty counters; reset with the ledgers they watch
+    modules.Router._flowBy = {}      -- per-item flow forensics; fresh per session
     -- stuck-machine recovery state is module-level so it survives the in-loop rebuilds; reset per session.
     modules.Router._idleEpochs = {}; modules.Router._draining = {}
     -- static connector cache + blocked-write shadow (gateSources perf): cleared per session and on every
@@ -260,6 +261,7 @@ function App.run(modules, topology, opts)
     modules.Planner._assign = {}; modules.Planner._epoch = 0; modules.Planner._scanCache = nil
     modules.Planner._drain = {}; modules.Planner._starve = {}; modules.Planner._drainTried = {}; modules.Planner._infeas = {}   -- feed-drain + infeasibility state; fresh per session
     modules.Planner._tempRecipe = {}   -- drain temp-recipe marks (seed-adoption guard); fresh per session
+    modules.Planner._infeasIng = {}    -- per-item blocking-ingredient marks; fresh per session
   end
 
   -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by

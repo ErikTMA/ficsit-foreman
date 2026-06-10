@@ -260,7 +260,7 @@ function Router:order(item, count, dst, src, toInput)
   -- buffer (an ingredient order's term is the product->buffer order; a direct/terminal
   -- order is its own term). gateSources gates an ingredient source against the terminal's
   -- delivery so a deep craft chain doesn't over-release (see the planner + gateSources).
-  local order = { item = item, count = count, dst = dst, src = src, delivered = 0, path = path }
+  local order = { item = item, count = count, dst = dst, src = src, delivered = 0, path = path, toInput = toInput }
   order.term = order
   table.insert(self.orders, order)
   self.ordersByItem[item] = order                 -- latest (back-compat)
@@ -317,11 +317,31 @@ end
 --- sources aren't gated to release an ingredient nothing will consume). Orders are appended
 --- in placement order, so the last per-item is at the tail of ordersForItem — pop in reverse.
 function Router:_truncateOrders(n)
+  local dropped = false
   while #self.orders > n do
     local o = table.remove(self.orders)
     local list = self.ordersForItem[o.item]
     if list and list[#list] == o then table.remove(list) end
     self.ordersByItem[o.item] = (list and list[#list]) or nil
+    dropped = true
+  end
+  if not dropped then return end
+  -- REBUILD the per-machine consumption guards + port pins from the SURVIVING orders. order()
+  -- writes consumes[dst][item] and portItem[dst][port] as a side effect; popping the order alone
+  -- left PHANTOM entries — a rolled-back attempt (e.g. an infeasible alternate assignment whose
+  -- second ingredient failed) made the machine's legs consume-guard against the GHOST item set,
+  -- refusing the real assignment's in-transit ingredients at the feeder, and showed ghost wants[]
+  -- in the debug dump (the live "wants[iron rod]" on a Reinforced-Iron-Plate machine).
+  self.consumes, self.portItem = {}, {}
+  for _, o in ipairs(self.orders) do
+    if self.isMachine[o.dst] then
+      self.consumes[o.dst] = self.consumes[o.dst] or {}; self.consumes[o.dst][o.item] = true
+      local tail = o.path and o.path[#o.path]
+      if o.toInput ~= nil and tail and (tail._port or tail.toInput or 0) == o.toInput then
+        self.portItem[o.dst] = self.portItem[o.dst] or {}
+        self.portItem[o.dst][o.toInput] = o.item
+      end
+    end
   end
 end
 
@@ -698,6 +718,8 @@ function Router:_overflow(sender, id, item)
           self:_credit(belt, item)
           if self.bufferItem[o.dst] then self:_creditRoom(o.dst, item) end
         end
+        Router._flowBy[item] = Router._flowBy[item] or {}
+        Router._flowBy[item].rec = (Router._flowBy[item].rec or 0) + 1
         Router._dlog(("RECOVER %s '%s' >out[%d] %s ->%s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(belt.to):sub(1,6), tostring(o.dst):sub(1,6)))
         return true
       end
@@ -713,6 +735,8 @@ function Router:_overflow(sender, id, item)
         -- NOT credit — the item continues and is credited at the final splitter before D (best.to == D),
         -- so crediting here too would double-count and falsely fill the cache (the reroute under-fill bug).
         if belt.to == D then self:_credit(belt, item); self:_creditRoom(D, item) end
+        Router._flowBy[item] = Router._flowBy[item] or {}
+        Router._flowBy[item].rer = (Router._flowBy[item].rer or 0) + 1
         Router._dlog(("REROUTE %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(D):sub(1,6)))
         return true
       end
@@ -725,6 +749,8 @@ function Router:_overflow(sender, id, item)
     local belt = self:firstHopTo(id, sink)
     if belt and sender:transferItem(belt.fromOutput or 0) then
       Router._nSunk = (Router._nSunk or 0) + 1            -- always-counted; the perf line reports the rate
+      Router._flowBy[item] = Router._flowBy[item] or {}
+      Router._flowBy[item].sunk = (Router._flowBy[item].sunk or 0) + 1
       if Router.DEBUG and #active > 0 and computer and computer.log then
         Router._sinkLog = (Router._sinkLog or 0)
         if Router._sinkLog < 16 then
@@ -742,6 +768,8 @@ function Router:_overflow(sender, id, item)
   -- over a single stray item — far worse than one item waiting on a belt. The held item resumes the
   -- instant a path opens (a buffer drains, a sink is wired, a belt is repaired) with no restart.
   Router._nStuck = (Router._nStuck or 0) + 1             -- always-counted; the perf line reports the rate
+  Router._flowBy[item] = Router._flowBy[item] or {}
+  Router._flowBy[item].stuck = (Router._flowBy[item].stuck or 0) + 1
   if Router.DEBUG and computer and computer.log then
     Router._holdLog = Router._holdLog or 0
     if Router._holdLog < 8 then
@@ -1070,6 +1098,10 @@ Router.progressFloor = Router.progressFloor or 8
 -- trickle) instead of starving its consumer forever.
 Router._stallGates  = Router._stallGates or {}    -- item -> consecutive stalled-with-ub-0 gates
 Router.stallForgive = Router.stallForgive or 5
+-- PER-ITEM FLOW LEDGER (debug forensics): where did a released item actually END UP? The live
+-- "screws vanish mid-manifold" hunt had no per-item trail — sunk/stuck were global counters and a
+-- silent recovery/reroute leaves no aggregate trace. Module-durable; dumped by debugDump.
+Router._flowBy = Router._flowBy or {}             -- item -> { rec=, rer=, sunk=, stuck= }
 -- machine entrances whose feed leg is physically FULL (transferItem failed): set by _routeAtSplitter /
 -- _mergerPush, cleared when a push succeeds. Module-durable (router instances are rebuilt per epoch);
 -- the planner's FEED-DRAIN reads it to detect a foreign item stranded at a starved machine's entrance.
@@ -1425,6 +1457,20 @@ function Router:debugDump()
     local wants = {}; for it in pairs(self.consumes[cid] or {}) do wants[#wants + 1] = it end
     computer.log(1, ("[Foreman] dbg mac %s recipe=%s in=%d [%s] wants[%s] fed[%s]")
       :format(s6(cid), rec, self:_inputTotal(cid), self:_inputItems(cid), table.concat(wants, ","), self:_feedDump(cid)))
+  end
+  -- per-item flow forensics: lifetime authorized vs delivered, and where overflow handling put the
+  -- rest (recovered to a destination / rerouted to a buffer / sunk / stuck-held). auth-deliv with
+  -- all four ~0 = the item is parked ON BELTS somewhere (a dam — look for a STUCK item upstream).
+  local items = {}
+  for k in pairs(Router._auth or {}) do local it = k:match("^item:(.+)$"); if it then items[it] = true end end
+  for it in pairs(Router._flowBy) do items[it] = true end
+  for item in pairs(items) do
+    local f = Router._flowBy[item] or {}
+    local deliv = 0
+    for k, v in pairs(Router._deliv or {}) do if k:sub(-#item - 1) == "|" .. item then deliv = deliv + v end end
+    computer.log(1, ("[Foreman] dbg flow '%s' auth=%d deliv=%d rec=%d rer=%d sunk=%d stuck=%d")
+      :format(item, (Router._auth and Router._auth["item:" .. item]) or 0, deliv,
+        f.rec or 0, f.rer or 0, f.sunk or 0, f.stuck or 0))
   end
 end
 

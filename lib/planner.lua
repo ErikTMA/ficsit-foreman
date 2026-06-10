@@ -359,14 +359,19 @@ function Planner:_orderIngredients(opt, crafts, cid, cumNum, cumDen, depth)
   local ports = self:_assignPorts(cid, opt)           -- ingredientName -> toInput (nil for single-input machines)
   -- ATOMIC: if any ingredient fails partway, un-claim the constructors EARLIER ingredients' recursive
   -- produce() already claimed (else they leak busy + a setRecipe, re-churning every epoch). The
-  -- caller truncates the orders; this releases the machines.
-  local function fail() for _, c in ipairs(sub) do self.busy[c] = nil end; return false end
+  -- caller truncates the orders; this releases the machines. Record WHICH ingredient failed — the
+  -- infeasibility yield uses it to decide whether freeing this machine could even help.
+  local function fail(ingName)
+    self._lastFailIng = ingName
+    for _, c in ipairs(sub) do self.busy[c] = nil end
+    return false
+  end
   for _, ing in ipairs(opt.ingredients) do
     local qty = crafts * ing.amount
     local rNum, rDen = cumNum * ing.amount, cumDen * out   -- this ingredient per terminal product
     local port = ports and ports[ing.name]                 -- assigned input port (nil = route normally)
     if self.sources[ing.name] then
-      if not self:orderFrom(ing.name, qty, cid, rNum, rDen, port) then return fail() end
+      if not self:orderFrom(ing.name, qty, cid, rNum, rDen, port) then return fail(ing.name) end
     elseif self.bufferOf[ing.name] then
       -- draw across ALL of the item's hubs, stock-first. A draw pinned to one hub (the old
       -- single bufferOf) strands stock in its siblings — live: RIP's screws order drew on the
@@ -401,12 +406,12 @@ function Planner:_orderIngredients(opt, crafts, cid, cumNum, cumDen, depth)
           end
         end
       end
-      if not placedAny then return fail() end                        -- no viable/reachable hub at all
+      if not placedAny then return fail(ing.name) end               -- no viable/reachable hub at all
     else
       local src, sc = self:produce(ing.name, qty, (depth or 0) + 1, rNum, rDen)
-      if not src then return fail() end
+      if not src then return fail(ing.name) end
       for _, c in ipairs(sc or {}) do sub[#sub + 1] = c end   -- record claims BEFORE the order so fail() releases them
-      if not self.router:order(ing.name, qty, cid, src, port) then return fail() end
+      if not self.router:order(ing.name, qty, cid, src, port) then return fail(ing.name) end
       local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
     end
   end
@@ -635,8 +640,27 @@ function Planner:assign()
       -- out ONE assignment round so the ingredient wins a machine; it re-enters next epoch and,
       -- once feasible, out-ranks the (staged) ingredient again. With one machine this ping-pongs
       -- ingredient/consumer in stageDepth-sized batches; with N machines they split stably.
+      -- ONLY IF IT CAN HELP: yielding frees THIS item's machines — that primes the dry ingredient
+      -- only if one of those machines can actually PRODUCE it. When the blocker needs a machine
+      -- class this item doesn't hold (live: RIP on an assembler starving for screws, which need a
+      -- CONSTRUCTOR), the yield just swaps two equally-starved siblings forever (RIP<->Rotor),
+      -- orphaning each other's in-transit ingredients every dwell window. Unknown blocker (no
+      -- ingredient recorded) keeps the original always-yield behavior.
       if (Planner._infeas[it] or 0) >= 2 then
         Planner._infeas[it] = 0
+        local ing = Planner._infeasIng[it]
+        local helpful = ing == nil
+        if ing and self.recipesByProduct[ing] then
+          for cid, a in pairs(Planner._assign) do
+            if a.item == it then
+              for _, o2 in ipairs(self.recipesByProduct[ing]) do
+                if o2.ctorId == cid then helpful = true; break end
+              end
+              if helpful then break end
+            end
+          end
+        end
+        if not helpful then pool[it] = n end   -- keep the assignment; freeing the machine gains nothing
       else
         pool[it] = n
       end
@@ -806,6 +830,7 @@ end
 -- user clearing a blockage by hand must not be reverted seconds later. setRecipe is safe here:
 -- the input is empty by construction (starved), so nothing is ejected.
 Planner._infeas     = Planner._infeas or {}       -- item -> consecutive epochs every produceFor failed (assign yields at 2)
+Planner._infeasIng  = Planner._infeasIng or {}    -- item -> the ingredient that blocked it (yield-helpfulness check)
 Planner._drain      = Planner._drain or {}        -- cid -> { recipe = name, idle = n }
 Planner._starve     = Planner._starve or {}       -- cid -> consecutive starved epochs while on the assigned recipe
 Planner._drainTried = Planner._drainTried or {}   -- cid -> last drain recipe name (round-robin cursor)
@@ -948,6 +973,7 @@ end
 -- Lossless: if the live recipe ≠ assigned, switch only when canSwitch, else DRAIN (route the
 -- current recipe's finishing output, no new feed). Atomic rollback on any ingredient failure.
 function Planner:produceFor(cid, item, share, dst)
+  self._lastFailIng = nil       -- per-attempt: only a real ingredient failure below sets it
   -- use the EXACT recipe assign() chose (stored on _assign) — not a re-pick by first-opt, which can
   -- disagree with the demand/hub-draw layers and set an infeasible alternate when one machine knows
   -- several recipes for the same product.
@@ -1112,8 +1138,11 @@ function Planner:fillAll()
     -- INFEASIBILITY tracking: an assigned item whose every produceFor failed (e.g. its hub-drawn
     -- ingredient is empty and nothing fills it because THIS item holds the machines) must
     -- eventually YIELD its machines so the ingredient can be primed — see assign().
-    if produced then Planner._infeas[item] = nil
-    else Planner._infeas[item] = (Planner._infeas[item] or 0) + 1 end
+    if produced then Planner._infeas[item] = nil; Planner._infeasIng[item] = nil
+    else
+      Planner._infeas[item] = (Planner._infeas[item] or 0) + 1
+      Planner._infeasIng[item] = self._lastFailIng           -- which ingredient blocked it (yield helpfulness)
+    end
   end
   local servedCid = {}
   for _, cids in pairs(self.served or {}) do for _, cid in ipairs(cids) do servedCid[cid] = true end end
