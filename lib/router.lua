@@ -283,8 +283,15 @@ end
 function Router:_machineAccepts(to, item)
   if not self.isMachine[to] then return true end
   local c = self.consumes[to]
-  if not c or not next(c) then return true end
-  return c[item] == true
+  if c and next(c) then return c[item] == true end
+  -- NO orders to this machine this epoch. Accepting anything here (the old default) let
+  -- overflow/merger pushes land foreign items on the legs of just-unassigned or DRAINING
+  -- machines — the wrong-items-to-constructors jam. Consult the planner-published allowance
+  -- instead: assigned recipe's ingredients pass, an unassigned/draining machine admits NOTHING
+  -- new. Only a machine the planner has never described (pre-plan grace) stays permissive.
+  local allow = self.machineAllow and self.machineAllow[to]
+  if allow then return allow[item] == true end
+  return true
 end
 
 -- May `item` ride `belt` into belt.to? Adds PORT EXCLUSIVITY on top of _machineAccepts: a machine
@@ -1054,6 +1061,15 @@ Router.flowWindow = Router.flowWindow or 50   -- max in-flight ingredient units 
 -- a consumer that delivers >= progressFloor units per gate is healthy and never throttled. Tunable.
 Router.inflightFloor = Router.inflightFloor or 32
 Router.progressFloor = Router.progressFloor or 8
+-- IN-FLIGHT AMNESTY: items that physically DIE in transit (sunk by overflow, eaten by a drain's
+-- temp recipe) never credit _deliv, so the stall clamp sees them as forever-in-flight and holds the
+-- gate shut PERMANENTLY — the live copper gate frozen at auth=82 ub=0 while its consumer starved.
+-- After stallForgive consecutive progress-less gates with nothing left to claw (ub == 0), declare
+-- the outstanding in-flight dead and settle the ledger (auth := delivered), letting the gate
+-- re-grant. A true persistent jam then leaks at most ~flowWindow per stallForgive gates (bounded
+-- trickle) instead of starving its consumer forever.
+Router._stallGates  = Router._stallGates or {}    -- item -> consecutive stalled-with-ub-0 gates
+Router.stallForgive = Router.stallForgive or 5
 -- machine entrances whose feed leg is physically FULL (transferItem failed): set by _routeAtSplitter /
 -- _mergerPush, cleared when a push succeeds. Module-durable (router instances are rebuilt per epoch);
 -- the planner's FEED-DRAIN reads it to detect a foreign item stranded at a starved machine's entrance.
@@ -1161,7 +1177,6 @@ function Router:gateSources()
         end
         Router._auth[k] = seed
       end
-      local add = cap - Router._auth[k]
       -- STALL BACK-PRESSURE: in-flight = released - delivered. If a lot of this item is in flight but
       -- almost nothing reached a consumer this window, the consumer is blocked (its OUTPUT is jammed)
       -- and the surplus is flooding the shared manifold — the overflow then reroutes it through other
@@ -1173,14 +1188,48 @@ function Router:gateSources()
       for _, cid in ipairs(cids) do delivered = delivered + (Router._deliv[tostring(cid) .. "|" .. item] or 0) end
       local prev = Router._delivPrev[item]
       Router._delivPrev[item] = delivered
-      local inflight = Router._auth[k] - delivered
+      -- _auth counts GRANTED budget. Granted-but-unreleased budget (ub, still in the connectors) on
+      -- a STOCKED source WILL release, so it counts as flood exposure — but the slice of ub that
+      -- exceeds the source's physical stock is INERT (nothing there to release). Without excluding
+      -- it, an EMPTY hub-source (first window granted, nothing to release, delivered 0) reads as
+      -- "stalled with 50 in flight" and gets clamped to the floor forever — the live RIP/rotor
+      -- feeders frozen at auth=32 ub=32 with zero items on any belt.
+      local ub, stock = 0, 0
+      for _, outs in pairs(conns) do
+        for _, conn in ipairs(outs) do
+          local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end); ub = ub + cur
+        end
+      end
+      for _, cid in ipairs(cids) do
+        local p = self.getProxy(cid)
+        pcall(function() for _, inv in ipairs(p:getInventories()) do stock = stock + (inv.itemCount or 0) end end)
+      end
+      local inflight = Router._auth[k] - delivered - math.max(0, ub - stock)
       -- throttle ONLY with a valid prior baseline: prev exists AND didn't decrease (a decrease means
       -- the _deliv ledger was reset by a session restart, so this epoch's progress is unmeasurable — a
       -- fresh session must release its seeded budget, not get clawed on a phantom stall).
       -- `>=` (not `>`): at exactly the floor the clamp yields add<=0, HOLDING release while still
       -- stalled. With `>` the floor itself escapes the clamp and the gate re-grants the full cap,
       -- oscillating claw->flood->claw every other epoch (seen live: ingot auth 32 -> 100 -> 32).
-      if not justSeeded and prev and delivered >= prev and inflight >= Router.inflightFloor and (delivered - prev) < Router.progressFloor then
+      local stalled = not justSeeded and prev and delivered >= prev
+        and inflight >= Router.inflightFloor and (delivered - prev) < Router.progressFloor
+      if stalled and ub <= 0 then
+        -- nothing left to claw back and still no progress: the outstanding in-flight is presumed
+        -- DEAD (sunk / drain-eaten — it can never credit _deliv). After stallForgive such gates,
+        -- settle the ledger so the gate can re-grant; see IN-FLIGHT AMNESTY above.
+        Router._stallGates[item] = (Router._stallGates[item] or 0) + 1
+        if Router._stallGates[item] >= Router.stallForgive then
+          pcall(function() computer.log(1, ("[Foreman] SETTLE: '%s' wrote off %d in-flight units (sunk or drain-eaten; gate re-opens)")
+            :format(tostring(item), inflight)) end)
+          Router._auth[k] = delivered
+          Router._stallGates[item] = 0
+          inflight, stalled = 0, false
+        end
+      else
+        Router._stallGates[item] = 0
+      end
+      local add = cap - Router._auth[k]
+      if stalled then
         add = math.min(add, Router.inflightFloor - inflight)   -- <=0 while stalled: claw down to / hold at the floor
       end
       if add > 0 then

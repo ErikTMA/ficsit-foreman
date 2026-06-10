@@ -41,6 +41,7 @@ function Planner.new(topology, router, getProxy, epochSeconds)
   local self = setmetatable({}, Planner)
   self.topo = topology
   self.router = router
+  self.epochSeconds = epochSeconds   -- replan cadence; sizes _machineCap (was silently dropped -> 2s fallback always)
   self.getProxy = getProxy or function(id) return component.proxy(id) end
   self.recipesByProduct = {}     -- itemName -> list of recipe options
   self.busy = {}                 -- ctorId -> true once assigned this planning pass
@@ -58,9 +59,14 @@ function Planner.new(topology, router, getProxy, epochSeconds)
   -- hub is DRAWN from the hub (e.g. cable takes wire from the wire buffer) instead of
   -- crafting a second parallel stream; the hub is kept full by its own fill order.
   self.bufferOf = {}
+  self.buffersOf = {}            -- itemName -> ALL of its buffer containers (ingredient draws span them)
   for _, c in ipairs(topology.containers or {}) do
     local di = Planner.destItem(c)
     if di and not self.bufferOf[di] then self.bufferOf[di] = c.id end
+    if di then
+      self.buffersOf[di] = self.buffersOf[di] or {}
+      table.insert(self.buffersOf[di], c.id)
+    end
   end
   return self
 end
@@ -192,7 +198,10 @@ function Planner:producible(item, depth, seen)
   -- an item already sitting in a HUB buffer is available up to its on-hand (e.g. mined/
   -- imported straight into the buffer, or wire whose only supply is the hub) — so a consumer
   -- isn't judged un-producible just because its feedstock lives in a buffer rather than raw.
-  local hubStock = (self.bufferOf and self.bufferOf[item]) and count_in(self.getProxy(self.bufferOf[item]), item) or 0
+  local hubStock = 0
+  for _, h in ipairs((self.buffersOf and self.buffersOf[item]) or {}) do
+    hubStock = hubStock + count_in(self.getProxy(h), item)   -- ALL hubs: stock in a sibling buffer is real supply
+  end
   if depth > 8 or seen[item] then return hubStock end
   local cands = self.recipesByProduct[item]
   if not cands then self._prodMemo[item] = hubStock; return hubStock end
@@ -359,11 +368,40 @@ function Planner:_orderIngredients(opt, crafts, cid, cumNum, cumDen, depth)
     if self.sources[ing.name] then
       if not self:orderFrom(ing.name, qty, cid, rNum, rDen, port) then return fail() end
     elseif self.bufferOf[ing.name] then
-      local hub = self.bufferOf[ing.name]
-      if not self:_hubViable(ing.name, hub) then return fail() end   -- never draw from a DEAD hub
-      if not self.router:order(ing.name, qty, cid, hub, port) then return fail() end
-      local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
-      self.router.sourceItem[hub] = lc(ing.name)
+      -- draw across ALL of the item's hubs, stock-first. A draw pinned to one hub (the old
+      -- single bufferOf) strands stock in its siblings — live: RIP's screws order drew on the
+      -- near-empty screws buffer while 101 screws sat in the second one, making RIP permanently
+      -- "infeasible" and fueling the assignment flap. Each hub is viability-guarded and path-
+      -- checked (order() fails without a belt route to this machine/port); residual demand pins
+      -- to the first viable hub so the gate still authorizes refill flow within the epoch.
+      local hubs = {}
+      for _, h in ipairs(self.buffersOf[ing.name] or { self.bufferOf[ing.name] }) do
+        hubs[#hubs + 1] = { id = h, stock = count_in(self.getProxy(h), ing.name) }
+      end
+      table.sort(hubs, function(x, y)
+        if x.stock ~= y.stock then return x.stock > y.stock end
+        return tostring(x.id) < tostring(y.id)
+      end)
+      local remaining, placedAny = qty, false
+      for _, h in ipairs(hubs) do
+        if remaining <= 0 then break end
+        if h.stock > 0 and self:_hubViable(ing.name, h.id)
+           and self.router:order(ing.name, math.min(remaining, h.stock), cid, h.id, port) then
+          local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
+          self.router.sourceItem[h.id] = lc(ing.name)
+          remaining = remaining - math.min(remaining, h.stock); placedAny = true
+        end
+      end
+      if remaining > 0 then
+        for _, h in ipairs(hubs) do
+          if self:_hubViable(ing.name, h.id) and self.router:order(ing.name, remaining, cid, h.id, port) then
+            local o = self.router.orders[#self.router.orders]; o.ratioNum = rNum; o.ratioDen = rDen
+            self.router.sourceItem[h.id] = lc(ing.name)
+            remaining = 0; placedAny = true; break
+          end
+        end
+      end
+      if not placedAny then return fail() end                        -- no viable/reachable hub at all
     else
       local src, sc = self:produce(ing.name, qty, (depth or 0) + 1, rNum, rDen)
       if not src then return fail() end
@@ -391,7 +429,10 @@ function Planner:produce(item, need, depth, cumNum, cumDen)
   local claimed = { pick.opt.ctorId }
   self.busy[pick.opt.ctorId] = true
   local okc, cur = pcall(function() return pick.opt.ctor:getRecipe() end)
-  if (okc and cur and cur.name) ~= pick.opt.recipe.name then pick.opt.ctor:setRecipe(pick.opt.recipe) end
+  if (okc and cur and cur.name) ~= pick.opt.recipe.name then
+    pick.opt.ctor:setRecipe(pick.opt.recipe)
+    Planner._tempRecipe[pick.opt.ctorId] = nil   -- real recipe set: clear any stale drain temp mark
+  end
   local ok, sub = self:_orderIngredients(pick.opt, pick.crafts, pick.opt.ctorId, cumNum, cumDen, depth)
   if not ok then
     self.router:_truncateOrders(startN)
@@ -610,17 +651,49 @@ function Planner:assign()
   -- SEED from machines' LIVE recipes (untracked ones) so a running recipe is respected — but stamp
   -- `since` back by MIN_DWELL so a seeded machine is IMMEDIATELY re-rankable: a tiny-need live recipe
   -- must not monopolize a machine for MIN_DWELL epochs while the top-need item starves.
+  -- NEVER seed a machine that is mid-DRAIN or still wearing a drain's temp recipe: adopting the
+  -- temp recipe as a real assignment turns the drain into a FUNDED competing consumer (orders,
+  -- quota, gate budget) that vacuums other machines' in-transit feedstock off a shared chain —
+  -- the live 222D68/B13DC6 temp 'Copper Sheet' eating C5504C's copper ingots. A MANUAL recipe
+  -- change (live ~= recorded temp) still seeds normally.
   for _, cid in ipairs(self.topo.constructors or {}) do
-    if not Planner._assign[cid] then
+    if not Planner._assign[cid] and not Planner._drain[cid] then
       local okc, rec = pcall(function() return self.getProxy(cid):getRecipe() end)
       local it = okc and rec and rec.name and self.itemOfRecipe[tostring(rec.name)]
-      if it and pool[it] and cap[cid] and cap[cid][it] then
+      if it and pool[it] and cap[cid] and cap[cid][it]
+         and Planner._tempRecipe[cid] ~= tostring(rec.name) then
         Planner._assign[cid] = { recipe = cap[cid][it].recipe.name, item = it, opt = cap[cid][it], since = Planner._epoch - MIN_DWELL }
       end
     end
   end
   local function servedN(it) local n = 0; for _, a in pairs(Planner._assign) do if a.item == it then n = n + 1 end end; return n end
-  for cid, a in pairs(Planner._assign) do if not pool[a.item] then Planner._assign[cid] = nil end end   -- drop satisfied
+  -- DROP an assignment whose item left the pool — but never hysteresis-free unless GENUINELY
+  -- satisfied. Pool exits are frequent and FLICKERY (the infeasibility yield removes an item for
+  -- one round; the producible demand cap drops it whenever feasibility flickers), and an instant
+  -- drop hands the machine to a rival in the SAME assign() call: the rival's setRecipe ejects the
+  -- hoarded input and every in-flight item ordered for the old recipe is orphaned on the belts to
+  -- sink — the live Rotor<->RIP / SAM<->Cable flap. need[] cannot tell satisfied from flicker
+  -- (both leave it empty), so test the buffers directly: every targeted buffer at target = done,
+  -- release the machine NOW (a finished job must not squat); anything else waits out MIN_DWELL
+  -- (the pacing the de-serve path already applies). Never tear down a machine mid-DRAIN — the
+  -- seed-skip above relies on _drain/_tempRecipe, and an unassigned drained machine would have
+  -- nothing to restore to. The infeasibility yield still works: the item leaves the RANKING
+  -- immediately; its machine is merely handed over at dwell pace.
+  local function satisfied(it)
+    for _, c in ipairs(self.topo.containers or {}) do
+      if Planner.destItem(c) == it and not self.sources[it] then
+        local target = c.target or Planner.destTarget(c)
+        if target and target - count_in(self.getProxy(c.id), it) > 0 then return false end
+      end
+    end
+    return true
+  end
+  for cid, a in pairs(Planner._assign) do
+    if not pool[a.item] and not Planner._drain[cid]
+       and (satisfied(a.item) or (Planner._epoch - (a.since or 0)) >= MIN_DWELL) then
+      Planner._assign[cid] = nil
+    end
+  end
   -- de-serve out-ranked machines (margin + dwell), spreading freed machines across DISTINCT unserved
   -- items (pendingServe) so one top item doesn't free EVERY out-ranked machine (avoidable thrash).
   local pendingServe = {}
@@ -632,7 +705,12 @@ function Planner:assign()
     end
   end
   local free = {}
-  for _, cid in ipairs(self.topo.constructors or {}) do if not Planner._assign[cid] then free[cid] = true end end
+  -- a DRAINING machine is out of the rotation entirely: granting it a pool item would fund
+  -- production on top of (or right after) its temp recipe — the same diversion the seed-skip
+  -- blocks. _jamSweep keeps servicing it; it re-enters the pool once the drain completes.
+  for _, cid in ipairs(self.topo.constructors or {}) do
+    if not Planner._assign[cid] and not Planner._drain[cid] then free[cid] = true end
+  end
   local ranked = {}
   for it in pairs(pool) do ranked[#ranked + 1] = it end
   table.sort(ranked, function(a, b) if pool[a] ~= pool[b] then return pool[a] > pool[b] end return tostring(a) < tostring(b) end)
@@ -661,6 +739,19 @@ function Planner:assign()
     self.busy[cid] = true
     if a.opt then for _, ing in ipairs(a.opt.ingredients) do self.consumedSet[ing.name] = true end end
   end
+  -- PUBLISH per-machine acceptance for the router: with no orders yet, _machineAccepts used to wave
+  -- ANY item into a machine — assignment gaps and drain holds (both order-less) routinely let
+  -- overflow/merger pushes land foreign items on machine legs (the wrong-items-to-constructors).
+  -- An assigned machine accepts its recipe's ingredients; an unassigned/draining one accepts
+  -- NOTHING new (its lane is cleared by the drain, not refilled). Machines unknown to the planner
+  -- stay permissive in the router (pre-plan grace).
+  local allow = {}
+  for _, cid in ipairs(self.topo.constructors or {}) do
+    allow[cid] = {}
+    local a = Planner._assign[cid]
+    if a and a.opt then for _, ing in ipairs(a.opt.ingredients) do allow[cid][ing.name] = true end end
+  end
+  self.router.machineAllow = allow
 end
 
 -- total hub-fill amount for an item (Σ its needing buffers' need, incl. hub draw).
@@ -718,6 +809,7 @@ Planner._infeas     = Planner._infeas or {}       -- item -> consecutive epochs 
 Planner._drain      = Planner._drain or {}        -- cid -> { recipe = name, idle = n }
 Planner._starve     = Planner._starve or {}       -- cid -> consecutive starved epochs while on the assigned recipe
 Planner._drainTried = Planner._drainTried or {}   -- cid -> last drain recipe name (round-robin cursor)
+Planner._tempRecipe = Planner._tempRecipe or {}   -- cid -> drain temp recipe name; blocks assign() seed-adoption until a real switch overwrites it
 Planner.drainAfter  = Planner.drainAfter or 3     -- starved+jammed epochs before a drain switch
 Planner.drainIdle   = Planner.drainIdle or 3      -- drain epochs with no pull before restoring
 
@@ -840,6 +932,7 @@ function Planner:_jamSweep(servedCid)
               pcall(function() opt.ctor:setRecipe(cand.recipe) end)   -- partial leftovers eject to OUTPUT (routed) — user rule: losing a sub-craft remnant beats a clogged lane
               Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
               Planner._drainTried[cid] = tostring(cand.recipe.name)
+              Planner._tempRecipe[cid] = tostring(cand.recipe.name)   -- never seed-adopted as a real assignment
               st.n = 0
               pcall(function() computer.log(1, ("[Foreman] DRAIN %s (idle): lane jammed; temp recipe '%s' pulls the blockage")
                 :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name))) end)
@@ -920,6 +1013,7 @@ function Planner:produceFor(cid, item, share, dst)
         pcall(function() opt.ctor:setRecipe(cand.recipe) end)   -- leftovers (if any) eject to OUTPUT and are routed
         Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
         Planner._drainTried[cid] = tostring(cand.recipe.name)
+        Planner._tempRecipe[cid] = tostring(cand.recipe.name)   -- never seed-adopted as a real assignment
         st.n = 0
         pcall(function() computer.log(1, ("[Foreman] DRAIN %s: entrance jammed while frozen; temp recipe '%s' pulls the blockage (assigned '%s')")
           :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name), tostring(opt.recipe.name))) end)
@@ -959,7 +1053,10 @@ function Planner:produceFor(cid, item, share, dst)
   -- setRecipe ONLY after the ingredients are orderable: switching first churned the (expensive,
   -- input-ejecting) setRecipe every epoch on an infeasible assignment — the live Solid Biofuel /
   -- Reanimated SAM flip-flop on one constructor, retrying a job whose ingredient doesn't exist.
-  if needSwitch then pcall(function() opt.ctor:setRecipe(opt.recipe) end) end
+  if needSwitch then
+    pcall(function() opt.ctor:setRecipe(opt.recipe) end)
+    Planner._tempRecipe[cid] = nil          -- real assignment switch: the drain's temp recipe is history
+  end
   for _, c in ipairs(sub or {}) do claimed[#claimed + 1] = c end
   if self.router:order(item, share, dst, cid) then
     local terminal = self.router.orders[#self.router.orders]
