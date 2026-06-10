@@ -282,13 +282,19 @@ end
 -- guard (avoid a false block before the plan reaches it).
 function Router:_machineAccepts(to, item)
   if not self.isMachine[to] then return true end
+  -- LIVE-RECIPE GATE (the user's rule: a machine leg only ever receives what the machine will
+  -- pull RIGHT NOW). Orders are not enough — assignments move faster than items transit, and an
+  -- item on the leg of a machine whose recipe changed is DEAD (won't be pulled; jams the lane;
+  -- costs a feed-drain + setRecipe churn). Better to refuse here and let the item wait UPSTREAM
+  -- at the splitter, where it can still be re-routed the moment a path opens. machineLive is
+  -- published by the planner at the end of every fillAll (EMPTY for draining machines); a
+  -- machine it has never described stays permissive (pre-plan grace).
+  local live = self.machineLive and self.machineLive[to]
+  if live and not live[item] then return false end
   local c = self.consumes[to]
   if c and next(c) then return c[item] == true end
-  -- NO orders to this machine this epoch. Accepting anything here (the old default) let
-  -- overflow/merger pushes land foreign items on the legs of just-unassigned or DRAINING
-  -- machines — the wrong-items-to-constructors jam. Consult the planner-published allowance
-  -- instead: assigned recipe's ingredients pass, an unassigned/draining machine admits NOTHING
-  -- new. Only a machine the planner has never described (pre-plan grace) stays permissive.
+  -- NO orders to this machine this epoch: consult the planner-published allowance — assigned
+  -- recipe's ingredients pass, an unassigned/draining machine admits NOTHING new.
   local allow = self.machineAllow and self.machineAllow[to]
   if allow then return allow[item] == true end
   return true
@@ -635,11 +641,25 @@ function Router:buildQuota()
   local left = {}                                   -- "dst|item" -> room remaining to allocate this pass
   for _, o in ipairs(self.orders) do
     local key = tostring(o.dst) .. "|" .. o.item
-    if left[key] == nil then left[key] = self:_orderRoom(o) end
-    local contrib = math.min(o.count - o.delivered, left[key])
-    if contrib > 0 then
-      left[key] = left[key] - contrib               -- SHARE one consumer's room across all its orders
-      if o.path then for _, b in ipairs(o.path) do b._q[o.item] = (b._q[o.item] or 0) + contrib end end
+    -- Room is SHARED across a key's orders only when it is a property of the DESTINATION (a
+    -- buffer's capacity, a multi-ingredient machine's balanced room). The single-input-machine
+    -- fallback in _orderRoom is per-ORDER (its own remaining) — seeding the shared pool from the
+    -- FIRST order for the key let one stale fully-delivered order zero the pool and starve every
+    -- later order's quota (legs read q=nil and everything fell to overflow, which used to mask
+    -- it by recovering items straight into the machines).
+    local cons = self.isMachine[o.dst] and self.consumes[o.dst]
+    local nIng = 0; if cons then for _ in pairs(cons) do nIng = nIng + 1 end end
+    local shared = self.capacity[o.dst] ~= nil or nIng >= 2
+    local contrib
+    if shared then
+      if left[key] == nil then left[key] = self:_orderRoom(o) end
+      contrib = math.min(o.count - o.delivered, left[key])
+      if contrib > 0 then left[key] = left[key] - contrib end
+    else
+      contrib = o.count - o.delivered
+    end
+    if contrib > 0 and o.path then
+      for _, b in ipairs(o.path) do b._q[o.item] = (b._q[o.item] or 0) + contrib end
     end
   end
 end
@@ -680,48 +700,47 @@ function Router:_credit(belt, item)
 end
 
 -- Fallback for an item with NO remaining quota leg at this node (its quota is spent, or it is
--- overflow/unmanaged). NEVER-HOLD policy (user rule: "reroute overflow — to a buffer, or if that's
--- full, to the sink"): a held item blocks the belt behind it (head-of-line — the abundant ingredient
--- stalls the shared splitter and starves the scarce one). So we always CLEAR the item off this node:
---   1. DELIVER to an active order's destination (most-behind first) if a hop accepts it — the ideal;
+-- overflow/unmanaged). HOLD-OVER-MISDELIVER policy (user rule: "it's better to block at the
+-- splitter than block towards the constructors"):
+--   1. DELIVER to an active order's BUFFER destination — never to a machine: an overflow push
+--      down a machine leg becomes a dead foreign item the moment the assignment moves (the
+--      copper-ingot chain gridlock: rec=229 ingots recovered into constructor legs, every feeder
+--      jammed, drains thrashing setRecipe). Machine legs are fed ONLY by planned quota legs,
+--      which _beltAccepts live-recipe-gates.
 --   2. else REROUTE to a buffer for the item that has room (preserve it in storage, off the belt);
---   3. else SINK it (over-supply / no room anywhere) — clears the belt so others pass;
---   4. only if there is NO sink at all do we HOLD (can't drop it into nowhere) or panic (unknown item).
--- Each step tries a DIFFERENT output leg, so a full destination leg is bypassed via the buffer/sink
--- leg instead of stalling. `fromOutput` is the transferItem arg for the hop out of this node.
+--   3. else if the item has NO active demand anywhere: SINK it (true over-supply — clears the lane);
+--   4. else HOLD at this node — a demanded item is never wasted into the sink; it waits HERE,
+--      where the level-triggered retry can re-route it the moment its consumer is live again.
+--      Holding can back the lane up to the source — that is the point: physical back-pressure
+--      stops the gate from pouring more of it into a jammed chain.
+-- `fromOutput` is the transferItem arg for the hop out of this node.
 function Router:_overflow(sender, id, item)
   local active = {}
   for _, o in ipairs(self.ordersForItem[item] or {}) do
     if o.delivered < o.count then active[#active + 1] = o end
   end
-  -- 1. DELIVER to an active destination (re-pathfind from HERE, most-behind first). If the hop is
-  -- full/unreachable, DON'T hold — fall through to the buffer/sink so the belt keeps moving.
+  -- 1. DELIVER to an active BUFFER destination (re-pathfind from HERE, most-behind first).
   table.sort(active, function(a, b) return (a.count - a.delivered) > (b.count - b.delivered) end)
   for _, o in ipairs(active) do
-    local terminal = not self.bufferItem[o.dst]
-    -- ADMISSION CONTROL on machine destinations: a machine is NOT "always accepts" — recovery
-    -- deliveries beyond the balanced/ordered room stuffed inputs to the stack cap (plate 200) and
-    -- froze the shared feeder lane (everything behind the unpullable surplus stopped). On a shared
-    -- transit chain the only safe invariant is: every item pushed somewhere WILL be absorbed — so
-    -- overflow honors the same room bound the quota legs already use.
-    local roomOK = true
-    if self.isMachine[o.dst] then roomOK = self:_orderRoom(o) > 0 end
-    if roomOK and (terminal or self:hasRoom(o.dst, item)) then
-      local belt = self:firstHopTo(id, o.dst)
-      -- _beltAccepts: the recovery hop must honor PORT PINS — re-pathfinding "any way to the
-      -- machine" used to land iron plate on the SCREWS port's belt, where the machine (plate slot
-      -- full) never pulls it and the port is dead forever. A dedicated port takes its item ONLY.
-      if belt and self:_beltAccepts(belt, item) and sender:transferItem(belt.fromOutput or 0) then
-        -- credit delivery + (on the DIRECT hop into a buffer dst) the room cache, so a chain of recovery
-        -- deliveries to the same buffer caps at capacity instead of flooding past the stale cached count.
-        if belt.to == o.dst then
-          self:_credit(belt, item)
-          if self.bufferItem[o.dst] then self:_creditRoom(o.dst, item) end
+    if not self.isMachine[o.dst] then
+      local terminal = not self.bufferItem[o.dst]
+      if terminal or self:hasRoom(o.dst, item) then
+        local belt = self:firstHopTo(id, o.dst)
+        -- _beltAccepts: the recovery hop must honor PORT PINS — re-pathfinding "any way" used to
+        -- land iron plate on the SCREWS port's belt. A dedicated port takes its item ONLY.
+        if belt and self:_beltAccepts(belt, item) and sender:transferItem(belt.fromOutput or 0) then
+          -- credit delivery + (on the DIRECT hop into a buffer dst) the room cache, so a chain of
+          -- recovery deliveries to the same buffer caps at capacity instead of flooding past the
+          -- stale cached count.
+          if belt.to == o.dst then
+            self:_credit(belt, item)
+            if self.bufferItem[o.dst] then self:_creditRoom(o.dst, item) end
+          end
+          Router._flowBy[item] = Router._flowBy[item] or {}
+          Router._flowBy[item].rec = (Router._flowBy[item].rec or 0) + 1
+          Router._dlog(("RECOVER %s '%s' >out[%d] %s ->%s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(belt.to):sub(1,6), tostring(o.dst):sub(1,6)))
+          return true
         end
-        Router._flowBy[item] = Router._flowBy[item] or {}
-        Router._flowBy[item].rec = (Router._flowBy[item].rec or 0) + 1
-        Router._dlog(("RECOVER %s '%s' >out[%d] %s ->%s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(belt.to):sub(1,6), tostring(o.dst):sub(1,6)))
-        return true
       end
     end
   end
@@ -742,39 +761,41 @@ function Router:_overflow(sender, id, item)
       end
     end
   end
-  -- 3. SINK: buffers full / no buffer — clear the belt rather than HOLD (head-of-line). Try EVERY
-  -- DEFAULT_OUT (a factory can have several): the first sink may be unreachable from this node while
-  -- another is reachable, especially on a looped manifold — so iterate, don't give up after defaults[1].
-  for _, sink in ipairs(self.defaults or {}) do
-    local belt = self:firstHopTo(id, sink)
-    if belt and sender:transferItem(belt.fromOutput or 0) then
-      Router._nSunk = (Router._nSunk or 0) + 1            -- always-counted; the perf line reports the rate
-      Router._flowBy[item] = Router._flowBy[item] or {}
-      Router._flowBy[item].sunk = (Router._flowBy[item].sunk or 0) + 1
-      if Router.DEBUG and #active > 0 and computer and computer.log then
-        Router._sinkLog = (Router._sinkLog or 0)
-        if Router._sinkLog < 16 then
-          Router._sinkLog = Router._sinkLog + 1
-          computer.log(2, ("[Foreman] SINK: '%s' overflow at %s — no room at its destination/buffer")
-            :format(item, tostring(id)))
-        end
+  -- 3. SINK — but NEVER an item a MACHINE is waiting for: sinking a live consumer's feedstock is
+  -- wasted resources (the live 424 sunk copper ingots while the copper sheet machines starved).
+  -- Buffer-fill surplus with every buffer full IS sinkable — that is genuine over-supply and the
+  -- lane must clear. Try EVERY DEFAULT_OUT: the first sink may be unreachable from this node
+  -- while another is reachable on a looped manifold.
+  local machineDemand = false
+  for _, o in ipairs(active) do if self.isMachine[o.dst] then machineDemand = true; break end end
+  if not machineDemand then
+    for _, sink in ipairs(self.defaults or {}) do
+      local belt = self:firstHopTo(id, sink)
+      if belt and sender:transferItem(belt.fromOutput or 0) then
+        Router._nSunk = (Router._nSunk or 0) + 1          -- always-counted; the perf line reports the rate
+        Router._flowBy[item] = Router._flowBy[item] or {}
+        Router._flowBy[item].sunk = (Router._flowBy[item].sunk or 0) + 1
+        Router._dlog(("SINK %s '%s' (overflow, no machine demand)"):format(tostring(id):sub(1,6), item))
+        return true
       end
-      Router._dlog(("SINK %s '%s' (overflow, no room)"):format(tostring(id):sub(1,6), item))
-      return true
     end
   end
-  -- 4. LAST RESORT — nowhere reachable from here (no destination, no buffer with room, no sink path).
-  -- HOLD the item and warn (capped). NEVER panic: crashing computer.panic kills the WHOLE controller
-  -- over a single stray item — far worse than one item waiting on a belt. The held item resumes the
-  -- instant a path opens (a buffer drains, a sink is wired, a belt is repaired) with no restart.
+  -- 4. HOLD at this node (user rule: block at the SPLITTER, never toward a constructor). An item
+  -- a machine is waiting for waits HERE — the level-triggered retry resumes it the moment a leg
+  -- opens — and the lane backing up to the source is intentional back-pressure (the gate must
+  -- not pour more into a jammed chain). An UNDEMANDED item only lands here when no sink is
+  -- reachable; that one is a wiring gap worth the warning. NEVER panic: a crash kills the whole
+  -- controller over a single stray item.
   Router._nStuck = (Router._nStuck or 0) + 1             -- always-counted; the perf line reports the rate
   Router._flowBy[item] = Router._flowBy[item] or {}
   Router._flowBy[item].stuck = (Router._flowBy[item].stuck or 0) + 1
-  if Router.DEBUG and computer and computer.log then
+  if machineDemand then
+    Router._dlog(("HOLD %s '%s' (a machine is waiting for it)"):format(tostring(id):sub(1,6), item))
+  elseif Router.DEBUG and computer and computer.log then
     Router._holdLog = Router._holdLog or 0
     if Router._holdLog < 8 then
       Router._holdLog = Router._holdLog + 1
-      computer.log(2, ("[Foreman] STUCK: '%s' at %s — no destination, buffer, or sink reachable from here; holding. Wire a DEFAULT_OUT_%d near this node, or a buffer for '%s'.")
+      computer.log(2, ("[Foreman] STUCK: '%s' at %s — no demand and no sink reachable from here; holding. Wire a DEFAULT_OUT_%d near this node, or a buffer for '%s'.")
         :format(tostring(item), tostring(id), #self.defaults + 1, tostring(item)))
     end
   end

@@ -1147,6 +1147,24 @@ function Planner:fillAll()
   local servedCid = {}
   for _, cids in pairs(self.served or {}) do for _, cid in ipairs(cids) do servedCid[cid] = true end end
   self:_jamSweep(servedCid)   -- unassigned machines still clear their jammed lanes (drain trigger + hold)
+  -- PUBLISH the LIVE-RECIPE gate for the router (user rule: a machine leg only ever receives what
+  -- the machine will pull RIGHT NOW). Read AFTER produceFor's switches and the jam sweep so the
+  -- set reflects this epoch's actual recipes. A DRAINING machine admits NOTHING new — its temp
+  -- recipe must clear the lane, not vacuum more of the blockage item in.
+  local liveGate = {}
+  for _, cid in ipairs(self.topo.constructors or {}) do
+    liveGate[cid] = {}
+    if not Planner._drain[cid] then
+      local okr, rec = pcall(function() return self.getProxy(cid):getRecipe() end)
+      if okr and rec and rec.getIngredients then
+        local oki, ings = pcall(function() return rec:getIngredients() end)
+        if oki then for _, ia in ipairs(ings or {}) do
+          if ia.type and ia.type.name then liveGate[cid][lc(ia.type.name)] = true end
+        end end
+      end
+    end
+  end
+  self.router.machineLive = liveGate
   if self.router and self.router.buildQuota then self.router:buildQuota() end
   if self.router and self.router.gateSources then self.router:gateSources() end
   return plan
