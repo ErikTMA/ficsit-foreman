@@ -251,6 +251,7 @@ function App.run(modules, topology, opts)
     -- re-discover, since a rebuilt component exposes new connector objects.
     modules.Router._connCache = {}; modules.Router._blockShadow = {}; modules.Router._retry = {}
     modules.Router._legFullMach = {}   -- machine-entrance jam marks (feed-drain signal); fresh per session
+    modules.Router._holdN = {}; modules.Router._epochN = 0   -- hold-patience counters + epoch clock; fresh per session
   end
   -- ingredient flow-control window (max in-flight feedstock per order, anti belt-flood); tunable.
   if modules.Router and opts.flowWindow then modules.Router.flowWindow = opts.flowWindow end

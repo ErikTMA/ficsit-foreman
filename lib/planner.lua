@@ -933,7 +933,7 @@ function Planner:_jamSweep(servedCid)
           Planner._drain[cid] = nil
         end
       else
-        local jammed = self.router._legFullMach and self.router._legFullMach[cid]
+        local jammed = self.router.legJammed and self.router:legJammed(cid)
         local st = Planner._starve[cid]
         if type(st) ~= "table" then st = { n = 0 }; Planner._starve[cid] = st end
         if st.lastIn == inN then st.n = st.n + 1 else st.n = 0 end
@@ -1013,7 +1013,7 @@ function Planner:produceFor(cid, item, share, dst)
       return true                     -- hold: no assigned-recipe production (and no feedstock orders) this epoch
     end
   end
-  local jammed = self.router._legFullMach and self.router._legFullMach[cid]
+  local jammed = self.router.legJammed and self.router:legJammed(cid)
   if live == opt.recipe.name then
     -- FROZEN tracking on the assigned recipe: the machine is STUCK when its input count AND its
     -- production are both UNCHANGED across epochs. This covers an empty input, a PARTIAL input

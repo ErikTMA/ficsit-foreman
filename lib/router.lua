@@ -637,6 +637,7 @@ function Router:_orderRoom(o)
 end
 
 function Router:buildQuota()
+  Router._epochN = (Router._epochN or 0) + 1     -- the re-plan epoch clock (jam-mark freshness)
   for _, belts in pairs(self.adj) do for _, b in ipairs(belts) do b._q = {} end end
   local left = {}                                   -- "dst|item" -> room remaining to allocate this pass
   for _, o in ipairs(self.orders) do
@@ -715,6 +716,7 @@ end
 --      stops the gate from pouring more of it into a jammed chain.
 -- `fromOutput` is the transferItem arg for the hop out of this node.
 function Router:_overflow(sender, id, item)
+  local hkey = tostring(id) .. "|" .. item       -- hold-patience key (see Router.holdPatience)
   local active = {}
   for _, o in ipairs(self.ordersForItem[item] or {}) do
     if o.delivered < o.count then active[#active + 1] = o end
@@ -736,6 +738,7 @@ function Router:_overflow(sender, id, item)
             self:_credit(belt, item)
             if self.bufferItem[o.dst] then self:_creditRoom(o.dst, item) end
           end
+          Router._holdN[hkey] = nil
           Router._flowBy[item] = Router._flowBy[item] or {}
           Router._flowBy[item].rec = (Router._flowBy[item].rec or 0) + 1
           Router._dlog(("RECOVER %s '%s' >out[%d] %s ->%s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(belt.to):sub(1,6), tostring(o.dst):sub(1,6)))
@@ -754,6 +757,7 @@ function Router:_overflow(sender, id, item)
         -- NOT credit — the item continues and is credited at the final splitter before D (best.to == D),
         -- so crediting here too would double-count and falsely fill the cache (the reroute under-fill bug).
         if belt.to == D then self:_credit(belt, item); self:_creditRoom(D, item) end
+        Router._holdN[hkey] = nil
         Router._flowBy[item] = Router._flowBy[item] or {}
         Router._flowBy[item].rer = (Router._flowBy[item].rer or 0) + 1
         Router._dlog(("REROUTE %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(D):sub(1,6)))
@@ -768,14 +772,19 @@ function Router:_overflow(sender, id, item)
   -- while another is reachable on a looped manifold.
   local machineDemand = false
   for _, o in ipairs(active) do if self.isMachine[o.dst] then machineDemand = true; break end end
-  if not machineDemand then
+  -- HOLD PATIENCE: a demanded item that has been held HERE for holdPatience consecutive attempts
+  -- is going nowhere (a dead-end lane, an unreachable consumer) — gridlocking every flow behind
+  -- it. Let it sink: bounded waste beats a frozen factory.
+  local impatient = (Router._holdN[hkey] or 0) > (Router.holdPatience or 400)
+  if not machineDemand or impatient then
     for _, sink in ipairs(self.defaults or {}) do
       local belt = self:firstHopTo(id, sink)
       if belt and sender:transferItem(belt.fromOutput or 0) then
         Router._nSunk = (Router._nSunk or 0) + 1          -- always-counted; the perf line reports the rate
+        Router._holdN[hkey] = nil
         Router._flowBy[item] = Router._flowBy[item] or {}
         Router._flowBy[item].sunk = (Router._flowBy[item].sunk or 0) + 1
-        Router._dlog(("SINK %s '%s' (overflow, no machine demand)"):format(tostring(id):sub(1,6), item))
+        Router._dlog(("SINK %s '%s' (overflow, %s)"):format(tostring(id):sub(1,6), item, impatient and "hold patience expired" or "no machine demand"))
         return true
       end
     end
@@ -787,6 +796,7 @@ function Router:_overflow(sender, id, item)
   -- reachable; that one is a wiring gap worth the warning. NEVER panic: a crash kills the whole
   -- controller over a single stray item.
   Router._nStuck = (Router._nStuck or 0) + 1             -- always-counted; the perf line reports the rate
+  Router._holdN[hkey] = (Router._holdN[hkey] or 0) + 1
   Router._flowBy[item] = Router._flowBy[item] or {}
   Router._flowBy[item].stuck = (Router._flowBy[item].stuck or 0) + 1
   if machineDemand then
@@ -843,7 +853,7 @@ function Router:_routeAtSplitter(sender, id, item)
       -- its input belt is backed up = its OUTPUT is blocked or a FOREIGN item the machine won't pull
       -- is stranded at its entrance) and fall through to the next-best leg. Mark machine entrances
       -- (module-durable: the planner's feed-drain reads it next epoch; cleared on a successful push).
-      if self.isMachine[best.to] then Router._legFullMach = Router._legFullMach or {}; Router._legFullMach[best.to] = true end
+      if self.isMachine[best.to] then Router._legFullMach = Router._legFullMach or {}; Router._legFullMach[best.to] = Router._epochN or 0 end
       Router._dlog(("SPLFULL %s '%s' >out[%d] %s — leg full, diverting"):format(tostring(id):sub(1, 6), item, best.fromOutput or 0, tostring(best.to):sub(1, 6)))
     end
   end
@@ -1011,7 +1021,7 @@ function Router:_mergerPush(sender, id, input, nm)
   if not sender:transferItem(input) then
     -- push failed: the merger's output belt is full. If it feeds a machine, mark the entrance jam
     -- (same signal as _routeAtSplitter's SPLFULL) for the planner's feed-drain.
-    if out and self.isMachine[out.to] then Router._legFullMach = Router._legFullMach or {}; Router._legFullMach[out.to] = true end
+    if out and self.isMachine[out.to] then Router._legFullMach = Router._legFullMach or {}; Router._legFullMach[out.to] = Router._epochN or 0 end
     return false
   end
   if out then
@@ -1126,7 +1136,24 @@ Router._flowBy = Router._flowBy or {}             -- item -> { rec=, rer=, sunk=
 -- machine entrances whose feed leg is physically FULL (transferItem failed): set by _routeAtSplitter /
 -- _mergerPush, cleared when a push succeeds. Module-durable (router instances are rebuilt per epoch);
 -- the planner's FEED-DRAIN reads it to detect a foreign item stranded at a starved machine's entrance.
-Router._legFullMach = Router._legFullMach or {}
+Router._legFullMach = Router._legFullMach or {}   -- cid -> epoch the entrance push last FAILED (a stale mark must not trigger drains)
+Router.jamFresh = Router.jamFresh or 2            -- a jam mark older than this many epochs is stale
+-- Is `cid`'s entrance jam mark FRESH? The mark is stamped when a push toward the machine FAILS
+-- and cleared when one succeeds — but under hold-at-splitter, pushes may simply STOP being
+-- attempted, leaving a STALE mark that re-triggered the feed-drain forever: stale jam + starved
+-- input -> drain -> machineLive publishes empty -> the splitter holds the machine's own supply ->
+-- still starved -> drain again (the live freeze loop). A mark only counts within jamFresh epochs.
+function Router:legJammed(cid)
+  local st = Router._legFullMach and Router._legFullMach[cid]
+  if st == nil then return false end
+  if st == true then return true end             -- legacy boolean (tests stamp it directly)
+  return ((Router._epochN or 0) - st) <= (Router.jamFresh or 2)
+end
+-- HOLD PATIENCE: a machine-demanded item held at the same node for this many consecutive overflow
+-- attempts finally gets the sink — bounded waste beats a frozen factory (a permanent dead-end
+-- hold gridlocks every flow sharing the lane).
+Router._holdN = Router._holdN or {}               -- "node|item" -> consecutive hold attempts
+Router.holdPatience = Router.holdPatience or 400
 Router.stuckEpochs = Router.stuckEpochs or 3   -- empty-input epochs before temp-consumer-drain may fire
 function Router:_contribution(o)
   local t = o.term or o
