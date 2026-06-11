@@ -830,6 +830,8 @@ Planner.drainIdle   = Planner.drainIdle or 3      -- drain epochs with no pull b
 Planner._probe      = Planner._probe or {}        -- cid -> { n = evidence-less dead epochs, tried = {recipeName=true}, exhausted = bool }
 Planner.probeAfter  = Planner.probeAfter or 10    -- dead epochs with NO observable cause before the bounded probe starts
 Planner.pourSlice   = Planner.pourSlice or 8      -- max units of an item poured per machine demand per epoch (lanes hold ~4)
+Planner.drainStall  = Planner.drainStall or 8     -- admitted-drain epochs with NO pull before giving up (something deeper blocks the leg)
+Planner._flowDry    = Planner._flowDry or {}      -- cid -> { item = true }: admitted flows that never pulled; do not re-cork them until something pulls
 
 -- total items in a machine's INPUT inventory (0 on any read error)
 function Planner:_inputCount(cid)
@@ -873,7 +875,10 @@ function Planner:_drainCandidate(cid, opt)
   local assignedIng = {}
   for _, ing in ipairs(opt.ingredients) do assignedIng[ing.name] = true end
   local observed, hint = {}, self.router._feedItem and self.router:_feedItem(cid)
-  if hint and not assignedIng[hint] then observed[hint] = true else hint = nil end
+  -- a flowDry item is KNOWN unreachable (an admitted drain already starved on it — something
+  -- deeper blocks the leg): not evidence, or the drain re-fires forever on the same dead view
+  if hint and (assignedIng[hint] or (Planner._flowDry[cid] and Planner._flowDry[cid][hint])) then hint = nil end
+  if hint then observed[hint] = true end
   for it in pairs(self:_inputMap(cid)) do if not assignedIng[it] then observed[it] = true end end
   if next(observed) == nil then return nil end       -- no foreign item OBSERVED -> no drain
   local needOf = {}
@@ -1022,8 +1027,13 @@ function Planner:_jamSweep(servedCid)
       local inN = self:_inputCount(cid)
       local d = Planner._drain[cid]
       if d then
-        if d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true
-        else d.idle = (d.idle or 0) + 1 end
+        if d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
+        else d.idle = (d.idle or 0) + 1; d.dry = (d.dry or 0) + 1 end
+        if Planner._drainAdmit[cid] and self.router._feedItem and self.router:_feedItem(cid) == Planner._drainAdmit[cid] then d.idle = 0 end
+        if (d.dry or 0) >= (Planner.drainStall or 8) and not d.pulled and Planner._drainAdmit[cid] then
+          local fd = Planner._flowDry[cid] or {}; Planner._flowDry[cid] = fd; fd[Planner._drainAdmit[cid]] = true
+          d.idle = (Planner.drainIdle or 3)
+        end
         d.lastIn = inN
         if d.idle >= (Planner.drainIdle or 3) then
           if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil end
@@ -1093,10 +1103,21 @@ function Planner:produceFor(cid, item, share)
     -- pin the drain recipe while the assigned ingredient jammed the entrance. Now it idles out;
     -- the restore's setRecipe EJECTS the remnant to the output (routed away) — losing a partial
     -- input below the craft requirement beats a clogged machine.
-    if d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true
-    else d.idle = (d.idle or 0) + 1 end
+    if d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
+    else d.idle = (d.idle or 0) + 1; d.dry = (d.dry or 0) + 1 end
+    -- EVIDENCE PERSISTENCE: while the feeder slot still SHOWS the admitted item the job is not
+    -- done — arrival gaps on a backed-up chain exceed drainIdle and caused one-item-per-cork
+    -- churn (restore -> re-cork -> drain, one junk item eaten per ~3 cycles of patience). But a
+    -- drain that NEVER pulls despite admission is blocked deeper (an invisible stray ahead of
+    -- the admitted item) — the dry-stall bound ends it and blocks re-corking the same item so
+    -- the probe gets its turn.
+    if Planner._drainAdmit[cid] and self.router._feedItem and self.router:_feedItem(cid) == Planner._drainAdmit[cid] then d.idle = 0 end
     d.lastIn = inN
     if live and live ~= opt.recipe.name then d.recipe = tostring(live) end   -- adopt manual changes mid-drain
+    if (d.dry or 0) >= (Planner.drainStall or 8) and not d.pulled and Planner._drainAdmit[cid] then
+      local fd = Planner._flowDry[cid] or {}; Planner._flowDry[cid] = fd; fd[Planner._drainAdmit[cid]] = true
+      d.idle = (Planner.drainIdle or 3)
+    end
     if d.idle >= (Planner.drainIdle or 3) then
       -- a drain that PULLED worked: clear the round-robin cursor so the same recipe is reused on
       -- the next jam; a drain that pulled nothing keeps the cursor so the next attempt advances.
@@ -1269,8 +1290,8 @@ function Planner:fillAll()
   -- machine already pulls that item, switching recipes can only strand it.
   for cid, corkItem in pairs(self.router._corked or {}) do
     self.router._corked[cid] = nil
-    if not Planner._drain[cid] then
-      local skip = false
+    if not Planner._drain[cid] and not (Planner._flowDry[cid] and Planner._flowDry[cid][corkItem]) then
+      local skip, own = false, false
       local pm = self.getProxy(cid)
       local okr, liveRec = pcall(function() return pm:getRecipe() end)
       local liveIt = okr and liveRec and liveRec.name and self.itemOfRecipe[tostring(liveRec.name)]
@@ -1281,10 +1302,21 @@ function Planner:fillAll()
       if lopt then
         local have, can = self:_inputMap(cid), true
         for _, ing in ipairs(lopt.ingredients) do
-          if ing.name == corkItem then skip = true end             -- own live feedstock: not a cork
+          if ing.name == corkItem then own = true end
           if (have[ing.name] or 0) < ing.amount then can = false end
         end
         if can then skip = true end                                -- output-blocked: never touch
+      end
+      if not skip and own then
+        -- the machine's OWN live feedstock corked while it STARVES for it (an unassigned machine
+        -- admits nothing and demands nothing, so its food holds at the feeder forever — the live
+        -- sam at 56A11B). No recipe change needed: RESUME the flow — register the drain so the
+        -- admit loop demands + gates the item to the machine that already eats it.
+        Planner._drain[cid] = { recipe = tostring(liveRec.name), idle = 0 }
+        Planner._drainAdmit[cid] = corkItem
+        pcall(function() computer.log(1, ("[Foreman] CORKFLOW %s: own feedstock '%s' held at the feeder; resuming flow (recipe untouched)")
+          :format(tostring(cid):sub(1, 6), corkItem)) end)
+        skip = true
       end
       local cand
       if not skip then
