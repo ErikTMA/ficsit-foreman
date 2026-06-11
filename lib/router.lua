@@ -667,9 +667,10 @@ function Router:_overflow(sender, id, item)
   Router._heldFresh[item] = Router._epochN or 0   -- live congestion signal: the planner stops POURING this item while anything holds
   Router._flowBy[item] = Router._flowBy[item] or {}
   Router._flowBy[item].stuck = (Router._flowBy[item].stuck or 0) + 1
-  if impatient then
-    -- patience expired and the sink loop above found no exit: if this node feeds a machine,
-    -- hand the cork to the planner for a TARGETED feed-drain (it knows the exact item)
+  -- CORK PATIENCE is short (sink patience stays long — never waste demanded items eagerly):
+  -- reporting a cork costs nothing and the planner's guards decide what to do with it. The old
+  -- shared 400-retry patience made every cleanup wait ~7 epochs before the first cork.
+  if (Router._holdN[hkey] or 0) > math.min(Router.corkPatience or 100, Router.holdPatience or 400) then
     for _, b in ipairs(self.adj[id] or {}) do
       if self.isMachine[b.to] then Router._corked[b.to] = item; break end
     end
@@ -974,6 +975,7 @@ Router._flowBy = Router._flowBy or {}             -- item -> { rer=, sunk=, stuc
 Router._legFullMach = Router._legFullMach or {}
 Router._legSent = Router._legSent or {}          -- machineId -> item -> count pushed onto its entrance this session
 Router._heldFresh = Router._heldFresh or {}      -- item -> epoch of the most recent HOLD (congestion: stop pouring)
+Router.corkPatience = Router.corkPatience or 100 -- hold retries before reporting a cork (sinking keeps holdPatience)
 Router.jamFresh = Router.jamFresh or 2            -- a jam mark older than this many epochs is stale
 -- Is `cid`'s entrance jam mark FRESH? Under hold-at-splitter, pushes may simply STOP being
 -- attempted, leaving a stale mark that re-triggered the feed-drain forever (the v0.16.5 freeze

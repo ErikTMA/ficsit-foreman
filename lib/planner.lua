@@ -826,9 +826,9 @@ Planner._drainTried = Planner._drainTried or {}   -- cid -> last drain recipe na
 Planner._tempRecipe = Planner._tempRecipe or {}   -- cid -> drain temp recipe name; blocks assign() seed-adoption until a real switch overwrites it
 Planner._drainAdmit = Planner._drainAdmit or {}   -- cid -> the corked item a targeted drain may admit through the live gate
 Planner.drainAfter  = Planner.drainAfter or 3     -- starved+jammed epochs before a drain switch
-Planner.drainIdle   = Planner.drainIdle or 3      -- drain epochs with no pull before restoring
+Planner.drainIdle   = Planner.drainIdle or 2      -- drain epochs with no pull before restoring
 Planner._probe      = Planner._probe or {}        -- cid -> { n = evidence-less dead epochs, tried = {recipeName=true}, exhausted = bool }
-Planner.probeAfter  = Planner.probeAfter or 10    -- dead epochs with NO observable cause before the bounded probe starts
+Planner.probeAfter  = Planner.probeAfter or 4     -- dead epochs with NO observable cause before the bounded probe starts
 Planner.pourSlice   = Planner.pourSlice or 8      -- max units of an item poured per machine demand per epoch (lanes hold ~4)
 Planner.drainStall  = Planner.drainStall or 8     -- admitted-drain epochs with NO pull before giving up (something deeper blocks the leg)
 Planner._flowDry    = Planner._flowDry or {}      -- cid -> { item = true }: admitted flows that never pulled; do not re-cork them until something pulls
@@ -1150,7 +1150,30 @@ function Planner:produceFor(cid, item, share)
     if st.lastIn == inN and st.lastSig == sig then st.n = st.n + 1
     else st.n = 0; Planner._probe[cid] = nil end   -- lane moved: any probe episode is over
     st.lastIn, st.lastSig = inN, sig
-    if jammed and st.n >= (Planner.drainAfter or 3) then
+    -- TIERED REACTION (user rule: "not crafting + something wrong at the input = act in seconds"):
+    --   foreign item IN the input inventory  -> 1 frozen epoch, no jam mark needed (it is ours;
+    --                                           nothing else can ever use it);
+    --   foreign at the feeder, demanded by NO machine -> 2 epochs (junk; nobody is waiting for it);
+    --   foreign at the feeder but demanded elsewhere  -> 3 epochs + jam mark (likely IN TRANSIT on
+    --                                           the shared chain — do not steal another machine's
+    --                                           feedstock just because it passes by).
+    local wait, needJam = (Planner.drainAfter or 3), true
+    do
+      local assignedIng = {}
+      for _, ing in ipairs(opt.ingredients) do assignedIng[ing.name] = true end
+      local inForeign = false
+      for it in pairs(self:_inputMap(cid)) do if not assignedIng[it] then inForeign = true; break end end
+      if inForeign then wait, needJam = 1, false
+      else
+        local fh = self.router._feedItem and self.router:_feedItem(cid)
+        if fh and not assignedIng[fh] and not (Planner._flowDry[cid] and Planner._flowDry[cid][fh]) then
+          local wanted = false
+          for _, c in ipairs((self._demand and self._demand[fh]) or {}) do if c.machine and c.id ~= cid then wanted = true; break end end
+          if not wanted then wait = 2 end
+        end
+      end
+    end
+    if (jammed or not needJam) and st.n >= wait then
       -- a frozen machine that COULD craft from what it holds is OUTPUT-blocked — its fix is
       -- downstream; never touch its recipe (setRecipe would eject full feedstock into the very
       -- path that is blocked — the live B13DC6 "in=100, output jammed" case).
@@ -1161,7 +1184,7 @@ function Planner:produceFor(cid, item, share)
       end
       local cand = (not canCraft) and self:_drainCandidate(cid, opt) or nil
       if not cand and not canCraft then
-        if self:_probeFire(cid, opt) then return true end   -- invisible blockage: bounded existence-probe
+        if jammed and self:_probeFire(cid, opt) then return true end   -- invisible blockage: bounded existence-probe
       end
       if cand then
         Planner._probe[cid] = nil                               -- visible evidence ends any probe episode
@@ -1407,26 +1430,32 @@ function Planner:fillAll()
       if b.need > 0 and not providing[b.id] then self:_addDemand(item, b.id, b.need, nil, false) end
     end
   end
-  -- PUBLISH the LIVE-RECIPE gate for the router (user rule: a machine leg only ever receives what
-  -- the machine will pull RIGHT NOW). Read AFTER produceFor's switches and the jam sweep so the
-  -- set reflects this epoch's actual recipes. A DRAINING machine admits NOTHING new — its temp
-  -- recipe must clear the lane, not vacuum more of the blockage item in.
+  -- PUBLISH the WANTED-RECIPE gate for the router (user rule: the splitter just outside a
+  -- constructor only ever admits the reagents of the ASSIGNED recipe — never the ingredients of
+  -- a temporary drain/probe recipe still sitting on the machine. Reading the LIVE recipe here
+  -- let a leftover temp recipe widen the gate and pull foreign items onto the leg, re-junking
+  -- the very lane the drain had cleared.) A DRAINING machine admits exactly its admit item;
+  -- an UNASSIGNED, non-draining machine admits NOTHING (CORKFLOW grants it an admit when its
+  -- own food corks at the feeder).
   local liveGate = {}
   for _, cid in ipairs(self.topo.constructors or {}) do
     liveGate[cid] = {}
-    if Planner._drain[cid] and Planner._drainAdmit[cid] then
-      liveGate[cid][Planner._drainAdmit[cid]] = true   -- targeted drain: admit the cork, nothing else
-    elseif not Planner._drain[cid] then
-      local okr, rec = pcall(function() return self.getProxy(cid):getRecipe() end)
-      if okr and rec and rec.getIngredients then
-        local oki, ings = pcall(function() return rec:getIngredients() end)
-        if oki then for _, ia in ipairs(ings or {}) do
-          if ia.type and ia.type.name then liveGate[cid][lc(ia.type.name)] = true end
-        end end
+    if Planner._drain[cid] then
+      if Planner._drainAdmit[cid] then
+        liveGate[cid][Planner._drainAdmit[cid]] = true   -- targeted drain: admit the cork, nothing else
+      end
+    else
+      local a = Planner._assign[cid]
+      if a and a.opt then
+        for _, ing in ipairs(a.opt.ingredients) do liveGate[cid][ing.name] = true end
       end
     end
-    if liveGate[cid] and not next(liveGate[cid]) and not Planner._drain[cid] then
-      -- not draining but no readable recipe: keep the empty set (admit nothing)
+  end
+  -- deep-craft sub-machines (claimed by produceInto, not in _assign) declare their wanted
+  -- reagents through this epoch's machine demand entries — admit exactly those
+  for item, consumers in pairs(self._demand) do
+    for _, cn in ipairs(consumers) do
+      if cn.machine and liveGate[cn.id] and not Planner._drain[cn.id] then liveGate[cn.id][item] = true end
     end
   end
   self.router.machineLive = liveGate
