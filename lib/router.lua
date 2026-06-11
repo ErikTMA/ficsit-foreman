@@ -201,7 +201,11 @@ function Router:findPath(src, dst)
       local node = queue[head]; head = head + 1
       if node == dst then break end
       local isBuffer = self.bufferItem[node] ~= nil and node ~= dst
-      if node == src or self.isSplitter[node] or self.isMerger[node] or not isBuffer or allowBuffer then
+      -- a MACHINE is never transit either: an item pushed onto its leg is eaten or blocks the
+      -- leg — it does not come out the other side (the live leak: copper's "path to the sink"
+      -- hopped through the cable constructor, landing ingots on its sealed leg)
+      local isMachine = self.isMachine[node] and node ~= dst
+      if not isMachine and (node == src or self.isSplitter[node] or self.isMerger[node] or not isBuffer or allowBuffer) then
         for _, b in ipairs(self.adj[node] or {}) do
           if not seen[b.to] then
             seen[b.to] = true
@@ -684,13 +688,24 @@ function Router:_overflow(sender, id, item)
       end
     end
   end
-  -- 3. SINK — but NEVER an item a MACHINE is waiting for: sinking a live consumer's feedstock is
-  -- wasted resources (the live 424 sunk copper ingots while the copper sheet machines starved).
-  -- Buffer-fill surplus with every buffer full IS sinkable — that is genuine over-supply and the
-  -- lane must clear. Try EVERY DEFAULT_OUT: the first sink may be unreachable from this node
-  -- while another is reachable on a looped manifold.
+  -- 3. SINK — but NEVER an item that is still WANTED (user rule: "if an item needs to be
+  -- crafted — we have less available than possible — do not sink it; lead it back to the
+  -- buffer instead"). Wanted = a machine demands it THIS epoch, OR it is an ingredient of any
+  -- machine's wanted recipe (the band is momentarily full; it will be demanded again on the
+  -- next refill — the sam that sank between C5504C's top-ups). Such items reroute to their
+  -- buffer (step 1) or HOLD/circulate. Genuine over-supply (no wanted recipe eats it, every
+  -- buffer full) sinks. Try EVERY DEFAULT_OUT: the first sink may be unreachable from here.
   local machineDemand = false
   for _, c in ipairs(self.demand[item] or {}) do if c.machine then machineDemand = true; break end end
+  -- PASSIVE tier: no demand entry this epoch, but the item is an ingredient of some machine's
+  -- wanted recipe (band momentarily full; demanded again on the next refill). Protected only
+  -- when it has STORAGE to wait in — "if there's no route to storage (ingots, for instance),
+  -- sink is OK" (user): bufferless surplus sinks instead of circling the loop forever.
+  if not machineDemand and self.machineLive and #(self.buffersForItem[item] or {}) > 0 then
+    for _, gate in pairs(self.machineLive) do
+      if gate[item] == true then machineDemand = true; break end
+    end
+  end
   -- HOLD PATIENCE: a demanded item that has been held HERE for holdPatience consecutive attempts
   -- is going nowhere (a dead-end lane, an unreachable consumer) — gridlocking every flow behind
   -- it. Let it sink: bounded waste beats a frozen factory.
