@@ -1036,7 +1036,11 @@ function Planner:_jamSweep(servedCid)
         end
         d.lastIn = inN
         if d.idle >= (Planner.drainIdle or 3) then
-          if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil end
+          if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil
+          else
+            local stB = Planner._starve[cid]; if type(stB) == "table" then stB.n = 99 end
+            local prB = Planner._probe[cid]; if type(prB) == "table" then prB.n = 99 end
+          end
           Planner._drain[cid] = nil
         end
       else
@@ -1121,7 +1125,15 @@ function Planner:produceFor(cid, item, share)
     if d.idle >= (Planner.drainIdle or 3) then
       -- a drain that PULLED worked: clear the round-robin cursor so the same recipe is reused on
       -- the next jam; a drain that pulled nothing keeps the cursor so the next attempt advances.
-      if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil end
+      if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil
+      else
+        -- DRY-CHAIN: the guess missed (the invisible leg head is some OTHER type). Do not spend
+        -- 3 epochs re-detecting the same frozen machine — prime the triggers so the NEXT
+        -- candidate (evidence or probe) fires on the very next epoch. Walking the whole recipe
+        -- list costs ~3 epochs per type instead of ~6 with restores between.
+        local stB = Planner._starve[cid]; if type(stB) == "table" then stB.n = 99 end
+        local prB = Planner._probe[cid]; if type(prB) == "table" then prB.n = 99 end
+      end
       Planner._drain[cid] = nil       -- no input movement for a while: drained (or unpullable) -> restore below
     else
       local di = live and self.itemOfRecipe[tostring(live)]                 -- route the drained product away
@@ -1217,7 +1229,12 @@ function Planner:produceFor(cid, item, share)
       feedForeign = true
       for _, ing in ipairs(opt.ingredients) do if ing.name == fh then feedForeign = false; break end end
     end
-    if live ~= nil and type(stA) == "table" and stA.n > 0 and (jammed or feedForeign) then
+    -- never ADOPT the drain's own leftover temp recipe as a "manual change" — after a drain ends
+    -- the machine still wears it for a call, and adopting it re-registers the same dead drain
+    -- forever (the MakeJ/Cable refire loop)
+    if live ~= nil and tostring(live) == tostring(Planner._tempRecipe[cid] or "\0") then
+      -- fall through to canSwitch/restore below
+    elseif live ~= nil and type(stA) == "table" and stA.n > 0 and (jammed or feedForeign) then
       Planner._drain[cid] = { recipe = tostring(live), idle = 0 }
       -- the adopted recipe drains a lane corked AT THE FEEDER: that item only moves if the live
       -- gate admits it and the admit loop demands it — without this the adoption is a no-op (the
