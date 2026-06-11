@@ -1500,24 +1500,37 @@ function Planner:fillAll()
     -- shared chain into a frozen buffer. Buffer fills absorb at the destination and stay unpaced.
     local held = self.router and self.router._heldFresh and self.router._heldFresh[item]
     local congested = held ~= nil and (epochN - held) <= 1
+    local totalMachine = 0
     for _, cn in ipairs(consumers) do
       consumerIds[cn.id] = true
       if not cn.noGrant then
         if cn.machine then
-          if not congested then total = total + math.min(cn.need, Planner.pourSlice or 8) end
+          if not congested then
+            local t = math.min(cn.need, Planner.pourSlice or 8)
+            total = total + t; totalMachine = totalMachine + t
+          end
         else
           total = total + cn.need
         end
       end
     end
-    local remaining = total
+    local remaining, remMachine = total, totalMachine
     for _, pr in ipairs(self:_providersFor(item, consumerIds)) do
       if remaining <= 0 then break end
-      local take = math.min(remaining, pr.stock)
+      -- a SIBLING HUB (another buffer of the same item) provides ONLY for machine demand —
+      -- never for another hub's staged fill. Two rod buffers below target otherwise grant to
+      -- each other forever: the rods shuffle hub<->hub and always out-race the machine's small
+      -- demand to the nearer buffer (the live B13DC6 "assigned Screws, in=0 forever").
+      local cap = remaining
+      for _, hid in ipairs((self.buffersOf and self.buffersOf[item]) or {}) do
+        if hid == pr.id then cap = math.min(remaining, remMachine); break end
+      end
+      local take = math.min(cap, pr.stock)
       if take > 0 then
         grants[pr.id] = (grants[pr.id] or 0) + take
         providing[pr.id] = true
         remaining = remaining - take
+        remMachine = math.max(0, remMachine - take)
       end
     end
     -- residual demand with a raw source: keep its gate open a batch so stock flowing INTO the
@@ -1528,10 +1541,24 @@ function Planner:fillAll()
     end
   end
   -- product destinations: every below-target buffer that is NOT providing this epoch demands its
-  -- staged refill, so machine OUTPUT (and drain ejecta) has a next hop toward storage
+  -- staged refill, so machine OUTPUT (and drain ejecta) has a next hop toward storage.
+  -- SIBLING SUPPRESSION: while ANY other hub of the item holds stock, this hub does not demand a
+  -- fill — routing is quantity-blind, so a standing fill demand attracts the stock RELEASED FOR
+  -- MACHINES into the sibling instead (the live rod ping-pong: two rod hubs granted to each
+  -- other forever while the screws machine starved at in=0). System stock gets CONSUMED before
+  -- anything is moved or produced to top up storage.
   for item in pairs(self.bufferOf) do
     for _, b in ipairs(self:_needingBuffers(item)) do
-      if b.need > 0 and not providing[b.id] then self:_addDemand(item, b.id, b.need, nil, false) end
+      if b.need > 0 and not providing[b.id] then
+        local sibStock = false
+        for _, hid in ipairs((self.buffersOf and self.buffersOf[item]) or {}) do
+          if hid ~= b.id then
+            local n = count_in(self.getProxy(hid), item)
+            if n and n > 0 then sibStock = true; break end
+          end
+        end
+        if not sibStock then self:_addDemand(item, b.id, b.need, nil, false) end
+      end
     end
   end
   -- PUBLISH the WANTED-RECIPE gate for the router (user rule: the splitter just outside a
