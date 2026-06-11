@@ -267,6 +267,8 @@ function App.run(modules, topology, opts)
     modules.Planner._flowDry = {}      -- dry admitted-flow marks; fresh per session
     modules.Planner._legView = {}      -- shadow-ledger pop views; fresh per session
     modules.Planner._drainEpisode = {} -- drain episode tried-sets; fresh per session
+    modules.Planner._wanted = {}; modules.Planner._clearQ = {}; modules.Planner._clearN = {}
+    modules.Planner._clearDry = {}; modules.Planner._clearPops = {}   -- belt-clear state machine; fresh per session
     modules.Router._legQueue = {}      -- shadow ledger itself; fresh per session (rebuilt by the first drain walk)
     modules.Router._arrived = {}; modules.Router._legTrusted = {}   -- arrival events + ledger trust; fresh per session
     modules.Router._legSent = {}       -- per-entrance push ledger; fresh per session

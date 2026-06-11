@@ -834,6 +834,11 @@ Planner.drainStall  = Planner.drainStall or 8     -- admitted-drain epochs with 
 Planner._flowDry    = Planner._flowDry or {}      -- cid -> { item = true }: admitted flows that never pulled; do not re-cork them until something pulls
 Planner._legView    = Planner._legView or {}      -- cid -> { prev = inputMap, trusted = bool } (shadow-ledger pop tracking)
 Planner._drainEpisode = Planner._drainEpisode or {} -- cid -> { recipeName = true } drains tried since the lane last moved (no repeats, no wandering)
+Planner._wanted     = Planner._wanted or {}       -- cid -> { nm, opt }: the REAL recipe, remembered across unassignment (user state machine)
+Planner._clearQ     = Planner._clearQ or {}       -- cid -> rotation queue of belt-clearing recipe names
+Planner._clearN     = Planner._clearN or {}       -- cid -> tries since clear mode started (wanted interleave on clean feeder)
+Planner._clearDry   = Planner._clearDry or {}     -- cid -> full dry rotations; parks on wanted after clearPark of them
+Planner.clearPark   = Planner.clearPark or 3      -- full dry queue rotations before parking on the wanted recipe
 
 -- total items in a machine's INPUT inventory (0 on any read error)
 function Planner:_inputCount(cid)
@@ -985,107 +990,104 @@ function Planner:_drainCandidate(cid, opt)
   return list[1].o2
 end
 
--- LAST-RESORT PROBE for an INVISIBLE blockage. FIN exposes no belt contents: a foreign item
--- stranded at the MACHINE end of an entrance belt (left by an old session or a mid-flight
--- reassignment) is observable nowhere — not at the feeder slot, not in the input inventory —
--- yet it head-of-line-blocks the leg forever (the live wire from the v0.17.1 flap that froze
--- all three constructors). When a machine stays frozen+jammed for probeAfter epochs with NO
--- observable cause, probe: try recipes whose single ingredient EXISTS in the factory (the leg
--- ledger of items the router pushed onto this entrance ranks first, then sourced/stocked/
--- demanded items — never an item that exists nowhere), one recipe per drain cycle, each tried
--- ONCE per episode. A probe that pulls items found the blockage (normal drain lifecycle takes
--- over); a full pass with no pull EXHAUSTS the probe — one loud warning, no further churn,
--- manual clearing needed. The episode resets when the machine crafts or the jam clears.
-function Planner:_probeCandidate(cid, opt, pr)
-  local assignedIng = {}
-  for _, ing in ipairs(opt.ingredients) do assignedIng[ing.name] = true end
-  local sent = (self.router and self.router._legSent and self.router._legSent[cid]) or {}
-  local needOf = {}
-  for item, consumers in pairs(self._demand or {}) do
-    local t = 0; for _, c in ipairs(consumers) do t = t + (c.need or 0) end; needOf[item] = t
-  end
-  local function existsInFactory(it)
-    if sent[it] then return true end
-    if self.sources[it] then return true end
-    if self._demand and self._demand[it] then return true end
-    for _, hid in ipairs((self.buffersOf and self.buffersOf[it]) or {}) do
-      local ok, n = pcall(function() return self:_count(hid, it) end)
-      if ok and (n or 0) > 0 then return true end
+-- BELT-CLEAR STATE MACHINE (user design, verbatim): each constructor has a REMEMBERED
+-- wantedRecipe (survives unassignment) and a clearBeltRecipes rotation queue. Not crafting and
+-- nothing visible to target? Try the queue head; a try that goes dry rotates to the back. Once
+-- the FEEDER passes only wanted items (or nothing), the wanted recipe is interleaved every 2nd
+-- try; after clearPark full dry rotations the machine PARKS on the wanted recipe (no churn)
+-- until the lane shows life again. Queue entries are existence-grounded: an ingredient that is
+-- nowhere in the factory can never pull anything.
+Planner._clearPops = Planner._clearPops or {}     -- cid -> queue pops since the last successful pull
+function Planner:_clearNext(cid, opt)
+  local wantedNm = tostring(opt.recipe.name)
+  local q = Planner._clearQ[cid]
+  if not q or #q == 0 then
+    local sent = (self.router and self.router._legSent and self.router._legSent[cid]) or {}
+    local lq = (self.router and self.router._legQueue and self.router._legQueue[cid]) or {}
+    local member = {}
+    for _, it in ipairs(lq) do member[it] = true end
+    local function exists(it)
+      if member[it] or sent[it] then return true end
+      if self.sources[it] then return true end
+      if self._demand and self._demand[it] then return true end
+      for _, hid in ipairs((self.buffersOf and self.buffersOf[it]) or {}) do
+        local ok, n = pcall(function() return count_in(self.getProxy(hid), it) end)
+        if ok and (n or 0) > 0 then return true end
+      end
+      return false
     end
-    return false
-  end
-  local seen, list = {}, {}
-  for _, opts in pairs(self.recipesByProduct) do
-    for _, o2 in ipairs(opts) do
-      local nm = tostring(o2.recipe.name)
-      if o2.ctorId == cid and nm ~= tostring(opt.recipe.name) and not seen[nm] and not pr.tried[nm] then
-        seen[nm] = true
-        local ing = #o2.ingredients == 1 and o2.ingredients[1] or nil
-        if ing and not assignedIng[ing.name] and existsInFactory(ing.name) then
-          local prod = self.itemOfRecipe[nm]
-          local member = 0
-          local lq = self.router._legQueue and self.router._legQueue[cid]
-          if lq then for _, it in ipairs(lq) do if it == ing.name then member = 2; break end end end
-          if member == 0 and sent[ing.name] then member = 1 end
-          list[#list + 1] = { o2 = o2, nm = nm, sent = member,
-                              amt = ing.amount or 1, need = (prod and needOf[prod]) or 0 }
+    local list, seen = {}, {}
+    for _, opts in pairs(self.recipesByProduct) do
+      for _, o2 in ipairs(opts) do
+        local nm = tostring(o2.recipe.name)
+        if o2.ctorId == cid and nm ~= wantedNm and not seen[nm] then
+          seen[nm] = true
+          local ing = #o2.ingredients == 1 and o2.ingredients[1] or nil
+          if ing and exists(ing.name) then
+            list[#list + 1] = { nm = nm, amt = ing.amount or 1, member = member[ing.name] and 1 or 0 }
+          end
         end
       end
     end
+    table.sort(list, function(a, b)
+      if a.member ~= b.member then return a.member > b.member end   -- items KNOWN on the leg first
+      if a.amt ~= b.amt then return a.amt < b.amt end
+      return a.nm < b.nm
+    end)
+    q = {}
+    for _, e in ipairs(list) do q[#q + 1] = e.nm end
+    Planner._clearQ[cid] = q
   end
-  if #list == 0 then return nil end
-  table.sort(list, function(a, b)
-    if a.sent ~= b.sent then return a.sent > b.sent end
-    if a.amt ~= b.amt then return a.amt < b.amt end
-    if a.need ~= b.need then return a.need > b.need end
-    return a.nm < b.nm
-  end)
-  return list[1].o2
-end
-
--- count of `it` inside container `hid` (0 on read error)
-function Planner:_count(hid, it)
-  local p = self.getProxy(hid)
-  if not p then return 0 end
-  local n = 0
-  pcall(function()
-    for _, inv in ipairs(p:getInventories()) do
-      for i = 0, (inv.size or 0) - 1 do
-        local s = inv:getStack(i)
-        if s and s.item and s.item.type and lc(s.item.type.name) == it then n = n + (s.count or 0) end
-      end
+  if #q == 0 then return nil end
+  if (Planner._clearDry[cid] or 0) >= (Planner.clearPark or 3) then return { wanted = true, park = true } end
+  local n = (Planner._clearN[cid] or 0) + 1
+  Planner._clearN[cid] = n
+  local fh = self.router._feedItem and self.router:_feedItem(cid)
+  local wantedIng = {}
+  for _, ing in ipairs(opt.ingredients) do wantedIng[ing.name] = true end
+  local clean = (fh == nil) or wantedIng[fh] == true
+  if clean and n % 2 == 0 then return { wanted = true } end
+  local nm = table.remove(q, 1); q[#q + 1] = nm      -- rotate to the back
+  local pops = (Planner._clearPops[cid] or 0) + 1
+  Planner._clearPops[cid] = pops
+  if pops >= #q and #q > 0 then
+    Planner._clearPops[cid] = 0
+    Planner._clearDry[cid] = (Planner._clearDry[cid] or 0) + 1
+  end
+  for _, opts in pairs(self.recipesByProduct) do
+    for _, o2 in ipairs(opts) do
+      if o2.ctorId == cid and tostring(o2.recipe.name) == nm then return { o2 = o2 } end
     end
-  end)
-  return n
+  end
+  return nil
 end
 
--- fire a probe drain on `cid` if its evidence-less dead streak crossed probeAfter. Returns true
--- when a probe recipe was set (caller treats it like a drain switch).
-function Planner:_probeFire(cid, opt)
-  local pr = Planner._probe[cid]
-  if type(pr) ~= "table" then pr = { n = 0, tried = {} }; Planner._probe[cid] = pr end
-  pr.n = pr.n + 1
-  local threshold = pr.armed and (Planner.drainAfter or 3) or (Planner.probeAfter or 10)
-  if pr.exhausted or pr.n < threshold then return false end
-  local cand = self:_probeCandidate(cid, opt, pr)
-  if not cand then
-    pr.exhausted = true
-    pcall(function() computer.log(2, ("[Foreman] PROBEFAIL %s: lane dead with no visible cause and no recipe pulled anything — manual clearing needed")
-      :format(tostring(cid):sub(1, 6))) end)
-    return false
+-- fire one clear-walk step (shared by produceFor and the jam sweep). Returns true if it acted.
+function Planner:_clearStep(cid, opt, live)
+  local nxt = self:_clearNext(cid, opt)
+  if not nxt then return false end
+  if nxt.wanted then
+    if tostring(live or "") ~= tostring(opt.recipe.name) then
+      pcall(function() opt.ctor:setRecipe(opt.recipe) end)
+      Planner._tempRecipe[cid] = nil
+      pcall(function() computer.log(1, ("[Foreman] %s %s: back on the wanted recipe '%s'%s")
+        :format(nxt.park and "CLEARPARK" or "CLEAR", tostring(cid):sub(1, 6), tostring(opt.recipe.name),
+                nxt.park and " (queue exhausted dry; parked until the lane shows life)" or " (feeder clean; every-2nd try)")) end)
+    end
+    return true
   end
-  pr.tried[tostring(cand.recipe.name)] = true
-  pr.n = 0; pr.armed = true
-  pcall(function() opt.ctor:setRecipe(cand.recipe) end)
-  Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0, probe = true }
+  local cand = nxt.o2
+  Planner._probe[cid] = nil
+  local ep2 = Planner._drainEpisode[cid] or {}; Planner._drainEpisode[cid] = ep2
+  ep2[tostring(cand.recipe.name)] = true
+  pcall(function() cand.ctor:setRecipe(cand.recipe) end)
+  Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
   Planner._drainTried[cid] = tostring(cand.recipe.name)
   Planner._tempRecipe[cid] = tostring(cand.recipe.name)
-  pcall(function() computer.log(1, ("[Foreman] PROBE %s: lane dead %d epochs, nothing visible; trying '%s' (its ingredient exists in the factory)")
-    :format(tostring(cid):sub(1, 6), Planner.probeAfter or 10, tostring(cand.recipe.name))) end)
-  local di = self.itemOfRecipe[tostring(cand.recipe.name)]
-  if di and self.bufferOf[di] then
-    self:_addDemand(di, self.bufferOf[di], math.max(1, self:_fillAmount(di)), nil, false, true)
-  end
+  local fh = self.router._feedItem and self.router:_feedItem(cid)
+  if fh == cand.ingredients[1].name then Planner._drainAdmit[cid] = fh end
+  pcall(function() computer.log(1, ("[Foreman] CLEAR %s: trying '%s' (rotation queue)")
+    :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name))) end)
   return true
 end
 
@@ -1108,13 +1110,22 @@ function Planner:_jamSweep(servedCid)
         elseif d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
         else d.idle = (d.idle or 0) + 1; d.dry = (d.dry or 0) + 1 end
         if Planner._drainAdmit[cid] and self.router._feedItem and self.router:_feedItem(cid) == Planner._drainAdmit[cid] then d.idle = 0 end
+        do
+          local lq = self.router._legQueue and self.router._legQueue[cid]
+          local adm = Planner._drainAdmit[cid]
+          if adm and lq then
+            for _, it in ipairs(lq) do if it == adm then d.idle = 0; break end end
+          end
+        end
         if (d.dry or 0) >= (Planner.drainStall or 8) and not d.pulled and Planner._drainAdmit[cid] then
           local fd = Planner._flowDry[cid] or {}; Planner._flowDry[cid] = fd; fd[Planner._drainAdmit[cid]] = true
           d.idle = (Planner.drainIdle or 3)
         end
         d.lastIn = inN
         if d.idle >= (Planner.drainIdle or 3) then
-          if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil
+          if d.pulled then
+            Planner._drainTried[cid] = nil; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil
+            Planner._clearDry[cid] = nil; Planner._clearPops[cid] = nil
           else
             local lq = self.router._legQueue and self.router._legQueue[cid]
             if lq and lq[1] and lq[1] == Planner._drainAdmit[cid] then table.remove(lq, 1) end
@@ -1143,8 +1154,9 @@ function Planner:_jamSweep(servedCid)
             for _, ing in ipairs(opt.ingredients) do
               if (have[ing.name] or 0) < ing.amount then canCraft = false; break end
             end
-            local cand = (not canCraft) and self:_drainCandidate(cid, opt) or nil
-            if not cand and not canCraft then self:_probeFire(cid, opt) end
+            local wopt = (Planner._wanted[cid] and Planner._wanted[cid].opt) or opt
+            local cand = (not canCraft) and self:_drainCandidate(cid, wopt) or nil
+            if not cand and not canCraft then self:_clearStep(cid, wopt, rec and rec.name) end
             if cand then
               Planner._probe[cid] = nil
               local ep2 = Planner._drainEpisode[cid] or {}; Planner._drainEpisode[cid] = ep2
@@ -1177,6 +1189,7 @@ function Planner:produceFor(cid, item, share)
   local a = Planner._assign[cid]
   local opt = a and a.opt
   if not opt then return false end
+  Planner._wanted[cid] = { nm = tostring(opt.recipe.name), opt = opt }   -- remembered across unassignment
   local okc, cur = pcall(function() return opt.ctor:getRecipe() end)
   local live = okc and cur and cur.name or nil
   local needSwitch = false
@@ -1210,6 +1223,17 @@ function Planner:produceFor(cid, item, share)
     -- the admitted item) — the dry-stall bound ends it and blocks re-corking the same item so
     -- the probe gets its turn.
     if Planner._drainAdmit[cid] and self.router._feedItem and self.router:_feedItem(cid) == Planner._drainAdmit[cid] then d.idle = 0 end
+    -- LEDGER PIN (the fresh re-contamination): the admit let items onto the leg; restoring while
+    -- they are still in transit STRANDS them (every drain cycle left its tail — iron+copper+sam
+    -- accumulated on all three legs within one session). The clear recipe holds until the ledger
+    -- says no admitted items remain; the dry-stall still bounds items that never arrive.
+    do
+      local lq = self.router._legQueue and self.router._legQueue[cid]
+      local adm = Planner._drainAdmit[cid]
+      if adm and lq then
+        for _, it in ipairs(lq) do if it == adm then d.idle = 0; break end end
+      end
+    end
     d.lastIn = inN
     if live and live ~= opt.recipe.name then d.recipe = tostring(live) end   -- adopt manual changes mid-drain
     if (d.dry or 0) >= (Planner.drainStall or 8) and not d.pulled and Planner._drainAdmit[cid] then
@@ -1219,7 +1243,9 @@ function Planner:produceFor(cid, item, share)
     if d.idle >= (Planner.drainIdle or 3) then
       -- a drain that PULLED worked: clear the round-robin cursor so the same recipe is reused on
       -- the next jam; a drain that pulled nothing keeps the cursor so the next attempt advances.
-      if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil
+      if d.pulled then
+        Planner._drainTried[cid] = nil; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil
+        Planner._clearDry[cid] = nil; Planner._clearPops[cid] = nil
       else
         local lq = self.router._legQueue and self.router._legQueue[cid]
         if lq and lq[1] and lq[1] == Planner._drainAdmit[cid] then table.remove(lq, 1) end   -- the ledger head proved absent: drop it
@@ -1256,7 +1282,8 @@ function Planner:produceFor(cid, item, share)
     local st = Planner._starve[cid]
     if type(st) ~= "table" then st = { n = 0 }; Planner._starve[cid] = st end
     if st.lastIn == inN and st.lastSig == sig then st.n = st.n + 1
-    else st.n = 0; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil end   -- lane moved: episodes over
+    else st.n = 0; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil
+      Planner._clearDry[cid] = nil; Planner._clearPops[cid] = nil; Planner._clearN[cid] = nil end   -- lane moved: episodes over
     st.lastIn, st.lastSig = inN, sig
     -- TIERED REACTION (user rule: "not crafting + something wrong at the input = act in seconds"):
     --   foreign item IN the input inventory  -> 1 frozen epoch, no jam mark needed (it is ours;
@@ -1291,8 +1318,8 @@ function Planner:produceFor(cid, item, share)
         if (have[ing.name] or 0) < ing.amount then canCraft = false; break end
       end
       local cand = (not canCraft) and self:_drainCandidate(cid, opt) or nil
-      if not cand and not canCraft then
-        if jammed and self:_probeFire(cid, opt) then return true end   -- invisible blockage: bounded existence-probe
+      if not cand and not canCraft and jammed then
+        if self:_clearStep(cid, opt, live) then return true end        -- invisible blockage: rotation queue + wanted interleave
       end
       if cand then
         Planner._probe[cid] = nil                               -- visible evidence ends any probe episode

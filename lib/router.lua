@@ -189,13 +189,12 @@ end
 -- Breadth-first search src -> dst over the belt graph. Returns the ordered list of
 -- belts forming the path, or nil if unreachable.
 function Router:findPath(src, dst)
-  -- TWO-PHASE BFS. Phase 1 does NOT transit a declared buffer (storage for a specific item is not a
-  -- relay — a different item cannot pass through it). This is the normal case and is what stops an
-  -- unrelated order's shortest path from running THROUGH a buffer and mis-marking it pass-through
-  -- (the wire self-loop). Phase 2 is a fallback: if dst is reachable ONLY through a relay buffer
-  -- (a storage container deliberately wired belt-in/belt-out as the sole route), allow buffer
-  -- transit so the destination is not silently orphaned. The common manifold always has a
-  -- splitter/merger route, so phase 1 succeeds and no buffer is ever transited there.
+  -- BFS that NEVER transits a declared (typed) buffer: storage is not a relay — an item pushed
+  -- "through" a container simply lands in it and stays (gates release only granted demand). The
+  -- old phase-2 fallback that allowed buffer transit when no splitter route existed was a
+  -- misdelivery generator: iron rods got delivered INTO the solid-biofuel buffer as a "hop".
+  -- Deliberate relay containers (unclassified, belt-in/belt-out) are still allowed — they carry
+  -- no typed identity and are wired as relays on purpose.
   local function bfs(allowBuffer)
     local prev, seen, queue, head = {}, { [src] = true }, { src }, 1
     while head <= #queue do
@@ -220,7 +219,7 @@ function Router:findPath(src, dst)
     end
     return path
   end
-  return bfs(false) or bfs(true)
+  return bfs(false)
 end
 
 -- the input belt of a machine wired to a specific port (toInput), or nil.

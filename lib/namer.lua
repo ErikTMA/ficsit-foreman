@@ -179,19 +179,17 @@ function Namer:scan()
       end
       -- 0 types: wait
     else
-      -- already named: only re-type on a MANUAL different single item
-      local item, kwt = parseGenerated(nick)
+      -- already named: the typed name is IMMUTABLE. Auto-retyping on a "different single item"
+      -- destroyed a live buffer: drain ejecta (2 iron rods) landed in the EMPTY reinforced-iron-
+      -- plate buffer and silently flipped its identity — killing the RIP demand and the whole
+      -- smart-plating chain. Repurposing a buffer = the player renames it back to the sacred
+      -- keyword ("buffer") themselves.
+      local item = parseGenerated(nick)
       if item then
         local types = itemTypes(p)
         if #types == 1 and types[1] ~= item then
-          local name = nextIndex(used, types[1], kwt)
-          p.nick = name; used[name] = true
-          actions[#actions + 1] = ("retyped %s -> %s (manual %s)"):format(nick, name, types[1])
-        elseif #types > 1 then
-          actions[#actions + 1] = ("ERROR: %s has %d item types; left as-is"):format(nick, #types)
-          self.log(("namer: %s has multiple item types; left as-is"):format(nick))
+          self.log(("namer: %s holds only %q; name kept (rename to 'buffer' to retype)"):format(nick, types[1]))
         end
-        -- empty or matching item: keep the name (never auto-reassign)
       end
     end
   end
