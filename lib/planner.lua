@@ -651,6 +651,33 @@ function Planner:assign()
       end
     end
   end
+  -- BASE MATERIALS FIRST (user rule: "we need the base materials before we can order the
+  -- higher materials"). A product whose production FAILED on a missing ingredient hands its
+  -- RANK down to that ingredient: the chain self-prioritizes bottom-up (one level per epoch on
+  -- deep chains). Without this, finals rank by their full shortfall (thousands) while a staged
+  -- intermediate ranks by its slice (~hundreds) and never wins a constructor — the live rotor
+  -- assembler idled forever because screws lost every machine to cable/sheet.
+  -- The boost is a PRIORITY TIER, not a nudge: the inherited rank (rotor ~112) still lost to
+  -- unrelated finals (cable ~585, sheet ~2000), so the ingredient never won a machine. Blocked-
+  -- chain ingredients jump above every need-ranked product; among themselves they order by the
+  -- blocked product's rank. The tier expires the moment the blocked product crafts (placed>0
+  -- clears _infeasIng), handing the machine back to the finals.
+  -- The tier expires on its own evidence: the blocking ingredient now has STOCK (a blocked
+  -- product that lost its machine is never re-attempted, so its failure record alone can not
+  -- clear — the live single-machine deadlock where MakeI held the machine forever).
+  for it, ing in pairs(Planner._infeasIng) do
+    if ing and self.bufferOf[ing] and self.recipesByProduct[ing] and not self.sources[ing] then
+      local avail = 0
+      for _, hid in ipairs((self.buffersOf and self.buffersOf[ing]) or {}) do
+        avail = avail + (count_in(self.getProxy(hid), ing) or 0)
+      end
+      if avail == 0 then
+        local blockedRank = math.max(pool[it] or 0, self.need[it] or 0)
+        local tier = 1000000 + blockedRank
+        if tier > (pool[ing] or 0) then pool[ing] = tier end
+      end
+    end
+  end
   local cap = {}                              -- ctorId -> { item -> opt }; FIRST opt per (cid,item) wins (deterministic)
   for it in pairs(pool) do
     for _, opt in ipairs(self.recipesByProduct[it]) do
