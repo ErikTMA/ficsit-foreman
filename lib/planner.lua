@@ -833,6 +833,7 @@ Planner.pourSlice   = Planner.pourSlice or 8      -- max units of an item poured
 Planner.drainStall  = Planner.drainStall or 8     -- admitted-drain epochs with NO pull before giving up (something deeper blocks the leg)
 Planner._flowDry    = Planner._flowDry or {}      -- cid -> { item = true }: admitted flows that never pulled; do not re-cork them until something pulls
 Planner._legView    = Planner._legView or {}      -- cid -> { prev = inputMap, trusted = bool } (shadow-ledger pop tracking)
+Planner._drainEpisode = Planner._drainEpisode or {} -- cid -> { recipeName = true } drains tried since the lane last moved (no repeats, no wandering)
 
 -- total items in a machine's INPUT inventory (0 on any read error)
 function Planner:_inputCount(cid)
@@ -965,17 +966,22 @@ function Planner:_drainCandidate(cid, opt)
       end
     end
   end
-  if #list == 0 then return nil end                  -- nothing on this machine eats the evidence
+  -- EPISODE SET: never re-try a recipe that already went dry this episode. The old single-name
+  -- "rotate one past the last failure" wandered: the list re-sorts every epoch by live demand
+  -- numbers, so the rotation step landed on different recipes between epochs (repeats + skips).
+  local ep = Planner._drainEpisode[cid]
+  if ep then
+    local kept = {}
+    for _, e in ipairs(list) do if not ep[e.nm] then kept[#kept + 1] = e end end
+    list = kept
+  end
+  if #list == 0 then return nil end                  -- everything evidenced already tried: probe's turn
   table.sort(list, function(a, b)
     if a.h ~= b.h then return a.h end
     if a.amt ~= b.amt then return a.amt < b.amt end
     if a.need ~= b.need then return a.need > b.need end
     return a.nm < b.nm
   end)
-  local lastFail = Planner._drainTried[cid]          -- set only when the previous drain pulled nothing
-  if lastFail then
-    for i, e in ipairs(list) do if e.nm == lastFail then return list[(i % #list) + 1].o2 end end
-  end
   return list[1].o2
 end
 
@@ -1108,7 +1114,7 @@ function Planner:_jamSweep(servedCid)
         end
         d.lastIn = inN
         if d.idle >= (Planner.drainIdle or 3) then
-          if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil
+          if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil
           else
             local lq = self.router._legQueue and self.router._legQueue[cid]
             if lq and lq[1] and lq[1] == Planner._drainAdmit[cid] then table.remove(lq, 1) end
@@ -1121,7 +1127,7 @@ function Planner:_jamSweep(servedCid)
         local jammed = self.router.legJammed and self.router:legJammed(cid)
         local st = Planner._starve[cid]
         if type(st) ~= "table" then st = { n = 0 }; Planner._starve[cid] = st end
-        if st.lastIn == inN then st.n = st.n + 1 else st.n = 0; Planner._probe[cid] = nil end
+        if st.lastIn == inN then st.n = st.n + 1 else st.n = 0; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil end
         st.lastIn = inN
         if jammed and st.n >= (Planner.drainAfter or 3) then
           local p = self.getProxy(cid)
@@ -1141,6 +1147,8 @@ function Planner:_jamSweep(servedCid)
             if not cand and not canCraft then self:_probeFire(cid, opt) end
             if cand then
               Planner._probe[cid] = nil
+              local ep2 = Planner._drainEpisode[cid] or {}; Planner._drainEpisode[cid] = ep2
+              ep2[tostring(cand.recipe.name)] = true
               pcall(function() opt.ctor:setRecipe(cand.recipe) end)   -- partial leftovers eject to OUTPUT (routed) — user rule: losing a sub-craft remnant beats a clogged lane
               Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
               Planner._drainTried[cid] = tostring(cand.recipe.name)
@@ -1211,7 +1219,7 @@ function Planner:produceFor(cid, item, share)
     if d.idle >= (Planner.drainIdle or 3) then
       -- a drain that PULLED worked: clear the round-robin cursor so the same recipe is reused on
       -- the next jam; a drain that pulled nothing keeps the cursor so the next attempt advances.
-      if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil
+      if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil
       else
         local lq = self.router._legQueue and self.router._legQueue[cid]
         if lq and lq[1] and lq[1] == Planner._drainAdmit[cid] then table.remove(lq, 1) end   -- the ledger head proved absent: drop it
@@ -1248,7 +1256,7 @@ function Planner:produceFor(cid, item, share)
     local st = Planner._starve[cid]
     if type(st) ~= "table" then st = { n = 0 }; Planner._starve[cid] = st end
     if st.lastIn == inN and st.lastSig == sig then st.n = st.n + 1
-    else st.n = 0; Planner._probe[cid] = nil end   -- lane moved: any probe episode is over
+    else st.n = 0; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil end   -- lane moved: episodes over
     st.lastIn, st.lastSig = inN, sig
     -- TIERED REACTION (user rule: "not crafting + something wrong at the input = act in seconds"):
     --   foreign item IN the input inventory  -> 1 frozen epoch, no jam mark needed (it is ours;
@@ -1288,6 +1296,8 @@ function Planner:produceFor(cid, item, share)
       end
       if cand then
         Planner._probe[cid] = nil                               -- visible evidence ends any probe episode
+        local ep2 = Planner._drainEpisode[cid] or {}; Planner._drainEpisode[cid] = ep2
+        ep2[tostring(cand.recipe.name)] = true
         pcall(function() opt.ctor:setRecipe(cand.recipe) end)   -- leftovers (if any) eject to OUTPUT and are routed
         Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
         Planner._drainTried[cid] = tostring(cand.recipe.name)

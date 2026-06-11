@@ -266,6 +266,7 @@ function App.run(modules, topology, opts)
     modules.Planner._probe = {}        -- invisible-blockage probe episodes; fresh per session
     modules.Planner._flowDry = {}      -- dry admitted-flow marks; fresh per session
     modules.Planner._legView = {}      -- shadow-ledger pop views; fresh per session
+    modules.Planner._drainEpisode = {} -- drain episode tried-sets; fresh per session
     modules.Router._legQueue = {}      -- shadow ledger itself; fresh per session (rebuilt by the first drain walk)
     modules.Router._arrived = {}; modules.Router._legTrusted = {}   -- arrival events + ledger trust; fresh per session
     modules.Router._legSent = {}       -- per-entrance push ledger; fresh per session
