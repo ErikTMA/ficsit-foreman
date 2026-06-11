@@ -613,6 +613,23 @@ end
 -- `fromOutput` is the transferItem arg for the hop out of this node.
 function Router:_overflow(sender, id, item)
   local hkey = tostring(id) .. "|" .. item       -- hold-patience key (see Router.holdPatience)
+  -- 0. ADJACENT MACHINE: the machine THIS node feeds will pull the item right now (its wanted
+  -- reagent, or its drain's admitted junk). Deliver locally. Admits are deliberately LOCAL-ONLY:
+  -- routing them as chain-wide demand attracted every loose unit of the item onto one leg (the
+  -- mixed junk trains on the constructor belts) — now each node's junk is eaten by ITS adjacent
+  -- machine, in parallel, and a leg only ever carries what its own machine pulls.
+  for _, b in ipairs(self.adj[id] or {}) do
+    if self.isMachine[b.to] and self:_machineAccepts(b.to, item) and self:_beltAccepts(b, item) then
+      if sender:transferItem(b.fromOutput or 0) then
+        self:_credit(b, item)
+        local ls = Router._legSent[b.to] or {}; Router._legSent[b.to] = ls
+        ls[item] = (ls[item] or 0) + 1
+        Router._holdN[hkey] = nil
+        Router._dlog(("ADMIT %s '%s' >out[%d] %s — adjacent machine pulls it"):format(tostring(id):sub(1,6), item, b.fromOutput or 0, tostring(b.to):sub(1,6)))
+        return true
+      end
+    end
+  end
   -- 1. REROUTE to a buffer for the item that has room — preserves it (it waits in storage,
   -- available when demand returns) instead of blocking the belt behind it.
   for _, D in ipairs(self.buffersForItem[item] or {}) do

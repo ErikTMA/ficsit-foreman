@@ -1369,17 +1369,16 @@ function Planner:fillAll()
       end
     end
   end
-  -- admit demand entries: give the admitted item a next hop onto the draining machine's leg —
-  -- but ONLY while the feeder slot still SHOWS it. A standing 10/epoch demand with the evidence
-  -- gone vacuums fresh provider stock of the item through the temp recipe forever (the drain's
-  -- progress hold never idles out while granted inflow keeps arriving). Evidence gone -> admit
-  -- dies -> inflow stops -> the drain idles out and the assignment restores.
+  -- admit LIFECYCLE only — no demand entry. The admit opens the live gate and the router's
+  -- adjacent-machine delivery (overflow step 0) moves the item the ONE hop from the feeder onto
+  -- the leg. A demand entry here routed CHAIN-WIDE: every loose unit of the admitted item
+  -- converged onto this one leg (the mixed junk trains on the constructor belts). The admit dies
+  -- when the drain ends or the feeder stops showing the item.
   for cid, admitItem in pairs(Planner._drainAdmit) do
     if not Planner._drain[cid] then Planner._drainAdmit[cid] = nil
     else
       local fh = self.router._feedItem and self.router:_feedItem(cid)
-      if fh == admitItem then self:_addDemand(admitItem, cid, 10, nil, true, true)
-      else Planner._drainAdmit[cid] = nil end
+      if fh ~= admitItem then Planner._drainAdmit[cid] = nil end
     end
   end
   -- PROVIDER GRANTS first (stocked hubs that will SUPPLY a demander act as sources this epoch and
