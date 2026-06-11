@@ -316,8 +316,12 @@ end
 -- not a trickle). An ingredient with NO conceivable supply — no raw source, no stocked hub, no
 -- assigned producer, and not deep-craftable on a free machine — fails the attempt (drives the
 -- infeasibility yield exactly as the order rollback used to).
-Planner.lowCrafts = Planner.lowCrafts or 2
-Planner.hiCrafts  = Planner.hiCrafts or 6
+-- Sized for the looped serial chain: a missed grant means a FULL LOOP LAP before the next
+-- arrival, so the band must bridge a lap. lowCrafts 2->4: refill starts while half the band
+-- remains (not when nearly empty); hiCrafts 6->12: the machine holds a lap's worth of work
+-- (user: "constructors often run out of things to craft from — up what it pulls").
+Planner.lowCrafts = Planner.lowCrafts or 4
+Planner.hiCrafts  = Planner.hiCrafts or 12
 function Planner:_demandIngredients(opt, cid, depth, maxCrafts, txn)
   local ports = self:_assignPorts(cid, opt)
   local have = self:_inputMap(cid)
@@ -829,7 +833,7 @@ Planner.drainAfter  = Planner.drainAfter or 3     -- starved+jammed epochs befor
 Planner.drainIdle   = Planner.drainIdle or 2      -- drain epochs with no pull before restoring
 Planner._probe      = Planner._probe or {}        -- cid -> { n = evidence-less dead epochs, tried = {recipeName=true}, exhausted = bool }
 Planner.probeAfter  = Planner.probeAfter or 4     -- dead epochs with NO observable cause before the bounded probe starts
-Planner.pourSlice   = Planner.pourSlice or 8      -- max units of an item poured per machine demand per epoch (lanes hold ~4)
+Planner.pourSlice   = Planner.pourSlice or 12     -- max units of an item poured per machine demand per epoch (legs spill to pass-along; the heldFresh brake stops over-pour)
 Planner.drainStall  = Planner.drainStall or 8     -- admitted-drain epochs with NO pull before giving up (something deeper blocks the leg)
 Planner._flowDry    = Planner._flowDry or {}      -- cid -> { item = true }: admitted flows that never pulled; do not re-cork them until something pulls
 Planner._legView    = Planner._legView or {}      -- cid -> { prev = inputMap, trusted = bool } (shadow-ledger pop tracking)
