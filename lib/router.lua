@@ -701,6 +701,7 @@ function Router:_routeAtSplitter(sender, id, item)
     item = cur
   end
   local legs = (self.nextHop[id] or {})[item]
+  local machineLegFull = false
   for li = 1, (legs and #legs or 0) do
     local best = legs[li].b
     local terminal = not self.bufferItem[best.to]
@@ -731,8 +732,28 @@ function Router:_routeAtSplitter(sender, id, item)
       -- input belt is backed up (output blocked, or a foreign head item the machine won't pull).
       -- Mark machine entrances (module-durable, epoch-stamped: the planner's feed-drain reads it;
       -- cleared on a successful push) and try the next-nearest demander's leg.
-      if self.isMachine[best.to] then Router._legFullMach = Router._legFullMach or {}; Router._legFullMach[best.to] = Router._epochN or 0 end
+      if self.isMachine[best.to] then
+        Router._legFullMach = Router._legFullMach or {}; Router._legFullMach[best.to] = Router._epochN or 0
+        machineLegFull = true
+      end
       Router._dlog(("SPLFULL %s '%s' >out[%d] %s — leg full, diverting"):format(tostring(id):sub(1, 6), item, best.fromOutput or 0, tostring(best.to):sub(1, 6)))
+    end
+  end
+  -- PASS-ALONG (user rule: "everything can go through the transit leg — also the machine's own
+  -- reagent when its leg is full"). Holding here dams the shared chain for everyone behind; on
+  -- the looped manifold the item circulates and retries the machine leg next time around. Only
+  -- when the MACHINE leg was full (the consumer exists but cannot take it now), and only onto a
+  -- pure transit leg (splitter/merger — never another machine, never a buffer it doesn't belong
+  -- in). Pour pacing bounds how many items can ever be circulating.
+  if machineLegFull then
+    for _, b in ipairs(self.adj[id] or {}) do
+      if (self.isSplitter[b.to] or self.isMerger[b.to]) and self:_beltAccepts(b, item) then
+        if sender:transferItem(b.fromOutput or 0) then
+          self:_credit(b, item)
+          Router._dlog(("PASSALONG %s '%s' >out[%d] %s — machine leg full, keep the chain flowing"):format(tostring(id):sub(1, 6), item, b.fromOutput or 0, tostring(b.to):sub(1, 6)))
+          return true
+        end
+      end
     end
   end
   return self:_overflow(sender, id, item)
