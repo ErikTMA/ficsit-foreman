@@ -416,11 +416,14 @@ function Planner:produceInto(item, depth, txn, needUnits, forCid)
 end
 
 -- append one demand entry (consumer `id` needs `n` of `item`, optionally on a pinned port)
-function Planner:_addDemand(item, id, n, port, isMachine)
+function Planner:_addDemand(item, id, n, port, isMachine, noGrant)
   item = lc(item)
   if n <= 0 then return end
   self._demand[item] = self._demand[item] or {}
-  table.insert(self._demand[item], { id = id, need = n, port = port, machine = isMachine or false })
+  -- noGrant: the entry exists for ROUTING only (drain admits, drain-product escapes). It must
+  -- never pull stock from providers or open a source gate — the live vacuum: cork admits for
+  -- 'iron ingot' opened the iron gate, flooding the chain with fresh ingots to drain, forever.
+  table.insert(self._demand[item], { id = id, need = n, port = port, machine = isMachine or false, noGrant = noGrant or false })
   if isMachine and port ~= nil then
     self._pins[id] = self._pins[id] or {}
     self._pins[id][port] = item
@@ -496,6 +499,10 @@ function Planner:computeNeed()
   for _, c in ipairs(self.topo.containers or {}) do          -- ingredient is a DRAW from its hub)
     local item = Planner.destItem(c)
     local target = c.target or Planner.destTarget(c)
+    -- same PHYSICAL-capacity clamp as _needingBuffers: a target above capacity would keep need[]
+    -- (and the machine's share) alive after the buffer is full — the surplus crafts can't land
+    -- and reroute/strand (the reroute B2 overproduction under epoch re-planning)
+    if target and c.capacity and c.capacity < target then target = c.capacity end
     if item and target and not self.sources[item] then
       local have = count_in(self.getProxy(c.id), item)
       if self.intermediate[item] then
@@ -822,6 +829,7 @@ Planner.drainAfter  = Planner.drainAfter or 3     -- starved+jammed epochs befor
 Planner.drainIdle   = Planner.drainIdle or 3      -- drain epochs with no pull before restoring
 Planner._probe      = Planner._probe or {}        -- cid -> { n = evidence-less dead epochs, tried = {recipeName=true}, exhausted = bool }
 Planner.probeAfter  = Planner.probeAfter or 10    -- dead epochs with NO observable cause before the bounded probe starts
+Planner.pourSlice   = Planner.pourSlice or 8      -- max units of an item poured per machine demand per epoch (lanes hold ~4)
 
 -- total items in a machine's INPUT inventory (0 on any read error)
 function Planner:_inputCount(cid)
@@ -996,7 +1004,7 @@ function Planner:_probeFire(cid, opt)
     :format(tostring(cid):sub(1, 6), Planner.probeAfter or 10, tostring(cand.recipe.name))) end)
   local di = self.itemOfRecipe[tostring(cand.recipe.name)]
   if di and self.bufferOf[di] then
-    self:_addDemand(di, self.bufferOf[di], math.max(1, self:_fillAmount(di)), nil, false)
+    self:_addDemand(di, self.bufferOf[di], math.max(1, self:_fillAmount(di)), nil, false, true)
   end
   return true
 end
@@ -1097,7 +1105,7 @@ function Planner:produceFor(cid, item, share)
     else
       local di = live and self.itemOfRecipe[tostring(live)]                 -- route the drained product away
       if di and self.bufferOf[di] then
-        self:_addDemand(di, self.bufferOf[di], math.max(1, self:_fillAmount(di)), nil, false)
+        self:_addDemand(di, self.bufferOf[di], math.max(1, self:_fillAmount(di)), nil, false, true)
       end
       return true                     -- hold: no assigned-recipe production (and no feedstock demand) this epoch
     end
@@ -1147,7 +1155,7 @@ function Planner:produceFor(cid, item, share)
           :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name), tostring(opt.recipe.name))) end)
         local di = self.itemOfRecipe[tostring(cand.recipe.name)]
         if di and self.bufferOf[di] then
-          self:_addDemand(di, self.bufferOf[di], math.max(1, self:_fillAmount(di)), nil, false)
+          self:_addDemand(di, self.bufferOf[di], math.max(1, self:_fillAmount(di)), nil, false, true)
         end
         return true
       end
@@ -1174,7 +1182,7 @@ function Planner:produceFor(cid, item, share)
       stA.n = 0
       local di = self.itemOfRecipe[tostring(live)]
       if di and self.bufferOf[di] then
-        self:_addDemand(di, self.bufferOf[di], math.max(1, self:_fillAmount(di)), nil, false)
+        self:_addDemand(di, self.bufferOf[di], math.max(1, self:_fillAmount(di)), nil, false, true)
       end
       return true
     end
@@ -1235,7 +1243,10 @@ function Planner:fillAll()
     local placed = 0
     for i, cid in ipairs(cids) do
       local sh = base + (i <= extra and 1 or 0)
-      if self:produceFor(cid, item, need > 0 and sh or nil) then placed = placed + 1 end
+      -- share 0 (NOT nil) when the product needs nothing: nil means "uncapped" further down and
+      -- let a dwelling assignment demand its full hi-water band with zero product need — the
+      -- crafts couldn't land and rerouted/stranded (the reroute B2 overproduction)
+      if self:produceFor(cid, item, sh) then placed = placed + 1 end
     end
     plan[#plan + 1] = ("%s: %d/%d ctor"):format(item, placed, #cids)
     -- INFEASIBILITY tracking: an assigned item whose every produceFor failed (its ingredient has
@@ -1312,17 +1323,34 @@ function Planner:fillAll()
     if not Planner._drain[cid] then Planner._drainAdmit[cid] = nil
     else
       local fh = self.router._feedItem and self.router:_feedItem(cid)
-      if fh == admitItem then self:_addDemand(admitItem, cid, 10, nil, true)
+      if fh == admitItem then self:_addDemand(admitItem, cid, 10, nil, true, true)
       else Planner._drainAdmit[cid] = nil end
     end
   end
   -- PROVIDER GRANTS first (stocked hubs that will SUPPLY a demander act as sources this epoch and
   -- must not also demand a refill — their own granted outflow would route straight back to them).
   local grants, providing = {}, {}
+  local epochN = self.router and self.router._epochN or 0
   for item, consumers in pairs(self._demand) do
     local total = 0
     local consumerIds = {}
-    for _, cn in ipairs(consumers) do total = total + cn.need; consumerIds[cn.id] = true end
+    -- POUR PACING (the freeze/unfreeze killer): never release more of an item than its lanes can
+    -- absorb. While ANY hold of this item is fresh on the network, machine demands pour NOTHING
+    -- new (level-triggered: holds drain -> pouring resumes); when clear, a machine demand pours
+    -- at most pourSlice per epoch — a leg holds ~4, not the 17-unit hi-water that turned the
+    -- shared chain into a frozen buffer. Buffer fills absorb at the destination and stay unpaced.
+    local held = self.router and self.router._heldFresh and self.router._heldFresh[item]
+    local congested = held ~= nil and (epochN - held) <= 1
+    for _, cn in ipairs(consumers) do
+      consumerIds[cn.id] = true
+      if not cn.noGrant then
+        if cn.machine then
+          if not congested then total = total + math.min(cn.need, Planner.pourSlice or 8) end
+        else
+          total = total + cn.need
+        end
+      end
+    end
     local remaining = total
     for _, pr in ipairs(self:_providersFor(item, consumerIds)) do
       if remaining <= 0 then break end

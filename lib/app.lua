@@ -265,6 +265,7 @@ function App.run(modules, topology, opts)
     modules.Planner._drainAdmit = {}   -- targeted-drain admissions; fresh per session
     modules.Planner._probe = {}        -- invisible-blockage probe episodes; fresh per session
     modules.Router._legSent = {}       -- per-entrance push ledger; fresh per session
+    modules.Router._heldFresh = {}     -- live congestion signal; fresh per session
   end
 
   -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by

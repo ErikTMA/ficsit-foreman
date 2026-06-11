@@ -663,6 +663,8 @@ function Router:_overflow(sender, id, item)
   -- controller over a single stray item.
   Router._nStuck = (Router._nStuck or 0) + 1             -- always-counted; the perf line reports the rate
   Router._holdN[hkey] = (Router._holdN[hkey] or 0) + 1
+  Router._heldFresh = Router._heldFresh or {}
+  Router._heldFresh[item] = Router._epochN or 0   -- live congestion signal: the planner stops POURING this item while anything holds
   Router._flowBy[item] = Router._flowBy[item] or {}
   Router._flowBy[item].stuck = (Router._flowBy[item].stuck or 0) + 1
   if impatient then
@@ -971,6 +973,7 @@ Router._flowBy = Router._flowBy or {}             -- item -> { rer=, sunk=, stuc
 -- trigger drains). Set by _routeAtSplitter/_mergerPush, cleared on a successful push.
 Router._legFullMach = Router._legFullMach or {}
 Router._legSent = Router._legSent or {}          -- machineId -> item -> count pushed onto its entrance this session
+Router._heldFresh = Router._heldFresh or {}      -- item -> epoch of the most recent HOLD (congestion: stop pouring)
 Router.jamFresh = Router.jamFresh or 2            -- a jam mark older than this many epochs is stale
 -- Is `cid`'s entrance jam mark FRESH? Under hold-at-splitter, pushes may simply STOP being
 -- attempted, leaving a stale mark that re-triggered the feed-drain forever (the v0.16.5 freeze
