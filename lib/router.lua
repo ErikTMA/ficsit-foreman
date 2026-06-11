@@ -480,6 +480,19 @@ function Router:_drainRetry()
   end
 end
 
+-- An item physically ENTERED a machine (ItemTransfer on its input connector): record the
+-- arrival for the planner (drain-pull proof, sampling-free) and pop a matching ledger head.
+function Router:_onArrive(sender, item)
+  local cid = Router._connCid and Router._connCid[sender]
+  if not cid then return end
+  local nm = itemName(item)
+  if not nm then return end
+  local a = Router._arrived[cid] or {}; Router._arrived[cid] = a
+  a[nm] = (a[nm] or 0) + 1
+  local q = Router._legQueue[cid]
+  if q and q[1] == nm then table.remove(q, 1); Router._legTrusted = Router._legTrusted or {}; Router._legTrusted[cid] = true end
+end
+
 --- Start listening to every splitter/merger so their ItemRequest signals actually
 --- reach this computer. CRITICAL: in FIN, event.registerListener only sets a callback
 --- filter — you must ALSO event.listen(component) for each signal source, or NOTHING
@@ -521,6 +534,23 @@ function Router:listenAll()
     local p = self.getProxy(id)
     if p then pcall(function() event.listen(p) end); Router._listened[id] = true; n = n + 1 end
   end
+  -- machine INPUT connectors: their ItemTransfer signal fires per item ENTERING the machine —
+  -- the only sampling-free consumption proof FIN offers (the input inventory often eats an
+  -- arrival between two epochs, invisible to polling). Feeds the shadow-ledger pops.
+  Router._connCid = {}
+  for _, cid in ipairs(self.topo.constructors or {}) do
+    local p = self.getProxy(cid)
+    if p and p.getFactoryConnectors then
+      local okc, conns = pcall(function() return p:getFactoryConnectors() end)
+      if okc then for _, conn in ipairs(conns or {}) do
+        local dir = nil; pcall(function() dir = conn.direction end)
+        if dir == 0 then
+          pcall(function() event.listen(conn) end)
+          Router._connCid[conn] = cid
+        end
+      end end
+    end
+  end
   if Router.DEBUG and computer and computer.log then
     computer.log(1, ("[Foreman] listeners re-synced %d -> %d (pruned orphaned senders)"):format(prev, n))
   end
@@ -542,6 +572,8 @@ function Router:install()
   self:listenAll()
   event.registerListener(event.filter{ event = "ItemRequest" },
     function(_, sender, a, b) self:_dispatch(sender, a, b) end)
+  event.registerListener(event.filter{ event = "ItemTransfer" },
+    function(_, sender, item) self:_onArrive(sender, item) end)
 end
 
 -- back-compat alias — pump() (level-triggered) drains every codeable input each call.
@@ -624,6 +656,10 @@ function Router:_overflow(sender, id, item)
         self:_credit(b, item)
         local ls = Router._legSent[b.to] or {}; Router._legSent[b.to] = ls
         ls[item] = (ls[item] or 0) + 1
+        if self.machineAdmit and self.machineAdmit[b.to] == item then
+          local lq = Router._legQueue[b.to] or {}; Router._legQueue[b.to] = lq
+          if #lq < 64 then lq[#lq + 1] = item end
+        end
         Router._holdN[hkey] = nil
         Router._dlog(("ADMIT %s '%s' >out[%d] %s — adjacent machine pulls it"):format(tostring(id):sub(1,6), item, b.fromOutput or 0, tostring(b.to):sub(1,6)))
         return true
@@ -733,6 +769,10 @@ function Router:_routeAtSplitter(sender, id, item)
           if Router._legFullMach then Router._legFullMach[best.to] = nil end   -- entrance accepted: jam (if any) cleared
           local ls = Router._legSent[best.to] or {}; Router._legSent[best.to] = ls
           ls[item] = (ls[item] or 0) + 1   -- leg ledger: items WE put on this entrance (probe candidates if the lane dies)
+          if self.machineAdmit and self.machineAdmit[best.to] == item then
+            local lq = Router._legQueue[best.to] or {}; Router._legQueue[best.to] = lq
+            if #lq < 64 then lq[#lq + 1] = item end
+          end
         end
         -- FAIR SPLIT within an epoch: rotate the used leg to the back of its equal-distance
         -- group, so two demanders at the same distance alternate item-by-item (the 8/8 split)
@@ -946,6 +986,10 @@ function Router:_mergerPush(sender, id, input, nm)
       if Router._legFullMach then Router._legFullMach[out.to] = nil end   -- entrance accepted: jam cleared
       local ls = Router._legSent[out.to] or {}; Router._legSent[out.to] = ls
       ls[nm] = (ls[nm] or 0) + 1
+      if self.machineAdmit and self.machineAdmit[out.to] == nm then
+        local lq = Router._legQueue[out.to] or {}; Router._legQueue[out.to] = lq
+        if #lq < 64 then lq[#lq + 1] = nm end
+      end
     end
   end
   return true
@@ -1012,6 +1056,11 @@ Router._flowBy = Router._flowBy or {}             -- item -> { rer=, sunk=, stuc
 -- trigger drains). Set by _routeAtSplitter/_mergerPush, cleared on a successful push.
 Router._legFullMach = Router._legFullMach or {}
 Router._legSent = Router._legSent or {}          -- machineId -> item -> count pushed onto its entrance this session
+Router._arrived = Router._arrived or {}          -- machineId -> item -> count of ItemTransfer arrivals since the planner last read them
+Router._connCid = Router._connCid or {}          -- machine input connector -> machineId (ItemTransfer sender mapping)
+Router._legQueue = Router._legQueue or {}        -- machineId -> FIFO of ADMITTED (drain) items pushed onto its entrance. The SHADOW
+                                                 -- LEDGER: belts are unreadable, but we are the only writer — wanted reagents flow and
+                                                 -- get eaten by design, so only the foreign/admitted items are worth remembering.
 Router._heldFresh = Router._heldFresh or {}      -- item -> epoch of the most recent HOLD (congestion: stop pouring)
 Router.corkPatience = Router.corkPatience or 100 -- hold retries before reporting a cork (sinking keeps holdPatience)
 Router.jamFresh = Router.jamFresh or 2            -- a jam mark older than this many epochs is stale

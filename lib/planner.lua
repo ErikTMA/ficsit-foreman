@@ -832,6 +832,7 @@ Planner.probeAfter  = Planner.probeAfter or 4     -- dead epochs with NO observa
 Planner.pourSlice   = Planner.pourSlice or 8      -- max units of an item poured per machine demand per epoch (lanes hold ~4)
 Planner.drainStall  = Planner.drainStall or 8     -- admitted-drain epochs with NO pull before giving up (something deeper blocks the leg)
 Planner._flowDry    = Planner._flowDry or {}      -- cid -> { item = true }: admitted flows that never pulled; do not re-cork them until something pulls
+Planner._legView    = Planner._legView or {}      -- cid -> { prev = inputMap, trusted = bool } (shadow-ledger pop tracking)
 
 -- total items in a machine's INPUT inventory (0 on any read error)
 function Planner:_inputCount(cid)
@@ -857,6 +858,61 @@ function Planner:_inputMap(cid)
   return have
 end
 
+-- SHADOW-LEDGER pops: belts are unreadable in FIN, but only WE write to a machine leg (the
+-- wanted-recipe gate + local admits), so Router._legQueue[cid] mirrors the physical FIFO.
+-- Items leave a leg only into its machine, head-first: pop the head when it visibly ARRIVES
+-- in the input inventory, or once per epoch when the live recipe ate it unseen (input changed
+-- and the head is live feedstock). The ledger starts UNTRUSTED each session — pre-session
+-- residue may sit AHEAD of everything we pushed — and becomes trusted on the first in-order
+-- arrival of a queued item (residue would have blocked it).
+function Planner:_legPop(cid, liveIng)
+  local q = self.router._legQueue and self.router._legQueue[cid]
+  local v = Planner._legView[cid]
+  if type(v) ~= "table" then v = { prev = {}, trusted = false }; Planner._legView[cid] = v end
+  local now = self:_inputMap(cid)
+  local changed, gains = false, {}
+  for it, n in pairs(now) do
+    local d = n - (v.prev[it] or 0)
+    if d > 0 then gains[it] = d end
+    if d ~= 0 then changed = true end
+  end
+  for it, n in pairs(v.prev) do if (now[it] or 0) ~= n then changed = true end end
+  v.prev = now
+  -- event-driven arrivals (ItemTransfer on the input connector) are the authoritative gains:
+  -- polling misses items eaten between samples; the signal never does
+  local arr = self.router._arrived and self.router._arrived[cid]
+  if arr then
+    for it, n in pairs(arr) do
+      if n > 0 then gains[it] = (gains[it] or 0) + n; changed = true end
+    end
+    self.router._arrived[cid] = nil
+    v.arrived = arr                                -- drain holds read this as pull proof
+  else
+    v.arrived = nil
+  end
+  if self.router._legTrusted and self.router._legTrusted[cid] then v.trusted = true end
+  if not q or #q == 0 then return end
+  -- pops: the ledger holds only ADMITTED items, and an admitted item is consumed exactly when
+  -- it shows up in the input inventory (the drain recipe eats it) — a visible GAIN pops its
+  -- head. A head that never arrives is popped by the drain's dry-stall (self-correction). The
+  -- first in-order arrival arms TRUST: anything physically ahead of it must already be gone.
+  local guard = 0
+  while #q > 0 and guard < 64 do
+    guard = guard + 1
+    local head = q[1]
+    if gains[head] and gains[head] > 0 then
+      gains[head] = gains[head] - 1
+      table.remove(q, 1)
+      v.trusted = true
+    elseif changed and liveIng and liveIng[head] then
+      table.remove(q, 1)
+      v.trusted = true
+    else
+      break
+    end
+  end
+end
+
 -- the next drain recipe to try on `cid` (≠ the assigned `opt`). EVIDENCE-GATED (user rule: "if we
 -- are not crafting and the input side has another item than what we need, switch recipe based on
 -- what is on the input side and what we need most that can be crafted by that item"):
@@ -879,6 +935,15 @@ function Planner:_drainCandidate(cid, opt)
   -- deeper blocks the leg): not evidence, or the drain re-fires forever on the same dead view
   if hint and (assignedIng[hint] or (Planner._flowDry[cid] and Planner._flowDry[cid][hint])) then hint = nil end
   if hint then observed[hint] = true end
+  -- TRUSTED LEDGER HEAD: the exact next item the machine faces (the belt is unreadable, but we
+  -- are its only writer). Outranks the feeder slot, which only shows what is one node back.
+  local lv = Planner._legView[cid]
+  local lq = self.router._legQueue and self.router._legQueue[cid]
+  local qhead = (lv and lv.trusted and lq and lq[1]) or nil
+  if qhead and not assignedIng[qhead] and not (Planner._flowDry[cid] and Planner._flowDry[cid][qhead]) then
+    observed[qhead] = true
+    hint = qhead
+  end
   for it in pairs(self:_inputMap(cid)) do if not assignedIng[it] then observed[it] = true end end
   if next(observed) == nil then return nil end       -- no foreign item OBSERVED -> no drain
   local needOf = {}
@@ -952,7 +1017,11 @@ function Planner:_probeCandidate(cid, opt, pr)
         local ing = #o2.ingredients == 1 and o2.ingredients[1] or nil
         if ing and not assignedIng[ing.name] and existsInFactory(ing.name) then
           local prod = self.itemOfRecipe[nm]
-          list[#list + 1] = { o2 = o2, nm = nm, sent = sent[ing.name] and 1 or 0,
+          local member = 0
+          local lq = self.router._legQueue and self.router._legQueue[cid]
+          if lq then for _, it in ipairs(lq) do if it == ing.name then member = 2; break end end end
+          if member == 0 and sent[ing.name] then member = 1 end
+          list[#list + 1] = { o2 = o2, nm = nm, sent = member,
                               amt = ing.amount or 1, need = (prod and needOf[prod]) or 0 }
         end
       end
@@ -1024,10 +1093,13 @@ end
 function Planner:_jamSweep(servedCid)
   for _, cid in ipairs(self.topo.constructors or {}) do
     if not servedCid[cid] then
+      self:_legPop(cid, nil)
       local inN = self:_inputCount(cid)
       local d = Planner._drain[cid]
       if d then
-        if d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
+        local lvA = Planner._legView[cid]
+        if lvA and lvA.arrived and next(lvA.arrived) then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
+        elseif d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
         else d.idle = (d.idle or 0) + 1; d.dry = (d.dry or 0) + 1 end
         if Planner._drainAdmit[cid] and self.router._feedItem and self.router:_feedItem(cid) == Planner._drainAdmit[cid] then d.idle = 0 end
         if (d.dry or 0) >= (Planner.drainStall or 8) and not d.pulled and Planner._drainAdmit[cid] then
@@ -1038,6 +1110,8 @@ function Planner:_jamSweep(servedCid)
         if d.idle >= (Planner.drainIdle or 3) then
           if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil
           else
+            local lq = self.router._legQueue and self.router._legQueue[cid]
+            if lq and lq[1] and lq[1] == Planner._drainAdmit[cid] then table.remove(lq, 1) end
             local stB = Planner._starve[cid]; if type(stB) == "table" then stB.n = 99 end
             local prB = Planner._probe[cid]; if type(prB) == "table" then prB.n = 99 end
           end
@@ -1099,6 +1173,16 @@ function Planner:produceFor(cid, item, share)
   local live = okc and cur and cur.name or nil
   local needSwitch = false
   local inN = self:_inputCount(cid)
+  do
+    local li = {}
+    if okc and cur and cur.getIngredients then
+      local oki, ings = pcall(function() return cur:getIngredients() end)
+      if oki then for _, ia in ipairs(ings or {}) do
+        if ia.type and ia.type.name then li[lc(ia.type.name)] = true end
+      end end
+    end
+    self:_legPop(cid, li)
+  end
   -- ---- FEED-DRAIN hold: a machine clearing its jammed entrance keeps the drain recipe ----
   local d = Planner._drain[cid]
   if d then
@@ -1107,7 +1191,9 @@ function Planner:produceFor(cid, item, share)
     -- pin the drain recipe while the assigned ingredient jammed the entrance. Now it idles out;
     -- the restore's setRecipe EJECTS the remnant to the output (routed away) — losing a partial
     -- input below the craft requirement beats a clogged machine.
-    if d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
+    local lvA = Planner._legView[cid]
+    if lvA and lvA.arrived and next(lvA.arrived) then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
+    elseif d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
     else d.idle = (d.idle or 0) + 1; d.dry = (d.dry or 0) + 1 end
     -- EVIDENCE PERSISTENCE: while the feeder slot still SHOWS the admitted item the job is not
     -- done — arrival gaps on a backed-up chain exceed drainIdle and caused one-item-per-cork
@@ -1127,6 +1213,8 @@ function Planner:produceFor(cid, item, share)
       -- the next jam; a drain that pulled nothing keeps the cursor so the next attempt advances.
       if d.pulled then Planner._drainTried[cid] = nil; Planner._probe[cid] = nil
       else
+        local lq = self.router._legQueue and self.router._legQueue[cid]
+        if lq and lq[1] and lq[1] == Planner._drainAdmit[cid] then table.remove(lq, 1) end   -- the ledger head proved absent: drop it
         -- DRY-CHAIN: the guess missed (the invisible leg head is some OTHER type). Do not spend
         -- 3 epochs re-detecting the same frozen machine — prime the triggers so the NEXT
         -- candidate (evidence or probe) fires on the very next epoch. Walking the whole recipe
@@ -1475,6 +1563,9 @@ function Planner:fillAll()
     end
   end
   self.router.machineLive = liveGate
+  local admitMap = {}
+  for cid, it in pairs(Planner._drainAdmit) do if Planner._drain[cid] then admitMap[cid] = it end end
+  self.router.machineAdmit = admitMap   -- the router's shadow ledger records exactly these pushes
   self.router:setDemand(self._demand, self._pins)
   self.router:buildNextHop()
   self.router:applyGates(grants)
