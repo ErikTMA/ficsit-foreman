@@ -936,17 +936,15 @@ end
 function Planner:_drainCandidate(cid, opt)
   local assignedIng = {}
   for _, ing in ipairs(opt.ingredients) do assignedIng[ing.name] = true end
-  local observed, hint = {}, self.router._feedItem and self.router:_feedItem(cid)
-  -- a flowDry item is KNOWN unreachable (an admitted drain already starved on it — something
-  -- deeper blocks the leg): not evidence, or the drain re-fires forever on the same dead view
-  if hint and (assignedIng[hint] or (Planner._flowDry[cid] and Planner._flowDry[cid][hint])) then hint = nil end
-  if hint then observed[hint] = true end
-  -- TRUSTED LEDGER HEAD: the exact next item the machine faces (the belt is unreadable, but we
-  -- are its only writer). Outranks the feeder slot, which only shows what is one node back.
+  -- ON-LEG EVIDENCE ONLY (user rule: the feeder slot is chain transit — items there are NOT the
+  -- machine's problem and, with the gate sealed to wanted reagents, can never be pulled in).
+  -- Evidence = the trusted ledger head (an item we ourselves put on the leg) or a foreign item
+  -- already sitting IN the machine's input inventory.
+  local observed, hint = {}, nil
   local lv = Planner._legView[cid]
   local lq = self.router._legQueue and self.router._legQueue[cid]
   local qhead = (lv and lv.trusted and lq and lq[1]) or nil
-  if qhead and not assignedIng[qhead] and not (Planner._flowDry[cid] and Planner._flowDry[cid][qhead]) then
+  if qhead and not assignedIng[qhead] then
     observed[qhead] = true
     hint = qhead
   end
@@ -1010,6 +1008,10 @@ function Planner:_clearNext(cid, opt)
       if member[it] or sent[it] then return true end
       if self.sources[it] then return true end
       if self._demand and self._demand[it] then return true end
+      -- the router TOUCHED this item type this session (routed, held or sunk it somewhere):
+      -- it provably exists in the factory even with no source/buffer/demand for it (legacy
+      -- junk on the loop whose siblings already drained to the sink)
+      if self.router and self.router._seen and self.router._seen[it] then return true end
       for _, hid in ipairs((self.buffersOf and self.buffersOf[it]) or {}) do
         local ok, n = pcall(function() return count_in(self.getProxy(hid), it) end)
         if ok and (n or 0) > 0 then return true end
@@ -1084,8 +1086,6 @@ function Planner:_clearStep(cid, opt, live)
   Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
   Planner._drainTried[cid] = tostring(cand.recipe.name)
   Planner._tempRecipe[cid] = tostring(cand.recipe.name)
-  local fh = self.router._feedItem and self.router:_feedItem(cid)
-  if fh == cand.ingredients[1].name then Planner._drainAdmit[cid] = fh end
   pcall(function() computer.log(1, ("[Foreman] CLEAR %s: trying '%s' (rotation queue)")
     :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name))) end)
   return true
@@ -1109,26 +1109,12 @@ function Planner:_jamSweep(servedCid)
         if lvA and lvA.arrived and next(lvA.arrived) then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
         elseif d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
         else d.idle = (d.idle or 0) + 1; d.dry = (d.dry or 0) + 1 end
-        if Planner._drainAdmit[cid] and self.router._feedItem and self.router:_feedItem(cid) == Planner._drainAdmit[cid] then d.idle = 0 end
-        do
-          local lq = self.router._legQueue and self.router._legQueue[cid]
-          local adm = Planner._drainAdmit[cid]
-          if adm and lq then
-            for _, it in ipairs(lq) do if it == adm then d.idle = 0; break end end
-          end
-        end
-        if (d.dry or 0) >= (Planner.drainStall or 8) and not d.pulled and Planner._drainAdmit[cid] then
-          local fd = Planner._flowDry[cid] or {}; Planner._flowDry[cid] = fd; fd[Planner._drainAdmit[cid]] = true
-          d.idle = (Planner.drainIdle or 3)
-        end
         d.lastIn = inN
         if d.idle >= (Planner.drainIdle or 3) then
           if d.pulled then
             Planner._drainTried[cid] = nil; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil
             Planner._clearDry[cid] = nil; Planner._clearPops[cid] = nil
           else
-            local lq = self.router._legQueue and self.router._legQueue[cid]
-            if lq and lq[1] and lq[1] == Planner._drainAdmit[cid] then table.remove(lq, 1) end
             local stB = Planner._starve[cid]; if type(stB) == "table" then stB.n = 99 end
             local prB = Planner._probe[cid]; if type(prB) == "table" then prB.n = 99 end
           end
@@ -1165,8 +1151,6 @@ function Planner:_jamSweep(servedCid)
               Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
               Planner._drainTried[cid] = tostring(cand.recipe.name)
               Planner._tempRecipe[cid] = tostring(cand.recipe.name)   -- never seed-adopted as a real assignment
-              local fh = self.router._feedItem and self.router:_feedItem(cid)
-              if fh == cand.ingredients[1].name then Planner._drainAdmit[cid] = fh end   -- feeder-slot evidence must be ROUTED onto the leg (admit); an input-inventory remnant is already inside — no admission, nothing to vacuum
               st.n = 0
               pcall(function() computer.log(1, ("[Foreman] DRAIN %s (idle): lane jammed; temp recipe '%s' pulls the blockage")
                 :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name))) end)
@@ -1216,30 +1200,8 @@ function Planner:produceFor(cid, item, share)
     if lvA and lvA.arrived and next(lvA.arrived) then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
     elseif d.lastIn ~= nil and inN ~= d.lastIn then d.idle = 0; d.pulled = true; d.dry = 0; Planner._flowDry[cid] = nil
     else d.idle = (d.idle or 0) + 1; d.dry = (d.dry or 0) + 1 end
-    -- EVIDENCE PERSISTENCE: while the feeder slot still SHOWS the admitted item the job is not
-    -- done — arrival gaps on a backed-up chain exceed drainIdle and caused one-item-per-cork
-    -- churn (restore -> re-cork -> drain, one junk item eaten per ~3 cycles of patience). But a
-    -- drain that NEVER pulls despite admission is blocked deeper (an invisible stray ahead of
-    -- the admitted item) — the dry-stall bound ends it and blocks re-corking the same item so
-    -- the probe gets its turn.
-    if Planner._drainAdmit[cid] and self.router._feedItem and self.router:_feedItem(cid) == Planner._drainAdmit[cid] then d.idle = 0 end
-    -- LEDGER PIN (the fresh re-contamination): the admit let items onto the leg; restoring while
-    -- they are still in transit STRANDS them (every drain cycle left its tail — iron+copper+sam
-    -- accumulated on all three legs within one session). The clear recipe holds until the ledger
-    -- says no admitted items remain; the dry-stall still bounds items that never arrive.
-    do
-      local lq = self.router._legQueue and self.router._legQueue[cid]
-      local adm = Planner._drainAdmit[cid]
-      if adm and lq then
-        for _, it in ipairs(lq) do if it == adm then d.idle = 0; break end end
-      end
-    end
     d.lastIn = inN
     if live and live ~= opt.recipe.name then d.recipe = tostring(live) end   -- adopt manual changes mid-drain
-    if (d.dry or 0) >= (Planner.drainStall or 8) and not d.pulled and Planner._drainAdmit[cid] then
-      local fd = Planner._flowDry[cid] or {}; Planner._flowDry[cid] = fd; fd[Planner._drainAdmit[cid]] = true
-      d.idle = (Planner.drainIdle or 3)
-    end
     if d.idle >= (Planner.drainIdle or 3) then
       -- a drain that PULLED worked: clear the round-robin cursor so the same recipe is reused on
       -- the next jam; a drain that pulled nothing keeps the cursor so the next attempt advances.
@@ -1247,8 +1209,6 @@ function Planner:produceFor(cid, item, share)
         Planner._drainTried[cid] = nil; Planner._probe[cid] = nil; Planner._drainEpisode[cid] = nil
         Planner._clearDry[cid] = nil; Planner._clearPops[cid] = nil
       else
-        local lq = self.router._legQueue and self.router._legQueue[cid]
-        if lq and lq[1] and lq[1] == Planner._drainAdmit[cid] then table.remove(lq, 1) end   -- the ledger head proved absent: drop it
         -- DRY-CHAIN: the guess missed (the invisible leg head is some OTHER type). Do not spend
         -- 3 epochs re-detecting the same frozen machine — prime the triggers so the NEXT
         -- candidate (evidence or probe) fires on the very next epoch. Walking the whole recipe
@@ -1286,27 +1246,18 @@ function Planner:produceFor(cid, item, share)
       Planner._clearDry[cid] = nil; Planner._clearPops[cid] = nil; Planner._clearN[cid] = nil end   -- lane moved: episodes over
     st.lastIn, st.lastSig = inN, sig
     -- TIERED REACTION (user rule: "not crafting + something wrong at the input = act in seconds"):
-    --   foreign item IN the input inventory  -> 1 frozen epoch, no jam mark needed (it is ours;
-    --                                           nothing else can ever use it);
-    --   foreign at the feeder, demanded by NO machine -> 2 epochs (junk; nobody is waiting for it);
-    --   foreign at the feeder but demanded elsewhere  -> 3 epochs + jam mark (likely IN TRANSIT on
-    --                                           the shared chain — do not steal another machine's
-    --                                           feedstock just because it passes by).
+    --   foreign item IN the input inventory -> 1 frozen epoch, no jam mark needed (it is ours;
+    --                                          nothing else can ever use it);
+    --   otherwise -> 3 epochs + jam mark (the blockage is ON the leg — invisible — and only a
+    --                                          jammed entrance proves it). Feeder-slot items are
+    --                                          chain transit: never a trigger, never a target.
     local wait, needJam = (Planner.drainAfter or 3), true
     do
       local assignedIng = {}
       for _, ing in ipairs(opt.ingredients) do assignedIng[ing.name] = true end
       local inForeign = false
       for it in pairs(self:_inputMap(cid)) do if not assignedIng[it] then inForeign = true; break end end
-      if inForeign then wait, needJam = 1, false
-      else
-        local fh = self.router._feedItem and self.router:_feedItem(cid)
-        if fh and not assignedIng[fh] and not (Planner._flowDry[cid] and Planner._flowDry[cid][fh]) then
-          local wanted = false
-          for _, c in ipairs((self._demand and self._demand[fh]) or {}) do if c.machine and c.id ~= cid then wanted = true; break end end
-          if not wanted then wait = 2 end
-        end
-      end
+      if inForeign then wait, needJam = 1, false end
     end
     if (jammed or not needJam) and st.n >= wait then
       -- a frozen machine that COULD craft from what it holds is OUTPUT-blocked — its fix is
@@ -1329,8 +1280,6 @@ function Planner:produceFor(cid, item, share)
         Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
         Planner._drainTried[cid] = tostring(cand.recipe.name)
         Planner._tempRecipe[cid] = tostring(cand.recipe.name)   -- never seed-adopted as a real assignment
-        local fh = self.router._feedItem and self.router:_feedItem(cid)
-        if fh == cand.ingredients[1].name then Planner._drainAdmit[cid] = fh end   -- feeder-slot evidence must be ROUTED onto the leg (admit); an input-inventory remnant is already inside — no admission, nothing to vacuum
         st.n = 0
         pcall(function() computer.log(1, ("[Foreman] DRAIN %s: entrance jammed while frozen; temp recipe '%s' pulls the blockage (assigned '%s')")
           :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name), tostring(opt.recipe.name))) end)
@@ -1361,10 +1310,6 @@ function Planner:produceFor(cid, item, share)
       -- fall through to canSwitch/restore below
     elseif live ~= nil and type(stA) == "table" and stA.n > 0 and (jammed or feedForeign) then
       Planner._drain[cid] = { recipe = tostring(live), idle = 0 }
-      -- the adopted recipe drains a lane corked AT THE FEEDER: that item only moves if the live
-      -- gate admits it and the admit loop demands it — without this the adoption is a no-op (the
-      -- item never reaches the machine, the drain idles out and the user's fix gets REVERTED).
-      if feedForeign then Planner._drainAdmit[cid] = fh end
       stA.n = 0
       local di = self.itemOfRecipe[tostring(live)]
       if di and self.bufferOf[di] then
@@ -1446,83 +1391,10 @@ function Planner:fillAll()
   local servedCid = {}
   for _, cids in pairs(self.served or {}) do for _, cid in ipairs(cids) do servedCid[cid] = true end end
   self:_jamSweep(servedCid)   -- unassigned machines still clear their jammed lanes (drain trigger + hold)
-  -- CORK DRAINS: the router reported items held past patience with no exit at a machine-feeding
-  -- node. The corked item is KNOWN, so drain it precisely: temp recipe that consumes exactly it,
-  -- a temp demand so the splitter pushes it onto the leg, and a live-gate admission for it alone.
-  -- Guards (same rules as the jam drain): a machine that CAN craft from its holdings is
-  -- OUTPUT-blocked — setRecipe would eject its full input into the very path that is blocked;
-  -- and a cork of the machine's OWN live feedstock is back-pressure, not a blockage — the
-  -- machine already pulls that item, switching recipes can only strand it.
-  for cid, corkItem in pairs(self.router._corked or {}) do
-    self.router._corked[cid] = nil
-    if not Planner._drain[cid] and not (Planner._flowDry[cid] and Planner._flowDry[cid][corkItem]) then
-      local skip, own = false, false
-      local pm = self.getProxy(cid)
-      local okr, liveRec = pcall(function() return pm:getRecipe() end)
-      local liveIt = okr and liveRec and liveRec.name and self.itemOfRecipe[tostring(liveRec.name)]
-      local lopt
-      for _, o2 in ipairs((liveIt and self.recipesByProduct[liveIt]) or {}) do
-        if o2.ctorId == cid and tostring(o2.recipe.name) == tostring(liveRec.name) then lopt = o2; break end
-      end
-      if lopt then
-        local have, can = self:_inputMap(cid), true
-        for _, ing in ipairs(lopt.ingredients) do
-          if ing.name == corkItem then own = true end
-          if (have[ing.name] or 0) < ing.amount then can = false end
-        end
-        if can then skip = true end                                -- output-blocked: never touch
-      end
-      if not skip and own then
-        -- the machine's OWN live feedstock corked while it STARVES for it (an unassigned machine
-        -- admits nothing and demands nothing, so its food holds at the feeder forever — the live
-        -- sam at 56A11B). No recipe change needed: RESUME the flow — register the drain so the
-        -- admit loop demands + gates the item to the machine that already eats it.
-        Planner._drain[cid] = { recipe = tostring(liveRec.name), idle = 0 }
-        Planner._drainAdmit[cid] = corkItem
-        pcall(function() computer.log(1, ("[Foreman] CORKFLOW %s: own feedstock '%s' held at the feeder; resuming flow (recipe untouched)")
-          :format(tostring(cid):sub(1, 6), corkItem)) end)
-        skip = true
-      end
-      local cand
-      if not skip then
-        -- deterministic + user rule: single-ingredient recipes eating the cork, LEAST amount first
-        local best
-        for _, opts in pairs(self.recipesByProduct) do
-          for _, o2 in ipairs(opts) do
-            if o2.ctorId == cid and #o2.ingredients == 1 and o2.ingredients[1].name == corkItem then
-              local nm = tostring(o2.recipe.name)
-              if not best or o2.ingredients[1].amount < best.amt
-                 or (o2.ingredients[1].amount == best.amt and nm < best.nm) then
-                best = { o2 = o2, amt = o2.ingredients[1].amount, nm = nm }
-              end
-            end
-          end
-        end
-        cand = best and best.o2
-      end
-      if cand then
-        pcall(function() cand.ctor:setRecipe(cand.recipe) end)
-        Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
-        Planner._drainTried[cid] = tostring(cand.recipe.name)
-        Planner._tempRecipe[cid] = tostring(cand.recipe.name)
-        Planner._drainAdmit[cid] = corkItem
-        pcall(function() computer.log(1, ("[Foreman] CORKDRAIN %s: '%s' corks the lane (no route, no sink); temp recipe '%s' eats it")
-          :format(tostring(cid):sub(1, 6), corkItem, tostring(cand.recipe.name))) end)
-      end
-    end
-  end
-  -- admit LIFECYCLE only — no demand entry. The admit opens the live gate and the router's
-  -- adjacent-machine delivery (overflow step 0) moves the item the ONE hop from the feeder onto
-  -- the leg. A demand entry here routed CHAIN-WIDE: every loose unit of the admitted item
-  -- converged onto this one leg (the mixed junk trains on the constructor belts). The admit dies
-  -- when the drain ends or the feeder stops showing the item.
-  for cid, admitItem in pairs(Planner._drainAdmit) do
-    if not Planner._drain[cid] then Planner._drainAdmit[cid] = nil
-    else
-      local fh = self.router._feedItem and self.router:_feedItem(cid)
-      if fh ~= admitItem then Planner._drainAdmit[cid] = nil end
-    end
-  end
+  -- Corked chain junk is a ROUTING problem (reroute, sink, pass-along, hold) — never solved by
+  -- importing it into a machine. The old CORKDRAIN/CORKFLOW + admit mechanism lived here; it
+  -- re-contaminated every manually-cleaned leg and is permanently removed (user rule).
+  for cid in pairs(self.router._corked or {}) do self.router._corked[cid] = nil end
   -- PROVIDER GRANTS first (stocked hubs that will SUPPLY a demander act as sources this epoch and
   -- must not also demand a refill — their own granted outflow would route straight back to them).
   local grants, providing = {}, {}
@@ -1598,38 +1470,45 @@ function Planner:fillAll()
       end
     end
   end
-  -- PUBLISH the WANTED-RECIPE gate for the router (user rule: the splitter just outside a
-  -- constructor only ever admits the reagents of the ASSIGNED recipe — never the ingredients of
-  -- a temporary drain/probe recipe still sitting on the machine. Reading the LIVE recipe here
-  -- let a leftover temp recipe widen the gate and pull foreign items onto the leg, re-junking
-  -- the very lane the drain had cleared.) A DRAINING machine admits exactly its admit item;
-  -- an UNASSIGNED, non-draining machine admits NOTHING (CORKFLOW grants it an admit when its
-  -- own food corks at the feeder).
+  -- PUBLISH the WANTED-RECIPE gate for the router. THE USER'S RULE, NOW WITHOUT EXCEPTIONS:
+  -- the splitter just outside a constructor only ever admits the reagents of the WANTED
+  -- (assigned, remembered) recipe. NEVER a temporary drain/clear recipe's ingredient. The old
+  -- "admit" exception deliberately widened this gate so drains could import corked chain junk
+  -- onto the leg — that is how sam/wire/copper kept appearing on a manually-cleaned cable leg.
+  -- Drains may only EAT what is already on the leg; chain junk is routing's problem (sink,
+  -- pass-along, hold), never a machine's.
   local liveGate = {}
   for _, cid in ipairs(self.topo.constructors or {}) do
     liveGate[cid] = {}
-    if Planner._drain[cid] then
-      if Planner._drainAdmit[cid] then
-        liveGate[cid][Planner._drainAdmit[cid]] = true   -- targeted drain: admit the cork, nothing else
+    local a = Planner._assign[cid]
+    local opt = (a and a.opt) or (Planner._wanted[cid] and Planner._wanted[cid].opt)
+    if not opt and not Planner._tempRecipe[cid] then
+      -- never-assigned machine: its live recipe is the player's choice — that IS its wanted
+      -- recipe (seed the memory once; a temp drain recipe is never adopted as wanted)
+      local okr, rec = pcall(function() return self.getProxy(cid):getRecipe() end)
+      local nm = okr and rec and tostring(rec.name) or nil
+      if nm then
+        local it = self.itemOfRecipe[nm]
+        for _, o2 in ipairs((it and self.recipesByProduct[it]) or {}) do
+          if o2.ctorId == cid and tostring(o2.recipe.name) == nm then
+            Planner._wanted[cid] = { nm = nm, opt = o2 }; opt = o2; break
+          end
+        end
       end
-    else
-      local a = Planner._assign[cid]
-      if a and a.opt then
-        for _, ing in ipairs(a.opt.ingredients) do liveGate[cid][ing.name] = true end
-      end
+    end
+    if opt then
+      for _, ing in ipairs(opt.ingredients) do liveGate[cid][ing.name] = true end
     end
   end
   -- deep-craft sub-machines (claimed by produceInto, not in _assign) declare their wanted
   -- reagents through this epoch's machine demand entries — admit exactly those
   for item, consumers in pairs(self._demand) do
     for _, cn in ipairs(consumers) do
-      if cn.machine and liveGate[cn.id] and not Planner._drain[cn.id] then liveGate[cn.id][item] = true end
+      if cn.machine and liveGate[cn.id] then liveGate[cn.id][item] = true end
     end
   end
   self.router.machineLive = liveGate
-  local admitMap = {}
-  for cid, it in pairs(Planner._drainAdmit) do if Planner._drain[cid] then admitMap[cid] = it end end
-  self.router.machineAdmit = admitMap   -- the router's shadow ledger records exactly these pushes
+  self.router.machineAdmit = nil   -- the admit mechanism is gone: no gate widening, ever
   self.router:setDemand(self._demand, self._pins)
   self.router:buildNextHop()
   self.router:applyGates(grants)

@@ -623,6 +623,8 @@ end
 -- it only feeds the 'dbg flow' forensics line.
 Router._deliv = Router._deliv or {}   -- "<dstId>|<item>" -> cumulative delivered this session
 function Router:_credit(belt, item)
+  Router._seen = Router._seen or {}
+  Router._seen[item] = true     -- session-wide existence: the router touched this item type
   for _, c in ipairs(self.demand[item] or {}) do
     if c.id == belt.to then
       local k = tostring(belt.to) .. "|" .. item
@@ -644,11 +646,10 @@ end
 -- `fromOutput` is the transferItem arg for the hop out of this node.
 function Router:_overflow(sender, id, item)
   local hkey = tostring(id) .. "|" .. item       -- hold-patience key (see Router.holdPatience)
-  -- 0. ADJACENT MACHINE: the machine THIS node feeds will pull the item right now (its wanted
-  -- reagent, or its drain's admitted junk). Deliver locally. Admits are deliberately LOCAL-ONLY:
-  -- routing them as chain-wide demand attracted every loose unit of the item onto one leg (the
-  -- mixed junk trains on the constructor belts) — now each node's junk is eaten by ITS adjacent
-  -- machine, in parallel, and a leg only ever carries what its own machine pulls.
+  -- 0. ADJACENT MACHINE: with the gate sealed to WANTED reagents (no admits, ever), this can
+  -- only deliver the machine's own legitimate feedstock — the live case: sam held at the feeder
+  -- of an unassigned Reanimated-SAM machine that demanded nothing, starving forever one node
+  -- from its food. Junk can never pass _machineAccepts here.
   for _, b in ipairs(self.adj[id] or {}) do
     if self.isMachine[b.to] and self:_machineAccepts(b.to, item) and self:_beltAccepts(b, item) then
       if sender:transferItem(b.fromOutput or 0) then
@@ -717,6 +718,8 @@ function Router:_overflow(sender, id, item)
   Router._holdN[hkey] = (Router._holdN[hkey] or 0) + 1
   Router._heldFresh = Router._heldFresh or {}
   Router._heldFresh[item] = Router._epochN or 0   -- live congestion signal: the planner stops POURING this item while anything holds
+  Router._seen = Router._seen or {}
+  Router._seen[item] = true
   Router._flowBy[item] = Router._flowBy[item] or {}
   Router._flowBy[item].stuck = (Router._flowBy[item].stuck or 0) + 1
   -- CORK PATIENCE is short (sink patience stays long — never waste demanded items eagerly):
@@ -744,6 +747,8 @@ end
 -- (precomputed by buildNextHop; up to 3 candidate legs, nearest first, so a physically full leg
 -- diverts to the next-nearest). No hop accepts -> the no-demand fallback (buffer/sink/hold).
 function Router:_routeAtSplitter(sender, id, item)
+  Router._seen = Router._seen or {}
+  if item then Router._seen[item] = true end   -- session-wide existence: the router processed this type
   -- Authoritative: route the item ACTUALLY at the input now. ItemRequest is edge-triggered
   -- and can arrive stale (the retry may have already moved it) — trusting the signal's item
   -- would route a phantom.
@@ -965,6 +970,8 @@ end
 -- output is still forwarded (it flows on to the next splitter, or eventually a sink). The
 -- `input` is the merger's logic id, exactly what transferItem expects.
 function Router:_mergerPush(sender, id, input, nm)
+  Router._seen = Router._seen or {}
+  if nm then Router._seen[nm] = true end   -- session-wide existence: the router processed this type
   -- Authoritative: read the item ACTUALLY at this input now. An ItemRequest is edge-
   -- triggered and can arrive stale (pump() may have moved the head already), so the
   -- signal's nm can name a different item than the one transferItem will actually move —
