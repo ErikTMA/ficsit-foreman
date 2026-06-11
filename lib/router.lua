@@ -88,10 +88,10 @@ function Router.new(topology, getProxy)
   self.isSplitter, self.isMerger = {}, {}
   for _, id in ipairs(topology.splitters or {}) do self.isSplitter[id] = true end
   for _, id in ipairs(topology.mergers or {}) do self.isMerger[id] = true end
-  -- MACHINE set + per-machine CONSUMED items (populated by order(): an order to a constructor means it
-  -- consumes that item). Used to GUARD a delivery — a splitter must never hand a constructor an item its
-  -- recipe doesn't take (iron rod into an iron-ingot machine, etc.) — and to dump the input item.
-  self.isMachine, self.consumes, self.portItem = {}, {}, {}
+  -- MACHINE set + port pins (published by the planner per epoch). A splitter must never hand a
+  -- constructor an item its LIVE recipe doesn't pull (machineLive, the one admission rule), and a
+  -- pinned multi-ingredient port takes its ingredient and NOTHING else (portItem).
+  self.isMachine, self.portItem = {}, {}
   for _, id in ipairs(topology.constructors or {}) do self.isMachine[id] = true end
   -- adjacency: node -> list of belts leaving it
   self.adj = {}
@@ -99,9 +99,10 @@ function Router.new(topology, getProxy)
     self.adj[b.from] = self.adj[b.from] or {}
     table.insert(self.adj[b.from], b)
   end
-  -- route[splitterId][itemType] = { output=portIndex, order=orderRef, terminal=bool }
-  self.route = {}
-  self.orders = {}
+  -- DEMAND-PULL STATE (published by the planner each epoch via setDemand):
+  --   demand[item]  = { {id=consumerId, need=n, port=toInput|nil, machine=bool}, ... }
+  --   nextHop[node][item] = ordered belt list toward the nearest demander(s) (buildNextHop)
+  self.demand, self.nextHop = {}, {}
   -- Source gating happens at the source container's OWN OUTPUT CONNECTOR (blocked +
   -- addUnblockedTransfers), NOT by holding codeables mid-line — so an idle source stops
   -- itself without ever stalling a shared belt. sourceItem[id]=item identifies sources.
@@ -135,8 +136,6 @@ function Router.new(topology, getProxy)
   for _, list in pairs(self.buffersForItem) do
     table.sort(list, function(x, y) return order_n[x] < order_n[y] end)
   end
-  self.ordersByItem = {}          -- item -> order (latest placed; back-compat)
-  self.ordersForItem = {}         -- item -> { all orders } (multi-destination routing)
   self._fh = {}                   -- firstHop cache: [from][dst] = belt | false
   self._mrr = {}                  -- per-merger round-robin input cursor (fair input draining)
   -- RAW INPUT ITEMS (copper ingot, iron ingot, concrete, ...): the items a physical input
@@ -230,73 +229,94 @@ function Router:_beltToPort(machine, port)
   return nil
 end
 
---- Route `count` of `item` to `dst`. Discovers the path and programs every
---- splitter on it. `src` is optional — if omitted, the container declared to
---- `provide` the item is used (the double-pass production case passes the
---- constructor as the explicit src for the crafted product). `toInput` (optional) pins delivery to a
---- SPECIFIC input port of `dst`: the path is forced to END on that port's belt, so a multi-ingredient
---- machine gets each ingredient on its own belt. Returns true, or false + reason if no path/source.
-function Router:order(item, count, dst, src, toInput)
-  item = lc(item)
-  src = src or self:sourceOf(item)
-  if not src then return false, "no source provides " .. item end
-  local path
-  if toInput ~= nil then
-    local pb = self:_beltToPort(dst, toInput)
-    if pb then
-      local pre = self:findPath(src, pb.feeder)       -- route to the port's feeder, then its final belt
-      if pre then path = pre; path[#path + 1] = pb.belt end
-    end
-    if not path then   -- pinning failed (port belt missing / feeder unreachable from this src): observable,
-      Router._dlog(("PORT-UNPIN %s '%s' ->%s port %s — falling back to any-port"):format(tostring(src):sub(1,6), item, tostring(dst):sub(1,6), tostring(toInput)))
-    end
-  end
-  path = path or self:findPath(src, dst)              -- fallback: any path to the machine
-  if not path then return false, ("no path %s -> %s"):format(src, dst) end
-  -- the order REMEMBERS its full path (the ordered list of belts src->dst). Edge quota
-  -- is summed from these paths (see buildQuota); on a rebuild the path is recomputed, so
-  -- a deleted splitter/merger makes the order re-route or fall back automatically.
-  -- `term` points at the order that delivers this flow's TERMINAL product into the actual
-  -- buffer (an ingredient order's term is the product->buffer order; a direct/terminal
-  -- order is its own term). gateSources gates an ingredient source against the terminal's
-  -- delivery so a deep craft chain doesn't over-release (see the planner + gateSources).
-  local order = { item = item, count = count, dst = dst, src = src, delivered = 0, path = path, toInput = toInput }
-  order.term = order
-  table.insert(self.orders, order)
-  self.ordersByItem[item] = order                 -- latest (back-compat)
-  self.ordersForItem[item] = self.ordersForItem[item] or {}
-  table.insert(self.ordersForItem[item], order)   -- ALL orders for this item (multi-destination)
-  if self.isMachine[dst] then self.consumes[dst] = self.consumes[dst] or {}; self.consumes[dst][item] = true end
-  if toInput ~= nil and self.isMachine[dst] and path[#path] and (path[#path]._port or path[#path].toInput or 0) == toInput then
-    -- the pin DEDICATES the port: this epoch, port `toInput` of `dst` carries `item` and NOTHING else
-    -- (see _beltAccepts — one foreign head item on a dedicated port's belt kills the port forever).
-    self.portItem[dst] = self.portItem[dst] or {}
-    self.portItem[dst][toInput] = item
-  end
-  return true
+--- DEMAND-PULL CORE. The planner publishes WHO NEEDS WHAT each epoch (setDemand); the router
+--- derives a per-item next-hop table toward the nearest demander (buildNextHop). Items are then
+--- routed one event at a time: ItemRequest at a codeable -> look up the head item's next hop ->
+--- transferItem. No orders, no quotas, no in-flight ledgers: machine/buffer inventory is the
+--- ground truth, re-read by the planner every epoch.
+---
+--- demand[item] = list of { id = consumerId, need = units, port = toInput|nil, machine = bool }
+--- portItem (multi-ingredient port pins) is published alongside; machineLive is the admission rule.
+function Router:setDemand(demand, portItem)
+  self.demand = demand or {}
+  self.portItem = portItem or {}
 end
 
--- May a splitter hand `item` to next-node `to`? Always yes UNLESS `to` is a constructor that does NOT
--- consume `item` this epoch — a machine must never be fed a foreign item (it can't craft it, and it jams
--- the input). `consumes[to]` is built from the orders to `to`; if a machine has NO orders yet we don't
--- guard (avoid a false block before the plan reaches it).
+-- Per-item multi-source BFS from every demander BACKWARD over the belt graph.
+-- nextHop[node][item] = ordered list of outgoing belts (nearest demander first, max 3) so a full
+-- leg can divert to the next-nearest. Distance ties rotate with the epoch clock for fair splits.
+-- Traversal mirrors findPath: buffers are not transited (phase-1); machines are endpoints.
+function Router:buildNextHop()
+  Router._epochN = (Router._epochN or 0) + 1     -- the re-plan epoch clock (jam-mark freshness)
+  self.nextHop = {}
+  -- reverse adjacency once
+  local radj = {}
+  for _, belts in pairs(self.adj) do
+    for _, b in ipairs(belts) do
+      radj[b.to] = radj[b.to] or {}
+      table.insert(radj[b.to], b)
+    end
+  end
+  for item, consumers in pairs(self.demand) do
+    -- seed: distance 0 at each demander node; a port-pinned machine seeds ONLY via its pinned
+    -- port's belt (the pin is enforced again at push time by _beltAccepts).
+    local dist = {}      -- nodeId -> hops to nearest demander
+    local queue, head = {}, 1
+    for _, c in ipairs(consumers) do
+      if dist[c.id] == nil then dist[c.id] = 0; queue[#queue + 1] = c.id end
+    end
+    while head <= #queue do
+      local node = queue[head]; head = head + 1
+      local d = dist[node]
+      for _, b in ipairs(radj[node] or {}) do
+        local up = b.from
+        -- an item may flow OUT of: a source/provider container, a splitter, a merger. It does not
+        -- transit other machines or foreign buffers (same rule as findPath phase 1). The upstream
+        -- node still gets a next-hop entry even when terminal (a provider container needs none).
+        if dist[up] == nil then
+          dist[up] = d + 1
+          local transit = self.isSplitter[up] or self.isMerger[up]
+          if transit then queue[#queue + 1] = up end
+        end
+      end
+    end
+    -- per transit node: outgoing belts that lead CLOSER, nearest-first; rotate ties by epoch
+    for node in pairs(dist) do
+      if self.isSplitter[node] or self.isMerger[node] then
+        local cands = {}
+        for _, b in ipairs(self.adj[node] or {}) do
+          local dd = dist[b.to]
+          if dd ~= nil and dd < dist[node] then cands[#cands + 1] = { b = b, d = dd } end
+        end
+        table.sort(cands, function(x, y)
+          if x.d ~= y.d then return x.d < y.d end
+          return (x.b.fromOutput or 0) < (y.b.fromOutput or 0)
+        end)
+        if #cands > 1 then   -- rotate equal-nearest ties so parallel demanders share fairly
+          local r = (Router._epochN or 0) % #cands
+          for _ = 1, r do table.insert(cands, table.remove(cands, 1)) end
+        end
+        local legs = {}
+        for i = 1, math.min(#cands, 3) do legs[i] = { b = cands[i].b, d = cands[i].d } end
+        if #legs > 0 then
+          self.nextHop[node] = self.nextHop[node] or {}
+          self.nextHop[node][item] = legs
+        end
+      end
+    end
+  end
+end
+
+-- May a node hand `item` to next-node `to`? ONE admission rule (the user's): a machine leg only
+-- ever receives what the machine's LIVE recipe will pull RIGHT NOW. machineLive is published by
+-- the planner at the end of every fillAll (EMPTY set for a draining machine — its temp recipe
+-- clears the lane, it must not vacuum more in). A machine the planner has never described stays
+-- permissive (pre-plan grace). Non-machines always accept (codeables/buffers/sinks are room- and
+-- pin-checked elsewhere).
 function Router:_machineAccepts(to, item)
   if not self.isMachine[to] then return true end
-  -- LIVE-RECIPE GATE (the user's rule: a machine leg only ever receives what the machine will
-  -- pull RIGHT NOW). Orders are not enough — assignments move faster than items transit, and an
-  -- item on the leg of a machine whose recipe changed is DEAD (won't be pulled; jams the lane;
-  -- costs a feed-drain + setRecipe churn). Better to refuse here and let the item wait UPSTREAM
-  -- at the splitter, where it can still be re-routed the moment a path opens. machineLive is
-  -- published by the planner at the end of every fillAll (EMPTY for draining machines); a
-  -- machine it has never described stays permissive (pre-plan grace).
   local live = self.machineLive and self.machineLive[to]
-  if live and not live[item] then return false end
-  local c = self.consumes[to]
-  if c and next(c) then return c[item] == true end
-  -- NO orders to this machine this epoch: consult the planner-published allowance — assigned
-  -- recipe's ingredients pass, an unassigned/draining machine admits NOTHING new.
-  local allow = self.machineAllow and self.machineAllow[to]
-  if allow then return allow[item] == true end
+  if live then return live[item] == true end
   return true
 end
 
@@ -318,41 +338,8 @@ function Router:_beltAccepts(belt, item)
   return true
 end
 
---- Remove orders placed after index `n` (the planner's atomic rollback: if a craft plan
---- turns out infeasible, drop the partial ingredient orders it already placed so their
---- sources aren't gated to release an ingredient nothing will consume). Orders are appended
---- in placement order, so the last per-item is at the tail of ordersForItem — pop in reverse.
-function Router:_truncateOrders(n)
-  local dropped = false
-  while #self.orders > n do
-    local o = table.remove(self.orders)
-    local list = self.ordersForItem[o.item]
-    if list and list[#list] == o then table.remove(list) end
-    self.ordersByItem[o.item] = (list and list[#list]) or nil
-    dropped = true
-  end
-  if not dropped then return end
-  -- REBUILD the per-machine consumption guards + port pins from the SURVIVING orders. order()
-  -- writes consumes[dst][item] and portItem[dst][port] as a side effect; popping the order alone
-  -- left PHANTOM entries — a rolled-back attempt (e.g. an infeasible alternate assignment whose
-  -- second ingredient failed) made the machine's legs consume-guard against the GHOST item set,
-  -- refusing the real assignment's in-transit ingredients at the feeder, and showed ghost wants[]
-  -- in the debug dump (the live "wants[iron rod]" on a Reinforced-Iron-Plate machine).
-  self.consumes, self.portItem = {}, {}
-  for _, o in ipairs(self.orders) do
-    if self.isMachine[o.dst] then
-      self.consumes[o.dst] = self.consumes[o.dst] or {}; self.consumes[o.dst][o.item] = true
-      local tail = o.path and o.path[#o.path]
-      if o.toInput ~= nil and tail and (tail._port or tail.toInput or 0) == o.toInput then
-        self.portItem[o.dst] = self.portItem[o.dst] or {}
-        self.portItem[o.dst][o.toInput] = o.item
-      end
-    end
-  end
-end
-
--- Cached first belt of a shortest path from -> dst (nil if unreachable). Works on
--- the belt LOOP because findPath's BFS handles cycles.
+-- First belt on a path from `from` to `dst` (cached). Used by the no-demand fallback
+-- (buffer/sink hops) — demand routing itself uses the precomputed nextHop table.
 function Router:firstHopTo(from, dst)
   self._fh[from] = self._fh[from] or {}
   local hit = self._fh[from][dst]
@@ -542,8 +529,8 @@ end
 --- Register the signal handler that executes routing AND listen to all codeable nodes.
 --- Call once, then pump the event loop (e.g. Router:run() or your own event.pull loop).
 -- DEFAULT-DENY: block every container's output. The controller asserts "nothing emits" the
--- instant it takes over; gateSources (end of the first fillAll) then OPENS exactly the sources it
--- funds and the pass-through relays. Idempotent, so it's also a safe assertion on every rebuild.
+-- instant it takes over; applyGates (end of the first fillAll) then OPENS exactly the providers
+-- whose items are demanded. Idempotent, so it's also a safe assertion on every rebuild.
 function Router:blockAllOutputs()
   for _, c in ipairs(self.topo.containers or {}) do
     for _, conn in ipairs(self:_connFor(c.id).conns) do self:_setBlocked(conn, true) end
@@ -551,7 +538,7 @@ function Router:blockAllOutputs()
 end
 
 function Router:install()
-  self:blockAllOutputs()        -- close everything first; gateSources re-opens only what flows
+  self:blockAllOutputs()        -- close everything first; applyGates re-opens only what flows
   self:listenAll()
   event.registerListener(event.filter{ event = "ItemRequest" },
     function(_, sender, a, b) self:_dispatch(sender, a, b) end)
@@ -600,155 +587,34 @@ function Router:_countAt(dst, item, isMachine)
   return total
 end
 
--- free room for an ORDER's delivery into its consumer = cap - have.
---
--- DESTINATION BUFFER: room = target - have. A buffer at/over target contributes 0 quota, so the
--- splitter feeding it diverts the item to a sibling buffer with room or to the bottleneck (load-
--- balances a same-item buffer pool, stops over-filling).
---
--- Room a destination has for an order's item RIGHT NOW. A storage buffer is capped by its capacity.
---
--- MULTI-INGREDIENT MACHINE — BALANCED DELIVERY: never hand a machine more of one ingredient than the
--- SCARCEST other ingredient it holds (+ a small margin). A reinforced-iron-plate machine that is
--- drowning in 200 iron plate but has only 1 screw can't craft — the plate just HOARDS, and (the killer)
--- the plate machine keeps eating iron ingot to make that hoarded plate, which floods the shared manifold
--- and starves the rod->screws chain. Capping plate to ~screws stops the hoard, lets the plate buffer
--- fill, throttles the plate machine, and frees the feedstock for the scarce branch. (This is the
--- per-ingredient cap done RIGHT: ratio-/scarcity-aware, not the too-low fixed portCap=12 that starved a
--- healthy machine.) A single-input machine and a sink are uncapped (full demand).
-Router.balanceMargin = Router.balanceMargin or 24       -- per-ingredient lookahead buffer over the scarcest (tunable)
-function Router:_orderRoom(o)
-  local cap = self.capacity[o.dst]
-  if cap then                                            -- destination buffer: room = capacity - have
-    local have = self:_countAt(o.dst, o.item, false)
-    return math.max(0, cap - have)
-  end
-  local cons = self.isMachine[o.dst] and self.consumes[o.dst]
-  if cons then
-    local n = 0; for _ in pairs(cons) do n = n + 1 end
-    if n >= 2 then                                       -- multi-ingredient machine: balance to the scarcest
-      local have = self:_countAt(o.dst, o.item, true)
-      local minOther = math.huge
-      for it in pairs(cons) do if it ~= o.item then minOther = math.min(minOther, self:_countAt(o.dst, it, true)) end end
-      return math.max(0, (minOther + (Router.balanceMargin or 24)) - have)
-    end
-  end
-  return o.count - o.delivered                           -- single-input machine / sink: full per-epoch demand
-end
-
-function Router:buildQuota()
-  Router._epochN = (Router._epochN or 0) + 1     -- the re-plan epoch clock (jam-mark freshness)
-  for _, belts in pairs(self.adj) do for _, b in ipairs(belts) do b._q = {} end end
-  local left = {}                                   -- "dst|item" -> room remaining to allocate this pass
-  for _, o in ipairs(self.orders) do
-    local key = tostring(o.dst) .. "|" .. o.item
-    -- Room is SHARED across a key's orders only when it is a property of the DESTINATION (a
-    -- buffer's capacity, a multi-ingredient machine's balanced room). The single-input-machine
-    -- fallback in _orderRoom is per-ORDER (its own remaining) — seeding the shared pool from the
-    -- FIRST order for the key let one stale fully-delivered order zero the pool and starve every
-    -- later order's quota (legs read q=nil and everything fell to overflow, which used to mask
-    -- it by recovering items straight into the machines).
-    local cons = self.isMachine[o.dst] and self.consumes[o.dst]
-    local nIng = 0; if cons then for _ in pairs(cons) do nIng = nIng + 1 end end
-    local shared = self.capacity[o.dst] ~= nil or nIng >= 2
-    local contrib
-    if shared then
-      if left[key] == nil then left[key] = self:_orderRoom(o) end
-      contrib = math.min(o.count - o.delivered, left[key])
-      if contrib > 0 then left[key] = left[key] - contrib end
-    else
-      contrib = o.count - o.delivered
-    end
-    if contrib > 0 and o.path then
-      for _, b in ipairs(o.path) do b._q[o.item] = (b._q[o.item] or 0) + contrib end
-    end
-  end
-end
-
--- Among a node's OUTGOING belts, the one carrying the most remaining quota for `item`
--- that also has room downstream (a non-buffer dst — constructor/codeable/sink — always
--- accepts; a buffer dst is room-checked). Decrement-on-dispatch makes two equal legs
--- alternate, so N items down each of two legs land exactly N/N — "10 down each leg".
-function Router:_bestEdge(id, item)
-  local best, bestq = nil, 0
-  for _, b in ipairs(self.adj[id] or {}) do
-    local q = (b._q and b._q[item]) or 0
-    if q > bestq and self:_beltAccepts(b, item) then
-      local terminal = not self.bufferItem[b.to]
-      if terminal or self:hasRoom(b.to, item) then best, bestq = b, q end
-    end
-  end
-  return best
-end
-
--- Credit one delivery when an item crosses the FINAL belt into an order's destination
--- (belt.to == o.dst). Works regardless of whether the final node is a splitter or a merger
--- (both call this on the same belt objects). Drives allDone() + the in-epoch SINK
--- diagnostic, and accumulates a DURABLE per-source lifetime count (Router._deliv) that
--- survives the App.run rebuild — gateSources needs it to size cross-epoch authorization,
--- and it is the ONLY way to track flow whose destination is a constructor (which consumes
--- immediately, so it has no observable landed inventory to read back).
-Router._deliv = Router._deliv or {}   -- "<srcId>|<item>" -> cumulative delivered this session
+-- Debug-only delivery credit: count an item crossing the FINAL belt into one of its demanders
+-- (machine or buffer). No ledger consumes this — machine/buffer inventory is the ground truth —
+-- it only feeds the 'dbg flow' forensics line.
+Router._deliv = Router._deliv or {}   -- "<dstId>|<item>" -> cumulative delivered this session
 function Router:_credit(belt, item)
-  for _, o in ipairs(self.orders) do
-    if o.dst == belt.to and o.item == item and o.delivered < o.count then
-      o.delivered = o.delivered + 1
-      local k = tostring(o.src) .. "|" .. item
+  for _, c in ipairs(self.demand[item] or {}) do
+    if c.id == belt.to then
+      local k = tostring(belt.to) .. "|" .. item
       Router._deliv[k] = (Router._deliv[k] or 0) + 1
       return
     end
   end
 end
 
--- Fallback for an item with NO remaining quota leg at this node (its quota is spent, or it is
--- overflow/unmanaged). HOLD-OVER-MISDELIVER policy (user rule: "it's better to block at the
+-- Fallback for an item with NO next hop at this node (nothing demands it, or its demander is
+-- unreachable from here). HOLD-OVER-MISDELIVER policy (user rule: "it's better to block at the
 -- splitter than block towards the constructors"):
---   1. DELIVER to an active order's BUFFER destination — never to a machine: an overflow push
---      down a machine leg becomes a dead foreign item the moment the assignment moves (the
---      copper-ingot chain gridlock: rec=229 ingots recovered into constructor legs, every feeder
---      jammed, drains thrashing setRecipe). Machine legs are fed ONLY by planned quota legs,
---      which _beltAccepts live-recipe-gates.
---   2. else REROUTE to a buffer for the item that has room (preserve it in storage, off the belt);
---   3. else if the item has NO active demand anywhere: SINK it (true over-supply — clears the lane);
---   4. else HOLD at this node — a demanded item is never wasted into the sink; it waits HERE,
---      where the level-triggered retry can re-route it the moment its consumer is live again.
---      Holding can back the lane up to the source — that is the point: physical back-pressure
---      stops the gate from pouring more of it into a jammed chain.
+--   1. REROUTE to a buffer for the item that has room (preserve it in storage, off the belt);
+--   2. else if NO machine demands it anywhere: SINK it (true over-supply — clears the lane);
+--   3. else HOLD at this node — a machine-demanded item is never wasted into the sink; it waits
+--      HERE, where the level-triggered retry re-routes it the moment a hop opens. The lane
+--      backing up to the source is intentional back-pressure. Hold patience (below) bounds a
+--      permanent dead-end so it cannot gridlock the lane forever.
 -- `fromOutput` is the transferItem arg for the hop out of this node.
 function Router:_overflow(sender, id, item)
   local hkey = tostring(id) .. "|" .. item       -- hold-patience key (see Router.holdPatience)
-  local active = {}
-  for _, o in ipairs(self.ordersForItem[item] or {}) do
-    if o.delivered < o.count then active[#active + 1] = o end
-  end
-  -- 1. DELIVER to an active BUFFER destination (re-pathfind from HERE, most-behind first).
-  table.sort(active, function(a, b) return (a.count - a.delivered) > (b.count - b.delivered) end)
-  for _, o in ipairs(active) do
-    if not self.isMachine[o.dst] then
-      local terminal = not self.bufferItem[o.dst]
-      if terminal or self:hasRoom(o.dst, item) then
-        local belt = self:firstHopTo(id, o.dst)
-        -- _beltAccepts: the recovery hop must honor PORT PINS — re-pathfinding "any way" used to
-        -- land iron plate on the SCREWS port's belt. A dedicated port takes its item ONLY.
-        if belt and self:_beltAccepts(belt, item) and sender:transferItem(belt.fromOutput or 0) then
-          -- credit delivery + (on the DIRECT hop into a buffer dst) the room cache, so a chain of
-          -- recovery deliveries to the same buffer caps at capacity instead of flooding past the
-          -- stale cached count.
-          if belt.to == o.dst then
-            self:_credit(belt, item)
-            if self.bufferItem[o.dst] then self:_creditRoom(o.dst, item) end
-          end
-          Router._holdN[hkey] = nil
-          Router._flowBy[item] = Router._flowBy[item] or {}
-          Router._flowBy[item].rec = (Router._flowBy[item].rec or 0) + 1
-          Router._dlog(("RECOVER %s '%s' >out[%d] %s ->%s"):format(tostring(id):sub(1,6), item, belt.fromOutput or 0, tostring(belt.to):sub(1,6), tostring(o.dst):sub(1,6)))
-          return true
-        end
-      end
-    end
-  end
-  -- 2. REROUTE to a buffer for the item that has room — preserves it (it waits in storage, available
-  -- when demand returns) instead of holding on the belt and blocking everything behind it.
+  -- 1. REROUTE to a buffer for the item that has room — preserves it (it waits in storage,
+  -- available when demand returns) instead of blocking the belt behind it.
   for _, D in ipairs(self.buffersForItem[item] or {}) do
     if self:hasRoom(D, item) then
       local belt = self:firstHopTo(id, D)
@@ -771,7 +637,7 @@ function Router:_overflow(sender, id, item)
   -- lane must clear. Try EVERY DEFAULT_OUT: the first sink may be unreachable from this node
   -- while another is reachable on a looped manifold.
   local machineDemand = false
-  for _, o in ipairs(active) do if self.isMachine[o.dst] then machineDemand = true; break end end
+  for _, c in ipairs(self.demand[item] or {}) do if c.machine then machineDemand = true; break end end
   -- HOLD PATIENCE: a demanded item that has been held HERE for holdPatience consecutive attempts
   -- is going nowhere (a dead-end lane, an unreachable consumer) — gridlocking every flow behind
   -- it. Let it sink: bounded waste beats a frozen factory.
@@ -812,47 +678,45 @@ function Router:_overflow(sender, id, item)
   return false
 end
 
--- Route the item at a SPLITTER input: send it out the highest-remaining-quota output leg
--- (balanced), decrement that leg, credit if it reaches a destination; else fall back.
+-- Route the item at a SPLITTER input: send it down the next-hop leg toward its nearest demander
+-- (precomputed by buildNextHop; up to 3 candidate legs, nearest first, so a physically full leg
+-- diverts to the next-nearest). No hop accepts -> the no-demand fallback (buffer/sink/hold).
 function Router:_routeAtSplitter(sender, id, item)
   -- Authoritative: route the item ACTUALLY at the input now. ItemRequest is edge-triggered
-  -- and can arrive stale (pump() may have already moved it) — trusting the signal's item
+  -- and can arrive stale (the retry may have already moved it) — trusting the signal's item
   -- would route a phantom.
   if sender.getInput then
     local cur = itemName(sender:getInput())
     if not cur then return false end                 -- input empty: stale signal, no-op
     item = cur
   end
-  -- candidate legs carrying quota for `item`, sorted by remaining quota (desc). Divert-on-full:
-  -- try each in turn; the first that physically accepts wins, so a full leg never stalls the belt.
-  local legs = {}
-  for _, b in ipairs(self.adj[id] or {}) do
-    local q = (b._q and b._q[item]) or 0
-    if q > 0 then legs[#legs + 1] = b end
-  end
-  table.sort(legs, function(a, b)
-    local qa, qb = (a._q and a._q[item]) or 0, (b._q and b._q[item]) or 0
-    if qa ~= qb then return qa > qb end
-    return (a.fromOutput or 0) < (b.fromOutput or 0)  -- tiebreak: equal-quota legs alternate deterministically
-  end)
-  for _, best in ipairs(legs) do
+  local legs = (self.nextHop[id] or {})[item]
+  for li = 1, (legs and #legs or 0) do
+    local best = legs[li].b
     local terminal = not self.bufferItem[best.to]
     if not self:_beltAccepts(best, item) then
       Router._dlog(("MISROUTE %s '%s' >out[%d] %s — machine/port doesn't take it; skipping leg")
         :format(tostring(id):sub(1, 6), item, best.fromOutput or 0, tostring(best.to):sub(1, 6)))
     elseif terminal or self:hasRoom(best.to, item) then
       if sender:transferItem(best.fromOutput or 0) then
-        best._q[item] = (best._q[item] or 1) - 1
         self:_credit(best, item)
         if not terminal then self:_creditRoom(best.to, item) end   -- routed toward a buffer: bump its cached room
         if self.isMachine[best.to] and Router._legFullMach then Router._legFullMach[best.to] = nil end   -- entrance accepted: jam (if any) cleared
+        -- FAIR SPLIT within an epoch: rotate the used leg to the back of its equal-distance
+        -- group, so two demanders at the same distance alternate item-by-item (the 8/8 split)
+        local grpEnd = li
+        while grpEnd < #legs and legs[grpEnd + 1].d == legs[li].d do grpEnd = grpEnd + 1 end
+        if grpEnd > li or li > 1 then
+          local used = table.remove(legs, li)
+          table.insert(legs, grpEnd, used)
+        end
         Router._dlog(("SPL %s '%s' >out[%d] %s"):format(tostring(id):sub(1,6), item, best.fromOutput or 0, tostring(best.to):sub(1,6)))
         return true
       end
-      -- chosen leg physically full right now: log it (a starved consumer whose leg never accepts =
-      -- its input belt is backed up = its OUTPUT is blocked or a FOREIGN item the machine won't pull
-      -- is stranded at its entrance) and fall through to the next-best leg. Mark machine entrances
-      -- (module-durable: the planner's feed-drain reads it next epoch; cleared on a successful push).
+      -- chosen leg physically full right now: a starved consumer whose leg never accepts = its
+      -- input belt is backed up (output blocked, or a foreign head item the machine won't pull).
+      -- Mark machine entrances (module-durable, epoch-stamped: the planner's feed-drain reads it;
+      -- cleared on a successful push) and try the next-nearest demander's leg.
       if self.isMachine[best.to] then Router._legFullMach = Router._legFullMach or {}; Router._legFullMach[best.to] = Router._epochN or 0 end
       Router._dlog(("SPLFULL %s '%s' >out[%d] %s — leg full, diverting"):format(tostring(id):sub(1, 6), item, best.fromOutput or 0, tostring(best.to):sub(1, 6)))
     end
@@ -1025,7 +889,6 @@ function Router:_mergerPush(sender, id, input, nm)
     return false
   end
   if out then
-    if out._q and (out._q[nm] or 0) > 0 then out._q[nm] = out._q[nm] - 1 end
     self:_credit(out, nm)
     if self.isMachine[out.to] and Router._legFullMach then Router._legFullMach[out.to] = nil end   -- entrance accepted: jam cleared
   end
@@ -1086,335 +949,70 @@ function Router:_setBlocked(conn, b)
   end
 end
 
--- Gate every source container at its OWN output connector: block it, and authorize only the
--- items it still needs to release, against a LIFETIME cap so a rebuild never re-releases
--- stock it already released. The naive "top the connector budget up to demand each rebuild"
--- OVER-RELEASES without bound: App.run rebuilds every ~2s with a fresh Router (delivered=0)
--- while items already released sit in transit — topping back up re-authorizes them every
--- rebuild, dripping surplus to the sink forever.
---
--- Fix: each order is gated against the all-time demand of its TERMINAL buffer (the order
--- that actually delivers into a storage container), scaled by the recipe ratio. For an
--- order o with terminal t:
---   terminalAllTime = Router._deliv[t.src|t.item] (cumulative delivered into the buffer,
---                     durable across rebuilds) + (t.count - t.delivered) (still needed)
---   contribution    = o.count * terminalAllTime / t.count   (= ratio × terminal all-time)
--- A direct order is its own terminal, so contribution = delivered + need = the buffer target.
--- This keeps the source's cap pinned to the BUFFER's progress, not to how fast an ingredient
--- reaches a consuming machine — which is what made the constructor-fed path drip. We only ADD
--- the delta over what we have already authorized (Router._auth, durable); a drained buffer
--- grows terminalAllTime so refills still happen.
-Router._auth = Router._auth or {}     -- "item:<item>" -> cumulative units authorized this session
--- SLIDING-WINDOW FLOW CONTROL: an INGREDIENT feeding a constructor is released only up to
--- "already consumed + flowWindow", not the whole terminal demand at once. Without it, a big
--- buffer (12000 wire) authorizes 12000 copper up front; the constructor crafts slowly, so the
--- copper floods the (shared) belt and saturates the input — and if the machine is then
--- reassigned, that in-flight feedstock is stranded/dumped. With it, in-flight (belt + input)
--- stays ≈ flowWindow; as the constructor crafts (terminal product delivered -> _deliv), the
--- window slides forward, so total release still converges to the full demand. Only INGREDIENT
--- orders are windowed (a DIRECT buffer fill is absorbed by its destination buffer's capacity,
--- so it doesn't flood). The terminal demand remains the hard upper bound (no over-release).
-Router.flowWindow = Router.flowWindow or 50   -- max in-flight ingredient units per order (tunable)
--- STALL BACK-PRESSURE (gateSources): when an item is released but its consumer is blocked (output
--- jammed), the surplus floods the manifold. Claw a stalled item's in-flight back toward inflightFloor;
--- a consumer that delivers >= progressFloor units per gate is healthy and never throttled. Tunable.
-Router.inflightFloor = Router.inflightFloor or 32
-Router.progressFloor = Router.progressFloor or 8
--- IN-FLIGHT AMNESTY: items that physically DIE in transit (sunk by overflow, eaten by a drain's
--- temp recipe) never credit _deliv, so the stall clamp sees them as forever-in-flight and holds the
--- gate shut PERMANENTLY — the live copper gate frozen at auth=82 ub=0 while its consumer starved.
--- After stallForgive consecutive progress-less gates with nothing left to claw (ub == 0), declare
--- the outstanding in-flight dead and settle the ledger (auth := delivered), letting the gate
--- re-grant. A true persistent jam then leaks at most ~flowWindow per stallForgive gates (bounded
--- trickle) instead of starving its consumer forever.
-Router._stallGates  = Router._stallGates or {}    -- item -> consecutive stalled-with-ub-0 gates
-Router.stallForgive = Router.stallForgive or 5
--- PER-ITEM FLOW LEDGER (debug forensics): where did a released item actually END UP? The live
--- "screws vanish mid-manifold" hunt had no per-item trail — sunk/stuck were global counters and a
--- silent recovery/reroute leaves no aggregate trace. Module-durable; dumped by debugDump.
-Router._flowBy = Router._flowBy or {}             -- item -> { rec=, rer=, sunk=, stuck= }
--- machine entrances whose feed leg is physically FULL (transferItem failed): set by _routeAtSplitter /
--- _mergerPush, cleared when a push succeeds. Module-durable (router instances are rebuilt per epoch);
--- the planner's FEED-DRAIN reads it to detect a foreign item stranded at a starved machine's entrance.
-Router._legFullMach = Router._legFullMach or {}   -- cid -> epoch the entrance push last FAILED (a stale mark must not trigger drains)
+-- PER-ITEM FLOW LEDGER (debug forensics): where overflow handling put items that lost their
+-- route (rerouted to a buffer / sunk / stuck-held). Module-durable; dumped by debugDump.
+Router._flowBy = Router._flowBy or {}             -- item -> { rer=, sunk=, stuck= }
+-- machine entrances whose feed leg push FAILED: cid -> the epoch it failed (stale marks must not
+-- trigger drains). Set by _routeAtSplitter/_mergerPush, cleared on a successful push.
+Router._legFullMach = Router._legFullMach or {}
 Router.jamFresh = Router.jamFresh or 2            -- a jam mark older than this many epochs is stale
--- Is `cid`'s entrance jam mark FRESH? The mark is stamped when a push toward the machine FAILS
--- and cleared when one succeeds — but under hold-at-splitter, pushes may simply STOP being
--- attempted, leaving a STALE mark that re-triggered the feed-drain forever: stale jam + starved
--- input -> drain -> machineLive publishes empty -> the splitter holds the machine's own supply ->
--- still starved -> drain again (the live freeze loop). A mark only counts within jamFresh epochs.
+-- Is `cid`'s entrance jam mark FRESH? Under hold-at-splitter, pushes may simply STOP being
+-- attempted, leaving a stale mark that re-triggered the feed-drain forever (the v0.16.5 freeze
+-- loop). A mark only counts within jamFresh epochs; legacy boolean marks (tests) always count.
 function Router:legJammed(cid)
   local st = Router._legFullMach and Router._legFullMach[cid]
   if st == nil then return false end
-  if st == true then return true end             -- legacy boolean (tests stamp it directly)
+  if st == true then return true end
   return ((Router._epochN or 0) - st) <= (Router.jamFresh or 2)
 end
 -- HOLD PATIENCE: a machine-demanded item held at the same node for this many consecutive overflow
--- attempts finally gets the sink — bounded waste beats a frozen factory (a permanent dead-end
--- hold gridlocks every flow sharing the lane).
+-- attempts finally gets the sink — bounded waste beats a frozen factory.
 Router._holdN = Router._holdN or {}               -- "node|item" -> consecutive hold attempts
 Router.holdPatience = Router.holdPatience or 400
-Router.stuckEpochs = Router.stuckEpochs or 3   -- empty-input epochs before temp-consumer-drain may fire
-function Router:_contribution(o)
-  local t = o.term or o
-  local td = Router._deliv[tostring(t.src) .. "|" .. t.item] or 0
-  local termAll = td + math.max(0, t.count - t.delivered)            -- terminal buffer all-time demand
-  if t == o then return termAll end                                  -- direct / self-terminal: not windowed
-  -- ingredient: scale the terminal demand by the STABLE recipe ratio (units of this raw item
-  -- per unit of terminal product, set by the planner). Scaling by the shrinking per-epoch need
-  -- (o.count/t.count) instead inflates as the buffer nears full, over-releasing out>1 recipes
-  -- (e.g. 1 copper -> 2 wire) to the sink.
-  local window = Router.flowWindow or 50
-  local full, consumed
-  if o.ratioDen and o.ratioDen > 0 then
-    full     = math.ceil(termAll * o.ratioNum / o.ratioDen)          -- total ingredient for ALL product
-    consumed = math.ceil(td * o.ratioNum / o.ratioDen)               -- ingredient already turned into product
-  elseif (t.count or 0) > 0 then
-    full     = math.ceil(o.count * termAll / t.count)                -- fallback (unstamped ratio)
-    consumed = math.ceil(o.count * td / t.count)
-  else
-    return o.count
-  end
-  return math.min(full, consumed + window)   -- release only consumed + a window's worth of lookahead
-end
-function Router:gateSources()
-  -- STALL BACK-PRESSURE state: per-item cumulative delivered as of the previous gate, used below to
-  -- detect an item that is being RELEASED but not CONSUMED (its consumer's output is jammed).
-  Router._delivPrev = Router._delivPrev or {}
-  -- Group source containers by the item they provide and gate PER ITEM, not per container.
-  -- The cap (sum of terminal-scaled contributions) and the authorized total are aggregated
-  -- across all of an item's sources, so the planner re-splitting demand across containers
-  -- between rebuilds (as on-hand shifts) can never re-authorize in-flight stock on a fresh
-  -- source. New budget is distributed to the sources weighted by this epoch's order demand.
-  local byItem = {}
+Router.stuckEpochs = Router.stuckEpochs or 3      -- empty-input epochs before temp-consumer-drain may fire
+
+-- FEEDBACK GATING (demand-pull). Every container's output is closed by default; each epoch the
+-- planner computes per-provider GRANTS (a refill batch sized from its demanders' live shortfall —
+-- machine inputs and buffer levels are re-read every epoch, so there is no cross-epoch release
+-- ledger to corrupt: over-release self-corrects because the next epoch sees fuller inventories
+-- and grants less/nothing). grants[containerId] = units to ALLOW out this epoch (absolute target
+-- for the connector budget, not an increment).
+function Router:applyGates(grants)
+  grants = grants or {}
   for _, c in ipairs(self.topo.containers or {}) do
-    local it = self.sourceItem[c.id]
-    if it then byItem[it] = byItem[it] or {}; table.insert(byItem[it], c.id) end
-  end
-  for item, cids in pairs(byItem) do
-    local isSrc = {}; for _, id in ipairs(cids) do isSrc[id] = true end
-    -- aggregate cap + per-source order weights for this item
-    local cap, weight, wtotal, nOrders = 0, {}, 0, 0
-    for _, o in ipairs(self.orders) do
-      if isSrc[o.src] then
-        cap = cap + self:_contribution(o)
-        local w = math.max(0, o.count - o.delivered)
-        weight[o.src] = (weight[o.src] or 0) + w; wtotal = wtotal + w; nOrders = nOrders + 1
+    local e = self:_connFor(c.id)
+    local want = grants[c.id]
+    if want and want > 0 then
+      -- top the connector budget UP TO the grant (never duplicate what is still unreleased):
+      -- leftover budget from the previous epoch counts against this epoch's grant.
+      local have = 0
+      for _, conn in ipairs(e.conns) do
+        local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end); have = have + cur
       end
-    end
-    -- BLOCK every output connector of every source. Fund the metered release ONLY on the
-    -- connectors that are actually belted (isConnected) — split evenly across them, so a source
-    -- wired out two ports still releases its full share (and no faster), while bare ports stay
-    -- blocked at zero. Funding a single guessed port can strand the whole budget on a dead port
-    -- (permanent under-fill); funding every port including bare ones wastes budget. Connected-only
-    -- is the safe middle. conns[cid] = all outputs (for the claw-back/seed scans); fundOuts[cid] =
-    -- the belted subset that receives addUnblockedTransfers (fallback: all, if none report connected).
-    local conns, fundOuts = {}, {}
-    for _, cid in ipairs(cids) do
-      local e = self:_connFor(cid)                  -- cached: connector list + belted (isConnected) subset
-      conns[cid] = e.conns
-      for _, conn in ipairs(e.conns) do self:_setBlocked(conn, true) end   -- shadowed: skips redundant write
-      fundOuts[cid] = e.fund
-    end
-    -- grant `n` release units to a source, split evenly across its belted outputs; returns the
-    -- amount ACTUALLY granted (0 if the source has no fundable connector).
-    local function fund(cid, n)
-      local outs = fundOuts[cid]
-      if not outs or #outs == 0 or n <= 0 then return 0 end
-      local base, extra, g = math.floor(n / #outs), n % #outs, 0
-      for i, conn in ipairs(outs) do
-        local s = base + (i <= extra and 1 or 0)
-        if s > 0 then pcall(function() conn:addUnblockedTransfers(s) end); g = g + s end
-      end
-      return g
-    end
-    local k = "item:" .. item
-    if nOrders == 0 then
-      -- NO CONSUMER for this item this epoch. Force every source output's leftover budget to
-      -- ZERO (addUnblockedTransfers clamps but accepts negatives) so the source stops dead and
-      -- the item stays IN ITS CONTAINER rather than dribbling onto the belt and into the sink.
-      -- This is the copper-with-no-wire case — the analog of a product simply waiting in its
-      -- buffer. Decrement the lifetime ledger by exactly what we claw back (the granted-but-
-      -- unreleased units) so _auth keeps tracking units ACTUALLY released: demand returning
-      -- then re-authorizes the right delta, no double-grant, no overshoot.
-      local clawed = 0
-      for _, outs in pairs(conns) do
-        for _, conn in ipairs(outs) do
-          local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end)
-          if cur > 0 then pcall(function() conn:addUnblockedTransfers(-cur) end); clawed = clawed + cur end
+      local add = want - have
+      if add > 0 and #e.fund > 0 then
+        local outs = e.fund
+        local base, extra = math.floor(add / #outs), add % #outs
+        for k, conn in ipairs(outs) do
+          local s = base + (k <= extra and 1 or 0)
+          if s > 0 then pcall(function() conn:addUnblockedTransfers(s) end) end
         end
       end
-      Router._auth[k] = math.max(0, (Router._auth[k] or 0) - clawed)
+      -- FIN metering semantics: the connector stays BLOCKED; unblockedTransfers is the budget
+      -- it may release despite the block. Unblocking would release without bound.
+      for _, conn in ipairs(e.conns) do self:_setBlocked(conn, true) end
     else
-      local justSeeded = (Router._auth[k] == nil)
-      if Router._auth[k] == nil then
-        -- first gate of the session: seed from the connectors' LEFTOVER budget so a program
-        -- restart (ledgers cleared, but the live connectors keep their unblockedTransfers)
-        -- doesn't re-grant what is already authorized in-game.
-        local seed = 0
-        for _, outs in pairs(conns) do
-          for _, conn in ipairs(outs) do local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end); seed = seed + cur end
-        end
-        Router._auth[k] = seed
-      end
-      -- STALL BACK-PRESSURE: in-flight = released - delivered. If a lot of this item is in flight but
-      -- almost nothing reached a consumer this window, the consumer is blocked (its OUTPUT is jammed)
-      -- and the surplus is flooding the shared manifold — the overflow then reroutes it through other
-      -- items' belts, including machine-OUTPUT belts, clogging the very outputs whose jam started it.
-      -- Claw the stalled surplus back to ~inflightFloor so it stays in the source container; release
-      -- self-restores the instant delivery resumes (progress >= progressFloor). A HEALTHY high-throughput
-      -- item keeps delivering, so it is never throttled regardless of how much it has in flight.
-      local delivered = 0
-      for _, cid in ipairs(cids) do delivered = delivered + (Router._deliv[tostring(cid) .. "|" .. item] or 0) end
-      local prev = Router._delivPrev[item]
-      Router._delivPrev[item] = delivered
-      -- _auth counts GRANTED budget. Granted-but-unreleased budget (ub, still in the connectors) on
-      -- a STOCKED source WILL release, so it counts as flood exposure — but the slice of ub that
-      -- exceeds the source's physical stock is INERT (nothing there to release). Without excluding
-      -- it, an EMPTY hub-source (first window granted, nothing to release, delivered 0) reads as
-      -- "stalled with 50 in flight" and gets clamped to the floor forever — the live RIP/rotor
-      -- feeders frozen at auth=32 ub=32 with zero items on any belt.
-      local ub, stock = 0, 0
-      for _, outs in pairs(conns) do
-        for _, conn in ipairs(outs) do
-          local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end); ub = ub + cur
-        end
-      end
-      for _, cid in ipairs(cids) do
-        local p = self.getProxy(cid)
-        pcall(function() for _, inv in ipairs(p:getInventories()) do stock = stock + (inv.itemCount or 0) end end)
-      end
-      local inflight = Router._auth[k] - delivered - math.max(0, ub - stock)
-      -- throttle ONLY with a valid prior baseline: prev exists AND didn't decrease (a decrease means
-      -- the _deliv ledger was reset by a session restart, so this epoch's progress is unmeasurable — a
-      -- fresh session must release its seeded budget, not get clawed on a phantom stall).
-      -- `>=` (not `>`): at exactly the floor the clamp yields add<=0, HOLDING release while still
-      -- stalled. With `>` the floor itself escapes the clamp and the gate re-grants the full cap,
-      -- oscillating claw->flood->claw every other epoch (seen live: ingot auth 32 -> 100 -> 32).
-      local stalled = not justSeeded and prev and delivered >= prev
-        and inflight >= Router.inflightFloor and (delivered - prev) < Router.progressFloor
-      if stalled and ub <= 0 then
-        -- nothing left to claw back and still no progress: the outstanding in-flight is presumed
-        -- DEAD (sunk / drain-eaten — it can never credit _deliv). After stallForgive such gates,
-        -- settle the ledger so the gate can re-grant; see IN-FLIGHT AMNESTY above.
-        Router._stallGates[item] = (Router._stallGates[item] or 0) + 1
-        if Router._stallGates[item] >= Router.stallForgive then
-          pcall(function() computer.log(1, ("[Foreman] SETTLE: '%s' wrote off %d in-flight units (sunk or drain-eaten; gate re-opens)")
-            :format(tostring(item), inflight)) end)
-          Router._auth[k] = delivered
-          Router._stallGates[item] = 0
-          inflight, stalled = 0, false
-        end
-      else
-        Router._stallGates[item] = 0
-      end
-      local add = cap - Router._auth[k]
-      if stalled then
-        add = math.min(add, Router.inflightFloor - inflight)   -- <=0 while stalled: claw down to / hold at the floor
-      end
-      if add > 0 then
-        -- distribute `add` across the sources weighted by their ordered demand, so budget lands
-        -- where the stock/orders are. Only sources with a fundable (belted) connector take part —
-        -- an order-less or unwired source would have no quota leg and would leak straight to the
-        -- sink. Credit the ledger by what is ACTUALLY granted (a dropped share must not inflate
-        -- _auth, or the next epoch under-releases).
-        local list = {}
-        for cid in pairs(conns) do if (weight[cid] or 0) > 0 and #(fundOuts[cid] or {}) > 0 then list[#list + 1] = cid end end
-        if #list == 0 then for cid in pairs(conns) do if #(fundOuts[cid] or {}) > 0 then list[#list + 1] = cid end end end
-        local intended, given = 0, 0
-        for i, cid in ipairs(list) do
-          local share
-          if wtotal > 0 then share = math.floor(add * (weight[cid] or 0) / wtotal)
-          else share = math.floor(add / #list) end
-          if i == #list then share = add - intended end        -- last source mops up rounding remainder
-          intended = intended + share
-          given = given + fund(cid, share)
-        end
-        Router._auth[k] = Router._auth[k] + given
-      elseif add < 0 then
-        -- demand DROPPED below what we have authorized: a consumer left or a machine changed recipe,
-        -- so this item is over-released. DEDUCT the excess (-add) from the sources' LEFTOVER budget —
-        -- NOT zero: cap still includes every REMAINING consumer's share, so the others keep getting
-        -- their items; we only remove the surplus that the departed consumer no longer needs. Only
-        -- ungranted-but-unreleased units can be reclaimed (already-released stock is in transit); we
-        -- reduce _auth by exactly what we reclaim so the ledger keeps tracking released units.
-        local want, removed = -add, 0
-        for _, outs in pairs(conns) do
-          for _, conn in ipairs(outs) do
-            if removed < want then
-              local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end)
-              local take = math.min(cur, want - removed)
-              if take > 0 then pcall(function() conn:addUnblockedTransfers(-take) end); removed = removed + take end
-            end
-          end
-        end
-        Router._auth[k] = math.max(0, (Router._auth[k] or 0) - removed)
-      end
-    end
-  end
-  -- DEFAULT-DENY every non-source container, then OPEN only the pass-throughs. The controller is
-  -- the complete authority over each container's output every rebuild: closed unless flow is
-  -- actually needed there. A PASS-THROUGH — one that some order's path legitimately routes OUT of
-  -- (a wire buffer wired into the cable constructor that draws from it) — is set OPEN so flow
-  -- continues; everything else is a DEAD-END store (a terminal buffer like concrete, or the sink)
-  -- and is BLOCKED so it can't re-emit its contents back into the belt loop ("fills the buffer but
-  -- also takes from it" re-circulation; a buffer with two output ports leaking out the un-routed
-  -- one). A container is pass-through iff it appears as `belt.from` on some order's path. Sources
-  -- are gated above (blocked + metered budget) and are skipped here. Setting blocked explicitly in
-  -- BOTH directions — not just blocking dead-ends — means a relay that was momentarily blocked (or
-  -- a future start-of-session block-all) is reliably re-opened, and nothing emits by default.
-  -- A non-source container's output opens only if some order legitimately routes OUT of it. flowsOut
-  -- records every container an order's path leaves (belt.from). With findPath no longer traversing a
-  -- DECLARED BUFFER, an unrelated item can never transit a buffer, so an idle pure-destination buffer
-  -- never appears in flowsOut and stays blocked (kills the self-loop). For a DECLARED BUFFER we add a
-  -- defence-in-depth item-match: its output opens only when its OWN buffered item flows out of it
-  -- (a genuine relay/hub re-emitting what it stores), never because a foreign item merely transits.
-  -- A plain conduit container (no buffered item) opens whenever it is on a path (legit pass-through).
-  local flowsOut, flowsOutItem = {}, {}
-  for _, o in ipairs(self.orders) do
-    for _, b in ipairs(o.path or {}) do
-      flowsOut[b.from] = true
-      flowsOutItem[b.from] = flowsOutItem[b.from] or {}
-      flowsOutItem[b.from][o.item] = true
-    end
-  end
-  for _, c in ipairs(self.topo.containers or {}) do
-    if not self.sourceItem[c.id] then
-      local item = self.bufferItem[c.id]
-      local opens
-      if item then
-        opens = flowsOutItem[c.id] and flowsOutItem[c.id][item] or false
-      else
-        opens = flowsOut[c.id] or false
-      end
-      local blockIt = not opens
-      for _, conn in ipairs(self:_connFor(c.id).conns) do
-        self:_setBlocked(conn, blockIt)             -- shadowed: skips the write when the verdict is unchanged
-        -- A blocked pure-destination must release NOTHING: claw any LEFTOVER unblockedTransfers to
-        -- zero. A buffer that was a funded hub-source in an earlier epoch (e.g. wire drawn for a cable
-        -- machine that is now gone) keeps its granted budget; once it stops being a source it lands
-        -- here, and without this it would keep emitting that budget — the item loops the manifold and
-        -- re-enters the same buffer (the wire round-trip). blocked=true alone does NOT stop a connector
-        -- that still has unblockedTransfers > 0. (unblockedTransfers stays a LIVE read — only the static
-        -- connector list + isConnected + the blocked write are cached.)
-        if blockIt then
-          local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end)
-          if cur > 0 then pcall(function() conn:addUnblockedTransfers(-cur) end) end
-        end
+      -- no grant: close the gate AND zero any leftover budget so the container stops dead and
+      -- its stock stays IN STORAGE rather than dribbling onto the manifold.
+      for _, conn in ipairs(e.conns) do
+        local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end)
+        if cur > 0 then pcall(function() conn:addUnblockedTransfers(-cur) end) end
+        self:_setBlocked(conn, true)
       end
     end
   end
 end
 
---- LEVEL-TRIGGERED routing sweep. ItemRequest is edge-triggered (fires once on arrival)
---- and an item that arrives unseen never re-fires — so a purely event-driven router
---- leaves items stuck in splitter/merger inputs forever (the in-game symptom). pump()
---- actively polls every codeable input each call and drains whatever is held, looping
---- until no further progress. This is the real driver; the ItemRequest listener just
---- makes it react faster. Returns the number of items moved.
--- Returns: moved (items routed this call), present (codeables STILL holding an item on the final pass
--- = items stuck/jammed right now). The loop uses `present` to decide whether to keep pumping (work to
--- do) or block for the next signal (truly clear) — so it NEVER sleeps on a jam.
 function Router:pump()
   local total = 0
   local present = 0
@@ -1495,14 +1093,23 @@ function Router:debugDump()
     if item then
       local ub = 0
       for _, conn in ipairs(self:_connFor(c.id).conns) do local cur = 0; pcall(function() cur = conn.unblockedTransfers or 0 end); ub = ub + cur end
-      computer.log(1, ("[Foreman] dbg src %s '%s' auth=%d ub=%d"):format(s6(c.id), item,
-        (Router._auth and (Router._auth["item:" .. item] or 0)) or 0, ub))
+      computer.log(1, ("[Foreman] dbg src %s '%s' gate=%s ub=%d"):format(s6(c.id), item,
+        ub > 0 and "open" or "shut", ub))
     end
+  end
+  -- the live demand sets: who needs what, how much (the entire routing truth under demand-pull)
+  for item, consumers in pairs(self.demand or {}) do
+    local total, who = 0, {}
+    for _, cn in ipairs(consumers) do total = total + (cn.need or 0); who[#who + 1] = s6(cn.id) .. (cn.machine and "" or "*") end
+    computer.log(1, ("[Foreman] dbg demand '%s' need=%d <- %s"):format(item, total, table.concat(who, ",")))
   end
   for _, cid in ipairs(self.topo.constructors or {}) do
     local p = self.getProxy(cid)
     local rec = "?"; if p then pcall(function() local r = p:getRecipe(); rec = (r and r.name) or "none" end) end
-    local wants = {}; for it in pairs(self.consumes[cid] or {}) do wants[#wants + 1] = it end
+    local wants = {}
+    for it, consumers in pairs(self.demand or {}) do
+      for _, cn in ipairs(consumers) do if cn.id == cid then wants[#wants + 1] = it; break end end
+    end
     computer.log(1, ("[Foreman] dbg mac %s recipe=%s in=%d [%s] wants[%s] fed[%s]")
       :format(s6(cid), rec, self:_inputTotal(cid), self:_inputItems(cid), table.concat(wants, ","), self:_feedDump(cid)))
   end
@@ -1510,25 +1117,19 @@ function Router:debugDump()
   -- rest (recovered to a destination / rerouted to a buffer / sunk / stuck-held). auth-deliv with
   -- all four ~0 = the item is parked ON BELTS somewhere (a dam — look for a STUCK item upstream).
   local items = {}
-  for k in pairs(Router._auth or {}) do local it = k:match("^item:(.+)$"); if it then items[it] = true end end
+  for it in pairs(self.demand or {}) do items[it] = true end
   for it in pairs(Router._flowBy) do items[it] = true end
   for item in pairs(items) do
     local f = Router._flowBy[item] or {}
     local deliv = 0
     for k, v in pairs(Router._deliv or {}) do if k:sub(-#item - 1) == "|" .. item then deliv = deliv + v end end
-    computer.log(1, ("[Foreman] dbg flow '%s' auth=%d deliv=%d rec=%d rer=%d sunk=%d stuck=%d")
-      :format(item, (Router._auth and Router._auth["item:" .. item]) or 0, deliv,
-        f.rec or 0, f.rer or 0, f.sunk or 0, f.stuck or 0))
+    computer.log(1, ("[Foreman] dbg flow '%s' deliv=%d rer=%d sunk=%d stuck=%d")
+      :format(item, deliv, f.rer or 0, f.sunk or 0, f.stuck or 0))
   end
 end
 
---- Are all placed orders fulfilled (delivered to their primary dst)?
-function Router:allDone()
-  for _, o in ipairs(self.orders) do
-    if o.delivered < o.count then return false end
-  end
-  return true
-end
+--- Demand-pull has no order ledger; "done" is run()'s quiescence streak. Kept for API compat.
+function Router:allDone() return true end
 
 --- Drive routing until quiescent (batch/test). Each iteration: level-triggered pump()
 --- (drain all codeable inputs) + one event.pull(0) (which, under the emulator, advances

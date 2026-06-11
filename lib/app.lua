@@ -172,18 +172,18 @@ function App.build(modules, declared, getProxy, opts)
   return router, planner, topo
 end
 
--- Diagnostic: log each order's COMPUTED PATH once (the belt sequence src -> dst with the
--- transferItem output port at each splitter hop). Short 6-char ids match the netdump labels,
--- so a path that ends somewhere other than its dst (or routes through DEFAULT_OUT) is visible.
+-- Diagnostic: log the demand sets once (who needs what, and how many next-hop nodes can route
+-- each item). Short 6-char ids match the netdump labels.
 function App.dumpPaths(router)
   if not App._debug or App._pathsLogged or not (computer and computer.log) then return end
   App._pathsLogged = true
   local function s(x) return tostring(x):sub(1, 6) end
-  for _, o in ipairs(router.orders or {}) do
-    local segs = {}
-    for _, b in ipairs(o.path or {}) do segs[#segs + 1] = ("[%d]>%s"):format(b.fromOutput or 0, s(b.to)) end
-    computer.log(1, ("[Foreman] PATH '%s' x%d  %s ->%s  : %s")
-      :format(o.item, o.count, s(o.src), s(o.dst), (#segs > 0 and table.concat(segs, " ")) or "(empty!)"))
+  for item, consumers in pairs(router.demand or {}) do
+    local who = {}
+    for _, c in ipairs(consumers) do who[#who + 1] = ("%s x%d"):format(s(c.id), c.need or 0) end
+    local hops = 0
+    for _, t in pairs(router.nextHop or {}) do if t[item] then hops = hops + 1 end end
+    computer.log(1, ("[Foreman] DEMAND '%s' <- %s (%d routing nodes)"):format(item, table.concat(who, ", "), hops))
   end
 end
 
@@ -197,24 +197,26 @@ function App.report(topo, planner, plan, opts)
     if c.provides then src = src + 1 end
     if c.buffer or c.output then buf = buf + 1 end
   end
-  local nc, ns, nm, nk, nb, no =
+  local no = 0
+  for _, consumers in pairs(planner.router.demand or {}) do no = no + #consumers end
+  local nc, ns, nm, nk, nb =
     #(topo.containers or {}), #(topo.splitters or {}), #(topo.mergers or {}),
-    #(topo.constructors or {}), #(topo.belts or {}), #(planner.router.orders or {})
+    #(topo.constructors or {}), #(topo.belts or {})
   -- only log when the discovered SHAPE changes — the loop rebuilds every couple of
   -- seconds and logging each tick floods the console.
   local sig = table.concat({ nc, src, buf, ns, nm, nk, nb, no }, ",")
   if sig == App._lastReport then return end
   App._lastReport = sig
-  computer.log(1, ("[Foreman] discovered: %d containers (%d src, %d buf), %d splitters, %d mergers, %d machines, %d belts; %d orders")
+  computer.log(1, ("[Foreman] discovered: %d containers (%d src, %d buf), %d splitters, %d mergers, %d machines, %d belts; %d demands")
     :format(nc, src, buf, ns, nm, nk, nb, no))
   for _, line in ipairs(plan or {}) do computer.log(1, "[Foreman]   plan: " .. line) end
-  -- per-order reachability: if there's no belt path from a source/producer to a
-  -- destination, the item will fall through to the sink. Surfaces a fragmented graph
-  -- (e.g. a buffer reachable only via a beltless DirectToSplitter snap — those record
-  -- as connections but don't carry items, so the path "exists" yet nothing crosses).
-  for _, o in ipairs(planner.router.orders or {}) do
-    if not planner.router:findPath(o.src, o.dst) then
-      computer.log(2, ("[Foreman]   NO PATH: %s  %s -> %s (item will go to DEFAULT_OUT)"):format(o.item, tostring(o.src), tostring(o.dst)))
+  -- demander reachability: a demanded item with ZERO routing nodes means no provider can reach
+  -- any of its demanders (fragmented graph / beltless snap mods) — surfaced, not silent.
+  for item, consumers in pairs(planner.router.demand or {}) do
+    local hops = 0
+    for _, t in pairs(planner.router.nextHop or {}) do if t[item] then hops = hops + 1 end end
+    if hops == 0 and #consumers > 0 then
+      computer.log(2, ("[Foreman]   NO ROUTE: '%s' is demanded but no provider can reach a demander"):format(item))
     end
   end
   if src == 0 then computer.log(2, "[Foreman] no SOURCE containers — nick an input '<Item>_input_1' (or bare 'input')") end
@@ -236,14 +238,10 @@ function App.run(modules, topology, opts)
   end
   local declared = topology                       -- nil => auto-discover (and re-discover)
 
-  -- New session: clear the source-gating ledgers. Router._auth (cumulative authorized) and
-  -- Router._deliv (cumulative delivered) are module-global so they PERSIST across the
-  -- rebuilds inside this loop (that is what stops a rebuild re-releasing in-flight stock);
-  -- but a fresh App.run is a fresh session and must start them empty.
+  -- New session: clear the module-durable state (demand-pull has no release ledgers; these are
+  -- debug counters, listener registries and jam/hold marks).
   if modules.Router then
-    modules.Router._auth = {}; modules.Router._deliv = {}; modules.Router._listened = {}
-    modules.Router._delivPrev = {}   -- stall back-pressure baseline; reset with _deliv so a fresh session has no stale progress
-    modules.Router._stallGates = {}  -- in-flight amnesty counters; reset with the ledgers they watch
+    modules.Router._deliv = {}; modules.Router._listened = {}
     modules.Router._flowBy = {}      -- per-item flow forensics; fresh per session
     -- stuck-machine recovery state is module-level so it survives the in-loop rebuilds; reset per session.
     modules.Router._idleEpochs = {}; modules.Router._draining = {}
