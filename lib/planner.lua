@@ -312,25 +312,21 @@ end
 
 -- DEMAND the ingredients of recipe `opt` for machine `cid` (demand-pull: no orders — a per-
 -- ingredient refill request sized by the machine's LIVE input level). Hysteresis band: request a
--- top-up to hiCrafts' worth once the level is below lowCrafts' worth (refills arrive in batches,
--- not a trickle). An ingredient with NO conceivable supply — no raw source, no stocked hub, no
--- assigned producer, and not deep-craftable on a free machine — fails the attempt (drives the
--- infeasibility yield exactly as the order rollback used to).
--- Sized for the looped serial chain: a missed grant means a FULL LOOP LAP before the next
--- arrival, so the band must bridge a lap. lowCrafts 2->4: refill starts while half the band
--- remains (not when nearly empty); hiCrafts 6->12: the machine holds a lap's worth of work
--- (user: "constructors often run out of things to craft from — up what it pulls").
-Planner.lowCrafts = Planner.lowCrafts or 4
-Planner.hiCrafts  = Planner.hiCrafts or 12
+-- top-up each ingredient toward hiItems once it drops below lowItems (refills arrive in
+-- batches, not a trickle). Band is in ITEMS, not crafts (user: "it should be up to 100"):
+-- a constructor input slot holds a stack — keep it loaded so a slow loop lap never starves
+-- the machine. Still clamped to the REMAINING product job (a finite 8-wire fill pulls
+-- exactly 8 copper, not a full stack). An ingredient with NO conceivable supply — no raw
+-- source, no stocked hub, no assigned producer, not deep-craftable — fails the attempt.
+Planner.lowItems = Planner.lowItems or 50
+Planner.hiItems  = Planner.hiItems or 100
 function Planner:_demandIngredients(opt, cid, depth, maxCrafts, txn)
   local ports = self:_assignPorts(cid, opt)
   local have = self:_inputMap(cid)
-  -- refill toward hiCrafts' worth, but never demand more feedstock than the REMAINING product
-  -- job needs (a finite 8-wire fill must pull exactly 8 copper, not a full hi-water batch)
-  local hiC = Planner.hiCrafts
-  if maxCrafts and maxCrafts < hiC then hiC = maxCrafts end
   for _, ing in ipairs(opt.ingredients) do
-    local lo, hi = math.min(Planner.lowCrafts, hiC) * ing.amount, hiC * ing.amount
+    local hi = Planner.hiItems
+    if maxCrafts then hi = math.min(hi, maxCrafts * ing.amount) end
+    local lo = math.min(Planner.lowItems, hi)
     local h = have[ing.name] or 0
     if h < lo then
       -- supply check (mirrors the old viability rules): someone must be able to PROVIDE this
@@ -833,7 +829,7 @@ Planner.drainAfter  = Planner.drainAfter or 3     -- starved+jammed epochs befor
 Planner.drainIdle   = Planner.drainIdle or 2      -- drain epochs with no pull before restoring
 Planner._probe      = Planner._probe or {}        -- cid -> { n = evidence-less dead epochs, tried = {recipeName=true}, exhausted = bool }
 Planner.probeAfter  = Planner.probeAfter or 4     -- dead epochs with NO observable cause before the bounded probe starts
-Planner.pourSlice   = Planner.pourSlice or 12     -- max units of an item poured per machine demand per epoch (legs spill to pass-along; the heldFresh brake stops over-pour)
+Planner.pourSlice   = Planner.pourSlice or 25     -- max units of an item poured per machine demand per epoch — a 100-item band fills in ~4 epochs; legs spill to pass-along and the heldFresh brake stops over-pour
 Planner.drainStall  = Planner.drainStall or 8     -- admitted-drain epochs with NO pull before giving up (something deeper blocks the leg)
 Planner._flowDry    = Planner._flowDry or {}      -- cid -> { item = true }: admitted flows that never pulled; do not re-cork them until something pulls
 Planner._legView    = Planner._legView or {}      -- cid -> { prev = inputMap, trusted = bool } (shadow-ledger pop tracking)
