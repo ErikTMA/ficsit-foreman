@@ -665,6 +665,13 @@ function Router:_overflow(sender, id, item)
   Router._holdN[hkey] = (Router._holdN[hkey] or 0) + 1
   Router._flowBy[item] = Router._flowBy[item] or {}
   Router._flowBy[item].stuck = (Router._flowBy[item].stuck or 0) + 1
+  if impatient then
+    -- patience expired and the sink loop above found no exit: if this node feeds a machine,
+    -- hand the cork to the planner for a TARGETED feed-drain (it knows the exact item)
+    for _, b in ipairs(self.adj[id] or {}) do
+      if self.isMachine[b.to] then Router._corked[b.to] = item; break end
+    end
+  end
   if machineDemand then
     Router._dlog(("HOLD %s '%s' (a machine is waiting for it)"):format(tostring(id):sub(1,6), item))
   elseif Router.DEBUG and computer and computer.log then
@@ -969,6 +976,12 @@ end
 -- attempts finally gets the sink — bounded waste beats a frozen factory.
 Router._holdN = Router._holdN or {}               -- "node|item" -> consecutive hold attempts
 Router.holdPatience = Router.holdPatience or 400
+-- CORKS: an item held past patience with NO sink reachable at a node that FEEDS a machine. The
+-- live-recipe gate rightly refuses to misdeliver it, so no push toward the machine ever fails —
+-- the feed-drain's jam trigger never arms and the cork blocks the lane forever (the v0.17.0
+-- freeze). Since the corked item is READABLE at the node input, the planner can drain it
+-- PRECISELY: temp recipe that consumes exactly this item, admit it, eat it, restore.
+Router._corked = Router._corked or {}             -- machineId -> corked item awaiting a targeted drain
 Router.stuckEpochs = Router.stuckEpochs or 3      -- empty-input epochs before temp-consumer-drain may fire
 
 -- FEEDBACK GATING (demand-pull). Every container's output is closed by default; each epoch the

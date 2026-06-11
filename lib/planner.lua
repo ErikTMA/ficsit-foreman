@@ -817,6 +817,7 @@ Planner._drain      = Planner._drain or {}        -- cid -> { recipe = name, idl
 Planner._starve     = Planner._starve or {}       -- cid -> consecutive starved epochs while on the assigned recipe
 Planner._drainTried = Planner._drainTried or {}   -- cid -> last drain recipe name (round-robin cursor)
 Planner._tempRecipe = Planner._tempRecipe or {}   -- cid -> drain temp recipe name; blocks assign() seed-adoption until a real switch overwrites it
+Planner._drainAdmit = Planner._drainAdmit or {}   -- cid -> the corked item a targeted drain may admit through the live gate
 Planner.drainAfter  = Planner.drainAfter or 3     -- starved+jammed epochs before a drain switch
 Planner.drainIdle   = Planner.drainIdle or 3      -- drain epochs with no pull before restoring
 
@@ -1118,6 +1119,36 @@ function Planner:fillAll()
   local servedCid = {}
   for _, cids in pairs(self.served or {}) do for _, cid in ipairs(cids) do servedCid[cid] = true end end
   self:_jamSweep(servedCid)   -- unassigned machines still clear their jammed lanes (drain trigger + hold)
+  -- CORK DRAINS: the router reported items held past patience with no exit at a machine-feeding
+  -- node. The corked item is KNOWN, so drain it precisely: temp recipe that consumes exactly it,
+  -- a temp demand so the splitter pushes it onto the leg, and a live-gate admission for it alone.
+  for cid, corkItem in pairs(self.router._corked or {}) do
+    self.router._corked[cid] = nil
+    if not Planner._drain[cid] then
+      local cand
+      for _, opts in pairs(self.recipesByProduct) do
+        for _, o2 in ipairs(opts) do
+          if o2.ctorId == cid and not cand then
+            for _, ing in ipairs(o2.ingredients) do if ing.name == corkItem then cand = o2; break end end
+          end
+        end
+      end
+      if cand then
+        pcall(function() cand.ctor:setRecipe(cand.recipe) end)
+        Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
+        Planner._drainTried[cid] = tostring(cand.recipe.name)
+        Planner._tempRecipe[cid] = tostring(cand.recipe.name)
+        Planner._drainAdmit[cid] = corkItem
+        pcall(function() computer.log(1, ("[Foreman] CORKDRAIN %s: '%s' corks the lane (no route, no sink); temp recipe '%s' eats it")
+          :format(tostring(cid):sub(1, 6), corkItem, tostring(cand.recipe.name))) end)
+      end
+    end
+  end
+  -- cork demand entries: give the corked item a next hop onto the draining machine's leg
+  for cid, corkItem in pairs(Planner._drainAdmit) do
+    if Planner._drain[cid] then self:_addDemand(corkItem, cid, 10, nil, true)
+    else Planner._drainAdmit[cid] = nil end
+  end
   -- PROVIDER GRANTS first (stocked hubs that will SUPPLY a demander act as sources this epoch and
   -- must not also demand a refill — their own granted outflow would route straight back to them).
   local grants, providing = {}, {}
@@ -1156,7 +1187,9 @@ function Planner:fillAll()
   local liveGate = {}
   for _, cid in ipairs(self.topo.constructors or {}) do
     liveGate[cid] = {}
-    if not Planner._drain[cid] then
+    if Planner._drain[cid] and Planner._drainAdmit[cid] then
+      liveGate[cid][Planner._drainAdmit[cid]] = true   -- targeted drain: admit the cork, nothing else
+    elseif not Planner._drain[cid] then
       local okr, rec = pcall(function() return self.getProxy(cid):getRecipe() end)
       if okr and rec and rec.getIngredients then
         local oki, ings = pcall(function() return rec:getIngredients() end)
@@ -1164,6 +1197,9 @@ function Planner:fillAll()
           if ia.type and ia.type.name then liveGate[cid][lc(ia.type.name)] = true end
         end end
       end
+    end
+    if liveGate[cid] and not next(liveGate[cid]) and not Planner._drain[cid] then
+      -- not draining but no readable recipe: keep the empty set (admit nothing)
     end
   end
   self.router.machineLive = liveGate

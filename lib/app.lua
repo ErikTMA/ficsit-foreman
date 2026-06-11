@@ -250,6 +250,7 @@ function App.run(modules, topology, opts)
     modules.Router._connCache = {}; modules.Router._blockShadow = {}; modules.Router._retry = {}
     modules.Router._legFullMach = {}   -- machine-entrance jam marks (feed-drain signal); fresh per session
     modules.Router._holdN = {}; modules.Router._epochN = 0   -- hold-patience counters + epoch clock; fresh per session
+    modules.Router._corked = {}    -- cork reports for targeted drains; fresh per session
   end
   -- ingredient flow-control window (max in-flight feedstock per order, anti belt-flood); tunable.
   if modules.Router and opts.flowWindow then modules.Router.flowWindow = opts.flowWindow end
@@ -261,6 +262,7 @@ function App.run(modules, topology, opts)
     modules.Planner._drain = {}; modules.Planner._starve = {}; modules.Planner._drainTried = {}; modules.Planner._infeas = {}   -- feed-drain + infeasibility state; fresh per session
     modules.Planner._tempRecipe = {}   -- drain temp-recipe marks (seed-adoption guard); fresh per session
     modules.Planner._infeasIng = {}    -- per-item blocking-ingredient marks; fresh per session
+    modules.Planner._drainAdmit = {}   -- targeted-drain admissions; fresh per session
   end
 
   -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by
