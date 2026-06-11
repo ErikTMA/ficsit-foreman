@@ -263,6 +263,8 @@ function App.run(modules, topology, opts)
     modules.Planner._tempRecipe = {}   -- drain temp-recipe marks (seed-adoption guard); fresh per session
     modules.Planner._infeasIng = {}    -- per-item blocking-ingredient marks; fresh per session
     modules.Planner._drainAdmit = {}   -- targeted-drain admissions; fresh per session
+    modules.Planner._probe = {}        -- invisible-blockage probe episodes; fresh per session
+    modules.Router._legSent = {}       -- per-entrance push ledger; fresh per session
   end
 
   -- DEBUG diagnostics (order paths + per-splitter/merger routing decisions) are OFF by

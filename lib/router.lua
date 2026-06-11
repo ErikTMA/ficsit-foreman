@@ -708,7 +708,11 @@ function Router:_routeAtSplitter(sender, id, item)
       if sender:transferItem(best.fromOutput or 0) then
         self:_credit(best, item)
         if not terminal then self:_creditRoom(best.to, item) end   -- routed toward a buffer: bump its cached room
-        if self.isMachine[best.to] and Router._legFullMach then Router._legFullMach[best.to] = nil end   -- entrance accepted: jam (if any) cleared
+        if self.isMachine[best.to] then
+          if Router._legFullMach then Router._legFullMach[best.to] = nil end   -- entrance accepted: jam (if any) cleared
+          local ls = Router._legSent[best.to] or {}; Router._legSent[best.to] = ls
+          ls[item] = (ls[item] or 0) + 1   -- leg ledger: items WE put on this entrance (probe candidates if the lane dies)
+        end
         -- FAIR SPLIT within an epoch: rotate the used leg to the back of its equal-distance
         -- group, so two demanders at the same distance alternate item-by-item (the 8/8 split)
         local grpEnd = li
@@ -897,7 +901,11 @@ function Router:_mergerPush(sender, id, input, nm)
   end
   if out then
     self:_credit(out, nm)
-    if self.isMachine[out.to] and Router._legFullMach then Router._legFullMach[out.to] = nil end   -- entrance accepted: jam cleared
+    if self.isMachine[out.to] then
+      if Router._legFullMach then Router._legFullMach[out.to] = nil end   -- entrance accepted: jam cleared
+      local ls = Router._legSent[out.to] or {}; Router._legSent[out.to] = ls
+      ls[nm] = (ls[nm] or 0) + 1
+    end
   end
   return true
 end
@@ -962,6 +970,7 @@ Router._flowBy = Router._flowBy or {}             -- item -> { rer=, sunk=, stuc
 -- machine entrances whose feed leg push FAILED: cid -> the epoch it failed (stale marks must not
 -- trigger drains). Set by _routeAtSplitter/_mergerPush, cleared on a successful push.
 Router._legFullMach = Router._legFullMach or {}
+Router._legSent = Router._legSent or {}          -- machineId -> item -> count pushed onto its entrance this session
 Router.jamFresh = Router.jamFresh or 2            -- a jam mark older than this many epochs is stale
 -- Is `cid`'s entrance jam mark FRESH? Under hold-at-splitter, pushes may simply STOP being
 -- attempted, leaving a stale mark that re-triggered the feed-drain forever (the v0.16.5 freeze
