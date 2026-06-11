@@ -845,50 +845,54 @@ function Planner:_inputMap(cid)
   return have
 end
 
--- the next drain recipe to try on `cid` (≠ the assigned `opt`). The blockage is BY DEFINITION an
--- item the assigned recipe does NOT consume (the machine would already pull its own feedstock), so:
---   * a feeder-item hint matching the assigned ingredients is in-transit feedstock, NOT the jam —
---     ignore it (the live bug: B13DC6 assigned Iron Rod(<-ingot) was hinted 'iron ingot' and picked
---     Iron Plate(<-ingot), a recipe that by construction can never pull the jam);
---   * a candidate that consumes ONLY assigned ingredients is equally useless — rank it last.
--- Ranking: tier 1 = recipes consuming another assignment's ingredient (strays come from the shared
--- manifold's own flows: rod/plate/screws); tier 2 = recipes consuming any buffered/sourced item;
--- tier 3 = the rest (a player-dropped stray). Alphabetical within a tier. The round-robin cursor
--- (_drainTried) is only set by a drain that pulled NOTHING — a working recipe is reused next jam.
+-- the next drain recipe to try on `cid` (≠ the assigned `opt`). EVIDENCE-GATED (user rule: "if we
+-- are not crafting and the input side has another item than what we need, switch recipe based on
+-- what is on the input side and what we need most that can be crafted by that item"):
+--   * EVIDENCE: only items OBSERVED at the machine count — the feeder's input slot
+--     (router:_feedItem) or a foreign item inside the input inventory. Items matching the
+--     assigned ingredients are in-transit feedstock, NOT evidence. No foreign observation ->
+--     nil -> NO drain: switching a congested-but-correct machine strands its real feedstock and
+--     manufactures the jam it imagined (the live B13DC6 'Screws'/'Iron Plate' churn on its own
+--     copper-ingot feed; the leaves->biomass->concrete round-robin for items existing NOWHERE).
+--   * CANDIDATES: single-ingredient recipes consuming an observed item. Ranked: feeder-slot item
+--     first, then LEAST ingredient amount (an Iron Plate drain needing 3 ingots freezes holding
+--     1-2 — prefer Iron Rod needing 1; sam ore's ONLY consumer needs 4, so least-wins, not
+--     1-only), then the product we currently NEED most, then name. The cursor (_drainTried, set
+--     only by a drain that pulled NOTHING) rotates within this evidence'd list — never beyond.
 function Planner:_drainCandidate(cid, opt)
   local assignedIng = {}
   for _, ing in ipairs(opt.ingredients) do assignedIng[ing.name] = true end
-  local tier1, tier2 = {}, {}
-  for _, a in pairs(Planner._assign) do
-    if a.opt then for _, ing in ipairs(a.opt.ingredients) do if not assignedIng[ing.name] then tier1[ing.name] = true end end end
+  local observed, hint = {}, self.router._feedItem and self.router:_feedItem(cid)
+  if hint and not assignedIng[hint] then observed[hint] = true else hint = nil end
+  for it in pairs(self:_inputMap(cid)) do if not assignedIng[it] then observed[it] = true end end
+  if next(observed) == nil then return nil end       -- no foreign item OBSERVED -> no drain
+  local needOf = {}
+  for item, consumers in pairs(self._demand or {}) do
+    local t = 0; for _, c in ipairs(consumers) do t = t + (c.need or 0) end; needOf[item] = t
   end
-  for it in pairs(self.bufferOf) do if not assignedIng[it] then tier2[it] = true end end
-  for it in pairs(self.sources) do if not assignedIng[it] then tier2[it] = true end end
   local seen, list = {}, {}
   for _, opts in pairs(self.recipesByProduct) do
     for _, o2 in ipairs(opts) do
       local nm = tostring(o2.recipe.name)
       if o2.ctorId == cid and nm ~= tostring(opt.recipe.name) and not seen[nm] then
         seen[nm] = true
-        local t = 3
-        for _, ing in ipairs(o2.ingredients) do
-          if tier1[ing.name] then t = 1; break elseif tier2[ing.name] then t = math.min(t, 2) end
+        local ing = #o2.ingredients == 1 and o2.ingredients[1] or nil
+        if ing and observed[ing.name] then
+          local prod = self.itemOfRecipe[nm]
+          list[#list + 1] = { o2 = o2, nm = nm, h = (ing.name == hint), amt = ing.amount or 1,
+                              need = (prod and needOf[prod]) or 0 }
         end
-        list[#list + 1] = { o2 = o2, tier = t, nm = nm }
       end
     end
   end
-  if #list == 0 then return nil end
-  table.sort(list, function(a, b) if a.tier ~= b.tier then return a.tier < b.tier end return a.nm < b.nm end)
+  if #list == 0 then return nil end                  -- nothing on this machine eats the evidence
+  table.sort(list, function(a, b)
+    if a.h ~= b.h then return a.h end
+    if a.amt ~= b.amt then return a.amt < b.amt end
+    if a.need ~= b.need then return a.need > b.need end
+    return a.nm < b.nm
+  end)
   local lastFail = Planner._drainTried[cid]          -- set only when the previous drain pulled nothing
-  local hint = self.router._feedItem and self.router:_feedItem(cid)
-  if hint and not assignedIng[hint] then             -- assigned feedstock at the feeder = in transit, not the jam
-    for _, e in ipairs(list) do
-      if e.nm ~= lastFail then
-        for _, ing in ipairs(e.o2.ingredients) do if ing.name == hint then return e.o2 end end
-      end
-    end
-  end
   if lastFail then
     for i, e in ipairs(list) do if e.nm == lastFail then return list[(i % #list) + 1].o2 end end
   end
@@ -941,6 +945,8 @@ function Planner:_jamSweep(servedCid)
               Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
               Planner._drainTried[cid] = tostring(cand.recipe.name)
               Planner._tempRecipe[cid] = tostring(cand.recipe.name)   -- never seed-adopted as a real assignment
+              local fh = self.router._feedItem and self.router:_feedItem(cid)
+              if fh == cand.ingredients[1].name then Planner._drainAdmit[cid] = fh end   -- feeder-slot evidence must be ROUTED onto the leg (admit); an input-inventory remnant is already inside — no admission, nothing to vacuum
               st.n = 0
               pcall(function() computer.log(1, ("[Foreman] DRAIN %s (idle): lane jammed; temp recipe '%s' pulls the blockage")
                 :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name))) end)
@@ -1025,6 +1031,8 @@ function Planner:produceFor(cid, item, share)
         Planner._drain[cid] = { recipe = tostring(cand.recipe.name), idle = 0 }
         Planner._drainTried[cid] = tostring(cand.recipe.name)
         Planner._tempRecipe[cid] = tostring(cand.recipe.name)   -- never seed-adopted as a real assignment
+        local fh = self.router._feedItem and self.router:_feedItem(cid)
+        if fh == cand.ingredients[1].name then Planner._drainAdmit[cid] = fh end   -- feeder-slot evidence must be ROUTED onto the leg (admit); an input-inventory remnant is already inside — no admission, nothing to vacuum
         st.n = 0
         pcall(function() computer.log(1, ("[Foreman] DRAIN %s: entrance jammed while frozen; temp recipe '%s' pulls the blockage (assigned '%s')")
           :format(tostring(cid):sub(1, 6), tostring(cand.recipe.name), tostring(opt.recipe.name))) end)
@@ -1036,11 +1044,24 @@ function Planner:produceFor(cid, item, share)
       end
     end
   else
-    -- live ≠ assigned. A frozen+jammed machine whose recipe was changed by hand is DRAINING its
-    -- blockage — ADOPT it (switching back would re-block the belt and fight the user).
+    -- live ≠ assigned. A starved machine whose recipe was changed by hand while its lane is in
+    -- trouble is DRAINING its blockage — ADOPT it (switching back would re-block the belt and
+    -- fight the user). "Lane in trouble" = a jam mark OR a foreign item visible at the feeder
+    -- slot: a lane corked AT the feeder never produces failed pushes toward the machine, so the
+    -- jam mark alone would refuse exactly the manual fix the user is applying.
     local stA = Planner._starve[cid]
-    if live ~= nil and type(stA) == "table" and stA.n > 0 and jammed then
+    local fh = self.router._feedItem and self.router:_feedItem(cid)
+    local feedForeign = false
+    if fh then
+      feedForeign = true
+      for _, ing in ipairs(opt.ingredients) do if ing.name == fh then feedForeign = false; break end end
+    end
+    if live ~= nil and type(stA) == "table" and stA.n > 0 and (jammed or feedForeign) then
       Planner._drain[cid] = { recipe = tostring(live), idle = 0 }
+      -- the adopted recipe drains a lane corked AT THE FEEDER: that item only moves if the live
+      -- gate admits it and the admit loop demands it — without this the adoption is a no-op (the
+      -- item never reaches the machine, the drain idles out and the user's fix gets REVERTED).
+      if feedForeign then Planner._drainAdmit[cid] = fh end
       stA.n = 0
       local di = self.itemOfRecipe[tostring(live)]
       if di and self.bufferOf[di] then
@@ -1122,16 +1143,45 @@ function Planner:fillAll()
   -- CORK DRAINS: the router reported items held past patience with no exit at a machine-feeding
   -- node. The corked item is KNOWN, so drain it precisely: temp recipe that consumes exactly it,
   -- a temp demand so the splitter pushes it onto the leg, and a live-gate admission for it alone.
+  -- Guards (same rules as the jam drain): a machine that CAN craft from its holdings is
+  -- OUTPUT-blocked — setRecipe would eject its full input into the very path that is blocked;
+  -- and a cork of the machine's OWN live feedstock is back-pressure, not a blockage — the
+  -- machine already pulls that item, switching recipes can only strand it.
   for cid, corkItem in pairs(self.router._corked or {}) do
     self.router._corked[cid] = nil
     if not Planner._drain[cid] then
+      local skip = false
+      local pm = self.getProxy(cid)
+      local okr, liveRec = pcall(function() return pm:getRecipe() end)
+      local liveIt = okr and liveRec and liveRec.name and self.itemOfRecipe[tostring(liveRec.name)]
+      local lopt
+      for _, o2 in ipairs((liveIt and self.recipesByProduct[liveIt]) or {}) do
+        if o2.ctorId == cid and tostring(o2.recipe.name) == tostring(liveRec.name) then lopt = o2; break end
+      end
+      if lopt then
+        local have, can = self:_inputMap(cid), true
+        for _, ing in ipairs(lopt.ingredients) do
+          if ing.name == corkItem then skip = true end             -- own live feedstock: not a cork
+          if (have[ing.name] or 0) < ing.amount then can = false end
+        end
+        if can then skip = true end                                -- output-blocked: never touch
+      end
       local cand
-      for _, opts in pairs(self.recipesByProduct) do
-        for _, o2 in ipairs(opts) do
-          if o2.ctorId == cid and not cand then
-            for _, ing in ipairs(o2.ingredients) do if ing.name == corkItem then cand = o2; break end end
+      if not skip then
+        -- deterministic + user rule: single-ingredient recipes eating the cork, LEAST amount first
+        local best
+        for _, opts in pairs(self.recipesByProduct) do
+          for _, o2 in ipairs(opts) do
+            if o2.ctorId == cid and #o2.ingredients == 1 and o2.ingredients[1].name == corkItem then
+              local nm = tostring(o2.recipe.name)
+              if not best or o2.ingredients[1].amount < best.amt
+                 or (o2.ingredients[1].amount == best.amt and nm < best.nm) then
+                best = { o2 = o2, amt = o2.ingredients[1].amount, nm = nm }
+              end
+            end
           end
         end
+        cand = best and best.o2
       end
       if cand then
         pcall(function() cand.ctor:setRecipe(cand.recipe) end)
@@ -1144,10 +1194,18 @@ function Planner:fillAll()
       end
     end
   end
-  -- cork demand entries: give the corked item a next hop onto the draining machine's leg
-  for cid, corkItem in pairs(Planner._drainAdmit) do
-    if Planner._drain[cid] then self:_addDemand(corkItem, cid, 10, nil, true)
-    else Planner._drainAdmit[cid] = nil end
+  -- admit demand entries: give the admitted item a next hop onto the draining machine's leg —
+  -- but ONLY while the feeder slot still SHOWS it. A standing 10/epoch demand with the evidence
+  -- gone vacuums fresh provider stock of the item through the temp recipe forever (the drain's
+  -- progress hold never idles out while granted inflow keeps arriving). Evidence gone -> admit
+  -- dies -> inflow stops -> the drain idles out and the assignment restores.
+  for cid, admitItem in pairs(Planner._drainAdmit) do
+    if not Planner._drain[cid] then Planner._drainAdmit[cid] = nil
+    else
+      local fh = self.router._feedItem and self.router:_feedItem(cid)
+      if fh == admitItem then self:_addDemand(admitItem, cid, 10, nil, true)
+      else Planner._drainAdmit[cid] = nil end
+    end
   end
   -- PROVIDER GRANTS first (stocked hubs that will SUPPLY a demander act as sources this epoch and
   -- must not also demand a refill — their own granted outflow would route straight back to them).
