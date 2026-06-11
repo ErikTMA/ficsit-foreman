@@ -802,6 +802,12 @@ function Router:_routeAtSplitter(sender, id, item)
   -- pure transit leg (splitter/merger — never another machine, never a buffer it doesn't belong
   -- in). Pour pacing bounds how many items can ever be circulating.
   if machineLegFull then
+    -- a pass-along IS congestion: the consumer exists but cannot take the item, so it circulates.
+    -- Without this stamp the item never HOLDS anywhere, heldFresh never fires, and the sources
+    -- keep pouring into the jam (live: copper/sam gates open ub=5-8 while thousands of retries
+    -- circulated — the constructors became full-time garbage disposals).
+    Router._heldFresh = Router._heldFresh or {}
+    Router._heldFresh[item] = Router._epochN or 0
     for _, b in ipairs(self.adj[id] or {}) do
       if (self.isSplitter[b.to] or self.isMerger[b.to]) and self:_beltAccepts(b, item) then
         if sender:transferItem(b.fromOutput or 0) then
